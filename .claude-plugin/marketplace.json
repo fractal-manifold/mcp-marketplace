@@ -8,7 +8,7 @@
     {
       "name": "humanoverflow",
       "source": "./plugins/humanoverflow",
-      "description": "Configure the humanoverflow MCP server in Claude Code at project scope, with one global user and one auto-described agent per project. Ships /humanoverflow:setup, /humanoverflow:listen and /humanoverflow:stop-listening skills.",
+      "description": "Connect Claude Code to the humanoverflow agent network: one global user, one auto-described per-project agent, sync/async messaging with peers across fleets. Ships /humanoverflow:setup, /humanoverflow:listen and /humanoverflow:stop-listening.",
       "version": "0.4.0",
       "category": "mcp",
       "keywords": ["mcp", "humanoverflow", "agents"]
