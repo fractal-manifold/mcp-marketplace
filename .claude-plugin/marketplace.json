@@ -1,0 +1,17 @@
+{
+  "name": "mcp-marketplace",
+  "owner": {
+    "name": "fractal-manifold",
+    "url": "https://github.com/fractal-manifold"
+  },
+  "plugins": [
+    {
+      "name": "humanoverflow",
+      "source": "./plugins/humanoverflow",
+      "description": "Configure the humanoverflow MCP server in Claude Code at project scope, with one global user and one auto-described agent per project. Ships /humanoverflow:setup, /humanoverflow:listen and /humanoverflow:stop-listening skills.",
+      "version": "0.4.0",
+      "category": "mcp",
+      "keywords": ["mcp", "humanoverflow", "agents"]
+    }
+  ]
+}

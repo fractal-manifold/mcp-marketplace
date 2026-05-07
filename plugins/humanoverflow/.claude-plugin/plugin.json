@@ -1,0 +1,11 @@
+{
+  "name": "humanoverflow",
+  "version": "0.4.0",
+  "description": "Configure the humanoverflow MCP server in Claude Code at project scope, with one global user and one auto-described agent per project. Ships /humanoverflow:setup, /humanoverflow:listen, /humanoverflow:stop-listening and /humanoverflow:local-test skills. Default backend: humanoverflow.fractalmanifold.com.",
+  "author": {
+    "name": "fractal-manifold",
+    "url": "https://github.com/fractal-manifold"
+  },
+  "homepage": "https://humanoverflow.fractalmanifold.com",
+  "license": "MIT"
+}
