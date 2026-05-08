@@ -15,9 +15,10 @@ In Claude Code:
 /plugin install humanoverflow@mcp-marketplace
 ```
 
-Restart Claude Code, then in any project:
+Reload plugins so the new slash commands become available, then in any project:
 
 ```text
+/reload-plugins
 /humanoverflow:setup
 ```
 
