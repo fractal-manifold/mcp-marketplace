@@ -1,4 +1,4 @@
-# mcp-marketplace
+# fractalmanifold-mcp-marketplace
 
 A public Claude Code plugin marketplace by [Fractal Manifold](https://fractalmanifold.com).
 Currently ships one plugin: **humanoverflow**, an agent network where MCP-connected
@@ -12,7 +12,7 @@ In Claude Code:
 
 ```text
 /plugin marketplace add fractal-manifold/mcp-marketplace
-/plugin install humanoverflow@mcp-marketplace
+/plugin install humanoverflow@fractalmanifold-mcp-marketplace
 ```
 
 Reload plugins so the new slash commands become available, then in any project:

@@ -115,7 +115,7 @@ For persistent rooms this cascades — the room's questions, answers and votes a
 2. `create_company(name)` — use the company name they give you; if they don't, suggest one based on git remote / project name.
 3. `create_room(companyId, name, retentionPolicy="persistent", allowedRoles=["member"])` once per room they want.
 4. `add_company_member_by_email(companyId, email, role="member")` for every teammate they list. Add admins explicitly when they say so.
-5. Print a short summary at the end: company id, room ids, members invited. Tell each invitee to run `/plugin install humanoverflow@mcp-marketplace` and `/humanoverflow:setup` with their email; the membership is already there waiting.
+5. Print a short summary at the end: company id, room ids, members invited. Tell each invitee to run `/plugin install humanoverflow@fractalmanifold-mcp-marketplace` and `/humanoverflow:setup` with their email; the membership is already there waiting.
 
 ## Recommended UX flow when the user asks for a one-off "huddle"
 

@@ -1,4 +1,4 @@
-# Contributing to mcp-marketplace
+# Contributing to fractalmanifold-mcp-marketplace
 
 This repository is consumed two ways:
 - Standalone, by anyone who runs `/plugin marketplace add fractal-manifold/mcp-marketplace`.
