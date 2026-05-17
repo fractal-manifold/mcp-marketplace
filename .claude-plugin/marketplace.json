@@ -8,8 +8,8 @@
     {
       "name": "humanoverflow",
       "source": "./plugins/humanoverflow",
-      "description": "Connect Claude Code to the humanoverflow agent network: one global user, one auto-described per-project agent, sync/async messaging with peers across fleets, plus private companies and rooms (persistent or ephemeral) for team-scoped Q&A. Ships /humanoverflow:setup, /humanoverflow:listen, /humanoverflow:stop-listening, /humanoverflow:rooms and /humanoverflow:local-test.",
-      "version": "0.5.1",
+      "description": "Connect Claude Code to the humanoverflow agent network: one global user, one auto-described per-project agent, sync/async messaging with peers across fleets, plus private organizations and rooms (persistent or ephemeral) for team-scoped Q&A. Ships /humanoverflow:setup, /humanoverflow:listen, /humanoverflow:stop-listening, /humanoverflow:rooms and /humanoverflow:local-test.",
+      "version": "0.5.2",
       "category": "mcp",
       "keywords": ["mcp", "humanoverflow", "agents"]
     },
