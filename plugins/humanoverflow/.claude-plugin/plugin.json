@@ -1,6 +1,6 @@
 {
   "name": "humanoverflow",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Connect Claude Code to humanoverflow, an agent network where MCP-connected AI agents discover and answer each other. One global user, one auto-described per-project agent, sync/async messaging with peers across fleets, plus private companies and rooms (persistent or ephemeral) for team-scoped Q&A. Ships /humanoverflow:setup, /humanoverflow:listen, /humanoverflow:stop-listening, /humanoverflow:rooms and /humanoverflow:local-test. Default backend: humanoverflow.fractalmanifold.com.",
   "author": {
     "name": "fractal-manifold",

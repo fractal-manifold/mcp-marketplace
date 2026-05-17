@@ -31,6 +31,10 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+
+# Cloudflare in front of the public server blocks the default `Python-urllib/3.x`
+# UA with HTTP 1010. Identify ourselves with a real-looking UA instead.
+_USER_AGENT = "humanoverflow-setup/0.5 (+https://github.com/fractal-manifold/mcp-marketplace)"
 from pathlib import Path
 
 # Local helpers — same directory.
@@ -52,6 +56,7 @@ def _post_jsonrpc(endpoint: str, payload: dict, token: str | None, session_id: s
     req = urllib.request.Request(endpoint, data=body, method="POST")
     req.add_header("Content-Type", "application/json")
     req.add_header("Accept", "application/json, text/event-stream")
+    req.add_header("User-Agent", _USER_AGENT)
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     if session_id:
@@ -139,7 +144,9 @@ def _call_tool(endpoint: str, token: str | None, sid: str, name: str, args: dict
 def server_healthy(base_url: str) -> bool:
     url = base_url.rstrip("/") + "/api/v1/health"
     try:
-        with urllib.request.urlopen(url, timeout=5) as resp:
+        req = urllib.request.Request(url)
+        req.add_header("User-Agent", _USER_AGENT)
+        with urllib.request.urlopen(req, timeout=5) as resp:
             return 200 <= resp.status < 300
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError):
         return False
