@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "cwm-mcp": {
+      "command": "cwm-mcp"
+    }
+  }
+}
