@@ -235,6 +235,34 @@ def claude_mcp_add(base_url: str, token: str, scope: str, cwd: Path) -> subproce
     return subprocess.run(cmd, capture_output=True, text=True, cwd=str(cwd))
 
 
+def write_project_mcp_json(base_url: str, token: str, cwd: Path) -> Path:
+    """Write `.mcp.json` at the project root with env-var-templated URL/token.
+
+    `claude mcp add` bakes literal values into the file; we want Claude Code to
+    expand `${HOF_BASE_URL}` and `${HOF_AGENT_TOKEN}` at session start so the
+    same `.mcp.json` works against prod and a local server without re-running
+    setup. The values from this run become the defaults (`${VAR:-default}`).
+    Existing entries for other MCP servers in `.mcp.json` are preserved.
+    """
+    path = cwd / ".mcp.json"
+    data: dict = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            data = {}
+    servers = data.setdefault("mcpServers", {})
+    servers[MCP_NAME] = {
+        "type": "http",
+        "url": "${HOF_BASE_URL:-" + base_url.rstrip("/") + "}/mcp",
+        "headers": {
+            "Authorization": "Bearer ${HOF_AGENT_TOKEN:-" + token + "}",
+        },
+    }
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    return path
+
+
 # ────────────────────── subcommands ──────────────────────
 
 def cmd_check(args: argparse.Namespace) -> int:
@@ -339,13 +367,30 @@ def cmd_register_project(args: argparse.Namespace) -> int:
 
 
 def cmd_install(args: argparse.Namespace) -> int:
-    """Run `claude mcp add` for the current project with its cached agent token."""
+    """Register the MCP server for the current project.
+
+    For the default `project` scope we write `.mcp.json` directly with an
+    env-var-templated URL/token so users can flip between prod and a local
+    server (`HOF_BASE_URL=http://localhost:8088 claude`) without re-running
+    setup. For `user`/`local` scope we fall through to `claude mcp add`, which
+    bakes literal values into the relevant settings file.
+    """
     root = project_root()
     key = project_key(root)
     token = read_agent_token(key)
     if not token:
         print(json.dumps({"status": "error", "reason": "no_agent_token_for_project"}), file=sys.stderr)
         return 2
+    if args.scope == "project":
+        path = write_project_mcp_json(args.base_url, token, cwd=root)
+        print(json.dumps({
+            "status": "ok",
+            "scope": args.scope,
+            "project_root": str(root),
+            "mcp_json": str(path),
+            "url_template": "${HOF_BASE_URL:-" + args.base_url.rstrip("/") + "}/mcp",
+        }))
+        return 0
     out = claude_mcp_add(args.base_url, token, args.scope, cwd=root)
     if out.returncode != 0:
         print(json.dumps({
