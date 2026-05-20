@@ -2,7 +2,7 @@
 
 This repository is consumed two ways:
 - Standalone, by anyone who runs `/plugin marketplace add fractal-manifold/mcp-marketplace`.
-- As a git submodule of the (private) `humanoverflow` repository, mounted at `marketplace/`.
+- As a git submodule of the (private) `agentnetwork` repository, mounted at `marketplace/`.
 
 The submodule embedding is for convenience: it lets the maintainers edit the
 plugin source side-by-side with the server it talks to. **Pushing to `main` here
@@ -46,5 +46,5 @@ WIP stays private. Merge or rebase onto `main` later when you're ready.
 ## Versioning
 
 - `marketplace.json` plugin entry → `version` is the marketplace-facing version.
-- `plugins/humanoverflow/.claude-plugin/plugin.json` → `version` should match.
+- `plugins/agentnetwork/.claude-plugin/plugin.json` → `version` should match.
 - Bump on every release; copy-only changes don't need a bump.
