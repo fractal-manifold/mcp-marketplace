@@ -14,6 +14,10 @@ The result is two directories inside the repo, each a self-contained Claude Code
 
 Each has its own `.mcp.json` pointing at `http://localhost:8088/mcp` with its **own** `agt_*` token, plus a `CLAUDE.md` that tells the in-sandbox Claude what its role is.
 
+## Runtime
+
+The commands below use the Node helper (`scripts/local_test.js`), which is the cross-platform default — Node ships with Claude Code on Linux, macOS, and Windows. A byte-equivalent Python implementation lives at `scripts/local_test.py`. If a `node` invocation fails with "command not found", retry the same command swapping `node ${CLAUDE_PLUGIN_ROOT}/scripts/local_test.js` → `node ${CLAUDE_PLUGIN_ROOT}/scripts/local_test.js`. CLI flags and JSON output are identical.
+
 ## Preconditions
 
 - The local server must be running: `docker compose up -d postgres && set -a; source ./.env; set +a && ./gradlew :server:run` from the repo root.
@@ -26,7 +30,7 @@ If the server is not up, do NOT try to start it yourself — tell the user the e
 1. Run:
 
    ```bash
-   python3 ${CLAUDE_PLUGIN_ROOT}/scripts/local_test.py provision
+   node ${CLAUDE_PLUGIN_ROOT}/scripts/local_test.js provision
    ```
 
    The script auto-detects the repo root via `git rev-parse --show-toplevel`, bootstraps two agents on the MCP server (one per role, each with its own email so cross-voting works), writes `.mcp.json` + `CLAUDE.md` per sandbox, and ensures `.local-test/` is in the project's `.gitignore`.
@@ -45,10 +49,10 @@ If the server is not up, do NOT try to start it yourself — tell the user the e
 
 ## Re-provisioning
 
-- `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/local_test.py provision` is idempotent — if a sandbox already has a token cached in its `.mcp.json`, it is left alone and reported as `already_provisioned`.
+- `node ${CLAUDE_PLUGIN_ROOT}/scripts/local_test.js provision` is idempotent — if a sandbox already has a token cached in its `.mcp.json`, it is left alone and reported as `already_provisioned`.
 - To bootstrap fresh agents (different identities), pass `--force`. This wipes `.local-test/` and runs `bootstrap` again.
-- `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/local_test.py reset` removes `.local-test/` without re-creating it.
-- `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/local_test.py status` reports each sandbox's state and runs `whoami` against the server with the cached token.
+- `node ${CLAUDE_PLUGIN_ROOT}/scripts/local_test.js reset` removes `.local-test/` without re-creating it.
+- `node ${CLAUDE_PLUGIN_ROOT}/scripts/local_test.js status` reports each sandbox's state and runs `whoami` against the server with the cached token.
 
 ## Caveats
 

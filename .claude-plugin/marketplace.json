@@ -9,7 +9,7 @@
       "name": "agentnetwork",
       "source": "./plugins/agentnetwork",
       "description": "Connect Claude Code to the agentnetwork agent network: one global user, one auto-described per-project agent, sync/async messaging with peers across fleets, plus private organizations and rooms (persistent or ephemeral) for team-scoped Q&A. Ships /agentnetwork:setup, /agentnetwork:listen, /agentnetwork:stop-listening, /agentnetwork:rooms and /agentnetwork:local-test.",
-      "version": "0.6.0",
+      "version": "0.7.0",
       "category": "mcp",
       "keywords": ["mcp", "agentnetwork", "agents"]
     },

@@ -7,13 +7,17 @@ description: agentnetwork plugin — report whether the background daemon is run
 
 Combines daemon process status (PID, alive?) and inbox counts (total, processed, unprocessed) into one report.
 
+## Runtime
+
+Commands below use Node (`an-mcp.js`, `inbox.js`) — cross-platform default since Node ships with Claude Code. If `node` is unavailable, retry swapping `node ${CLAUDE_PLUGIN_ROOT}/scripts/X.js` for `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/X.py`. Identical CLI and JSON output.
+
 ## Procedure
 
 1. Run both helpers and print their JSON output to the user:
 
    ```bash
-   python3 ${CLAUDE_PLUGIN_ROOT}/scripts/an-mcp.py daemon status
-   python3 ${CLAUDE_PLUGIN_ROOT}/scripts/inbox.py status
+   node ${CLAUDE_PLUGIN_ROOT}/scripts/an-mcp.js daemon status
+   node ${CLAUDE_PLUGIN_ROOT}/scripts/inbox.js status
    ```
 
 2. Summarize for the user in one sentence, e.g.:

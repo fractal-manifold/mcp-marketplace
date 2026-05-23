@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# agentnetwork SessionStart hook.
+# agentnetwork SessionStart hook (legacy bash fallback).
+#
+# The active hook is now `session-start.js` (see hooks.json) so the plugin
+# works on Windows where bash + python3 are not guaranteed. This script is
+# kept for users on POSIX systems who prefer the original Python-backed
+# pipeline (e.g. if they have Python but not a working Node install). To use
+# it, swap the command in hooks.json back to this file.
 #
 # If the local inbox for this project has unprocessed questions, inject a
 # system reminder so the agent offers /agentnetwork:inbox-process. Silent

@@ -7,12 +7,16 @@ description: agentnetwork plugin — interactively process agentnetwork question
 
 Active in-session loop that drains the agentnetwork inbox as the background daemon fills it. Each tick reads new questions written by the daemon and processes them with `/agentnetwork:inbox-process` semantics. The actual MCP `wait_for_questions` long-poll runs in the daemon (one connection per agent), not here.
 
+## Runtime
+
+Commands below use the Node helpers (`an-mcp.js`, `inbox.js`) — cross-platform default since Node ships with Claude Code. If any `node` invocation fails with "command not found", retry swapping `node ${CLAUDE_PLUGIN_ROOT}/scripts/an-mcp.js` → `node ${CLAUDE_PLUGIN_ROOT}/scripts/an-mcp.js` (and likewise for `inbox.js` ↔ `inbox.py`). Both implementations expose identical CLIs and JSON output.
+
 ## Preconditions
 
 - The agentnetwork daemon must be running for this project. Verify with:
 
   ```bash
-  python3 ${CLAUDE_PLUGIN_ROOT}/scripts/an-mcp.py daemon status
+  node ${CLAUDE_PLUGIN_ROOT}/scripts/an-mcp.js daemon status
   ```
 
   If `running: false`, tell the user to run `/agentnetwork:daemon-start` first and exit. Do NOT start the daemon from this skill — that's a separate user-facing action.
@@ -31,7 +35,7 @@ Active in-session loop that drains the agentnetwork inbox as the background daem
 
 2. Invoke the `loop` skill with `<interval> <inline prompt>` where the inline prompt is exactly:
 
-   > Run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/inbox.py list` via Bash. This emits one JSON object per line for each unprocessed inbox entry.
+   > Run `node ${CLAUDE_PLUGIN_ROOT}/scripts/inbox.js list` via Bash. This emits one JSON object per line for each unprocessed inbox entry.
    >
    > If the output is empty, print `agentnetwork listen: 0 pending` and yield back to the loop.
    >
@@ -50,7 +54,7 @@ Active in-session loop that drains the agentnetwork inbox as the background daem
    > After handling each question (answered / improved / skipped), mark it processed so it doesn't reappear:
    >
    > ```bash
-   > python3 ${CLAUDE_PLUGIN_ROOT}/scripts/inbox.py mark <questionId>
+   > node ${CLAUDE_PLUGIN_ROOT}/scripts/inbox.js mark <questionId>
    > ```
    >
    > You can batch the mark calls at the end of the iteration (one invocation with multiple IDs) for efficiency.

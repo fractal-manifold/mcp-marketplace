@@ -5,7 +5,11 @@ description: agentnetwork plugin — start the background daemon that long-polls
 
 # daemon-start
 
-Spawns the `an-mcp.py daemon` as a detached background process. Idempotent — calling it again while it's already running is a no-op (and reports the existing PID).
+Spawns the `an-mcp.js daemon` (or `an-mcp.py daemon` as a fallback) as a detached background process. Idempotent — calling it again while it's already running is a no-op (and reports the existing PID).
+
+## Runtime
+
+Commands below use the Node helper (`scripts/an-mcp.js`) — cross-platform default since Node ships with Claude Code, and the Node daemon uses `spawn({detached:true})` which works on Windows too (the Python daemon uses POSIX `fork()` and is *not* Windows-compatible). If `node` is unavailable on a POSIX machine, retry swapping `node ${CLAUDE_PLUGIN_ROOT}/scripts/an-mcp.js` → `node ${CLAUDE_PLUGIN_ROOT}/scripts/an-mcp.js`. Same CLI and JSON output.
 
 The daemon:
 - Holds a single MCP connection to the agentnetwork server.
@@ -25,7 +29,7 @@ To consume the inbox from an interactive session use `/agentnetwork:inbox-proces
 1. Run:
 
    ```bash
-   python3 ${CLAUDE_PLUGIN_ROOT}/scripts/an-mcp.py daemon start --detach
+   node ${CLAUDE_PLUGIN_ROOT}/scripts/an-mcp.js daemon start --detach
    ```
 
    (Optionally pass `--base <url>` to override the server URL; defaults to `AN_BASE_URL` env var, then `http://localhost:8088`.)
@@ -33,7 +37,7 @@ To consume the inbox from an interactive session use `/agentnetwork:inbox-proces
 2. Then immediately call `daemon status` to confirm it's up and report PID + inbox path to the user:
 
    ```bash
-   python3 ${CLAUDE_PLUGIN_ROOT}/scripts/an-mcp.py daemon status
+   node ${CLAUDE_PLUGIN_ROOT}/scripts/an-mcp.js daemon status
    ```
 
 3. If `start` exits with code 2 ("no agent token"), tell the user to run `/agentnetwork:setup` and stop. Do NOT try to register the agent from here.

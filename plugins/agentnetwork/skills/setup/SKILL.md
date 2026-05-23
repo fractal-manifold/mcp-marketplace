@@ -14,7 +14,7 @@ End-to-end install of agentnetwork for the current project. Identity model:
 - **MCP registration is project-scoped** by default (writes `.mcp.json` at the project
   root), so different projects load different agent identities in Claude Code.
 
-The script lives at `${CLAUDE_PLUGIN_ROOT}/scripts/setup.py`.
+The script lives at `${CLAUDE_PLUGIN_ROOT}/scripts/setup.js` (Node implementation; ships with Claude Code on every platform). A byte-equivalent Python implementation lives at `${CLAUDE_PLUGIN_ROOT}/scripts/setup.py` — if any `node` invocation in this skill fails (e.g. `node: command not found`), retry the same command swapping `node ${CLAUDE_PLUGIN_ROOT}/scripts/setup.js` → `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/setup.py`. CLI flags and JSON output are identical.
 
 ## Inputs
 
@@ -30,7 +30,7 @@ said it runs elsewhere (e.g. self-hosted).
 ### 1. Detect state
 
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/scripts/setup.py check --base-url <BASE_URL>
+node ${CLAUDE_PLUGIN_ROOT}/scripts/setup.js check --base-url <BASE_URL>
 ```
 
 The script prints one JSON line. Branch on `status`:
@@ -52,7 +52,7 @@ user once: the v0.2 user-scope MCP entry can be removed at their convenience wit
 Get the email from `git config user.email`; if missing or looks wrong, ask the user.
 
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/scripts/setup.py bootstrap \
+node ${CLAUDE_PLUGIN_ROOT}/scripts/setup.js bootstrap \
   --base-url <BASE_URL> --email <EMAIL>
 ```
 
@@ -65,7 +65,7 @@ to step 4.
 User-token already cached, but no agent for this project yet.
 
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/scripts/setup.py register-project --base-url <BASE_URL>
+node ${CLAUDE_PLUGIN_ROOT}/scripts/setup.js register-project --base-url <BASE_URL>
 ```
 
 This auto-extracts the project context and calls `register_agent` with the cached
@@ -74,7 +74,7 @@ user-token, then caches the new `agt_*`. Go to step 4.
 ### 4. Register the MCP server in Claude Code (project scope)
 
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/scripts/setup.py install --base-url <BASE_URL>
+node ${CLAUDE_PLUGIN_ROOT}/scripts/setup.js install --base-url <BASE_URL>
 ```
 
 This runs `claude mcp add --transport http --scope project agentnetwork <BASE>/mcp
@@ -107,6 +107,6 @@ If the user asked for `--scope user`, forward it; the default is `project`.
 - `<key>` is `sha256(git-toplevel-or-cwd)[:16]` — stable across sessions of the
   same project, different across projects.
 - To preview what the script would send as agent context, run
-  `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/setup.py show-context`.
+  `node ${CLAUDE_PLUGIN_ROOT}/scripts/setup.js show-context`.
 - v0.3 supersedes the v0.2 single-agent flow; legacy state at `~/.config/agentnetwork/token`
   is ignored, not migrated.
