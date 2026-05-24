@@ -14,12 +14,12 @@
       "keywords": ["mcp", "agentnetwork", "agents"]
     },
     {
-      "name": "claude-wall-monitor",
-      "source": "./plugins/claude-wall-monitor",
-      "description": "Registers cwm-mcp, the local broker for the Claude Wall Monitor ESP32 device. Adds four diagnostic tools (wall_monitor_status, wall_monitor_health, wall_monitor_recent_logs, wall_monitor_provision_hint) and runs with leader-elected coexistence so multiple Claude Code sessions and an existing systemd daemon share the broker port cleanly. Requires the cwm-mcp binary on PATH (go install github.com/fractal-manifold/cwm-mcp/cmd/cwm-mcp@latest).",
-      "version": "0.1.0",
+      "name": "cwallmonitor",
+      "source": "./plugins/cwallmonitor",
+      "description": "Registers cwm-mcp, the local broker for the C Wall Monitor ESP32 device. Adds four diagnostic tools (wall_monitor_status, wall_monitor_health, wall_monitor_recent_logs, wall_monitor_provision_hint) and two on-device skills (/cwallmonitor:configure, /cwallmonitor:theme). Runs with leader-elected coexistence so multiple Claude Code sessions and an existing systemd daemon share the broker port cleanly. Requires the cwm-mcp binary on PATH (go install github.com/fractal-manifold/cwm-mcp/cmd/cwm-mcp@latest).",
+      "version": "0.2.0",
       "category": "mcp",
-      "keywords": ["mcp", "claude-wall-monitor", "esp32", "iot", "hardware"]
+      "keywords": ["mcp", "cwallmonitor", "wall-monitor", "esp32", "iot", "hardware"]
     }
   ]
 }

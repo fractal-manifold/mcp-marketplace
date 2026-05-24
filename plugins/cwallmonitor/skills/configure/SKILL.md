@@ -1,25 +1,25 @@
 ---
 name: configure
-description: claude-wall-monitor plugin — provision or reconfigure a Claude Wall Monitor device from the LAN. Discovers devices in BOOT_NEEDS_CONFIG via mDNS (`_cwm._tcp.local.`), prompts the user for the 6-digit pairing code shown on the device's screen, then pushes the broker URL, PSK (derived from a passphrase) and any optional config (city, brightness, providers) to it. Also registers the device in the local cwm-mcp registry so future control-plane polls (/device/<id>/sync) recognise it. Use this when the user says they have a new wall monitor, the device shows "Esperando configuración", they reset a device, or they ask to "configure", "provision" or "set up" a wall monitor.
+description: cwallmonitor plugin — provision or reconfigure a C Wall Monitor device from the LAN. Discovers devices in BOOT_NEEDS_CONFIG via mDNS (`_cwm._tcp.local.`), prompts the user for the 8-digit pairing code shown on the device's screen, then pushes the broker URL, PSK (derived from a passphrase) and any optional config (city, brightness, providers) to it. Also registers the device in the local cwm-mcp registry so future control-plane polls (/device/<id>/sync) recognise it. Use this when the user says they have a new wall monitor, the device shows "Waiting for setup", they reset a device, or they ask to "configure", "provision" or "set up" a wall monitor.
 ---
 
-# /wall-monitor:configure
+# /cwallmonitor:configure
 
-Provision a Claude Wall Monitor device that has just connected to WiFi
+Provision a C Wall Monitor device that has just connected to WiFi
 but does not yet know which broker to talk to. The device sits at the
-"Esperando configuración" screen, showing its IP and a 6-digit pairing
+"Waiting for setup" screen, showing its IP and an 8-digit pairing
 code; this skill bridges that gap end-to-end without leaving Claude Code.
 
 ## When to invoke
 
 - "I just plugged in a new wall monitor."
-- "The device says 'Esperando configuración'."
+- "The device says 'Waiting for setup'."
 - "I reset the device, configure it again."
 - "Pair this device to my broker."
 
 ## Prerequisites
 
-- `cwm-mcp` is running on the user's laptop (the `claude-wall-monitor`
+- `cwm-mcp` is running on the user's laptop (the `cwallmonitor`
   plugin's MCP server registers it). Verify with
   `wall_monitor_status` — if it errors, tell the user to install/start
   `cwm-mcp` and stop. `cwm-mcp` is a launcher: it auto-selects one of
@@ -38,8 +38,9 @@ code; this skill bridges that gap end-to-end without leaving Claude Code.
 
 Call `wall_monitor_discover_devices` (default 4-second scan). If no
 devices come back, ask the user to confirm the device finished its WiFi
-connection (the screen should read "Esperando configuración" and show
-a 6-digit code). Retry once with `timeout_seconds: 8` before giving up.
+connection (the screen should read "Waiting for setup" and show an
+8-digit pairing code). Retry once with `timeout_seconds: 8` before
+giving up.
 
 Each entry in the result includes:
 - `device_id` — 8 hex chars; also visible on the device's `/info`
@@ -54,7 +55,7 @@ one. Show device_id and IP side by side.
 
 ### 2. Get the pairing code from the user
 
-Ask: "What 6-digit code is shown on the device's screen?" The code is
+Ask: "What 8-digit code is shown on the device's screen?" The code is
 intentionally not retrievable over the network — typing it proves the
 user is physically present.
 
@@ -125,7 +126,7 @@ firewall on the laptop, double-check the chosen broker_url, or run
 ## Reconfiguring an existing device
 
 If the user wants to change a setting on an *already-provisioned* device
-(it does not show "Esperando configuración"), this skill is the wrong
+(it does not show "Waiting for setup"), this skill is the wrong
 tool. Direct them to either:
 
 - the on-device Settings panel (long-press the mascot on the dashboard), or

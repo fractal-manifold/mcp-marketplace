@@ -1,8 +1,10 @@
-# claude-wall-monitor plugin
+# cwallmonitor plugin
 
 Registers the `cwm-mcp` MCP server with Claude Code. `cwm-mcp` is the
-local broker that serves OAuth credentials to the Claude Wall Monitor
-ESP32 device and exposes four diagnostic tools to the model.
+local broker that serves OAuth credentials to the C Wall Monitor
+ESP32 device, exposes four diagnostic tools to the model, and ships
+two on-device skills (`/cwallmonitor:configure`,
+`/cwallmonitor:theme`).
 
 - Binary source & releases:
   [`fractal-manifold/cwm-mcp`](https://github.com/fractal-manifold/cwm-mcp)
@@ -52,7 +54,7 @@ at least one of them, plus the launcher itself.
 
    ```text
    /plugin marketplace add fractal-manifold/mcp-marketplace
-   /plugin install claude-wall-monitor
+   /plugin install cwallmonitor
    ```
 
 ## Tools exposed to the model

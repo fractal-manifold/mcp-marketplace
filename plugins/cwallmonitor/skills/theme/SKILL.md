@@ -1,11 +1,11 @@
 ---
 name: theme
-description: claude-wall-monitor plugin — switch a Claude Wall Monitor device between Day, Night and Auto themes remotely. Each provider (Claude / Codex / Gemini) has its own brand-tinted palette in both Day and Night flavours; Auto follows the sunrise/sunset of the configured city. Use this when the user says "switch the wall monitor to night mode", "make it dark", "use the day theme", "let it follow the sun", "change the theme on device X", or anything similar.
+description: cwallmonitor plugin — switch a C Wall Monitor device between Day, Night and Auto themes remotely. Each provider (Claude / Codex / Gemini) has its own brand-tinted palette in both Day and Night flavours; Auto follows the sunrise/sunset of the configured city. Use this when the user says "switch the wall monitor to night mode", "make it dark", "use the day theme", "let it follow the sun", "change the theme on device X", or anything similar.
 ---
 
-# /wall-monitor:theme
+# /cwallmonitor:theme
 
-Set the on-device theme mode (Day, Night or Auto) on a Claude Wall
+Set the on-device theme mode (Day, Night or Auto) on a C Wall
 Monitor device. The change is queued through the control plane and
 applied on the device's next poll + reboot cycle.
 
@@ -20,7 +20,7 @@ applied on the device's next poll + reboot cycle.
 ## Usage
 
 ```
-/wall-monitor:theme <day|night|auto> [--device <device_id>]
+/cwallmonitor:theme <day|night|auto> [--device <device_id>]
 ```
 
 If `--device` is omitted, list available devices with
@@ -40,7 +40,7 @@ ambiguous, ask.
 
 - Call `wall_monitor_list_devices`.
   - 0 devices → tell the user nothing is registered and stop (suggest
-    `/wall-monitor:configure`).
+    `/cwallmonitor:configure`).
   - 1 device → use it without asking.
   - >1 devices → if no `--device` flag was given, present the list with
     `AskUserQuestion` (show `device_id`, `active_broker_url`, last
@@ -105,7 +105,7 @@ skill.
   rejected an unknown value. Re-read the user's request and map it
   to one of the three modes.
 - **`device <id> not registered`** — the device was never registered
-  on this broker. Run `/wall-monitor:configure` first, or
+  on this broker. Run `/cwallmonitor:configure` first, or
   `wall_monitor_register_device` if it was registered elsewhere.
 - **`registry disabled`** — the user's broker is running without a
   registry path. They need to configure
