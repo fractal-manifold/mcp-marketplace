@@ -83,13 +83,39 @@ Resolve only the broker URL before asking the user anything else:
   Default to nothing and let the user fill it in later via
   `wall_monitor_set_device_pending` if they don't want to think about
   it now.
-- **brightness / volume / providers** — only ask if the user volunteers
+- **brightness / volume** — only ask if the user volunteers
   preferences. Defaults on the device are sensible.
+- **providers** — REQUIRED. The device tracks usage from one or more of
+  Claude, Codex and Gemini; only the ones enabled here are polled and
+  shown on the dashboard. Resolve the default selection by probing the
+  laptop for each provider's CLI/auth artefact (the user typically only
+  has the providers they actually use):
+    - `claude` → `~/.claude/.credentials.json` exists and is non-empty,
+       or `~/.claude/settings.json` exists (Claude Code installed).
+    - `codex` → `~/.codex/auth.json` exists, or `~/.config/codex/`
+       exists, or `OPENAI_API_KEY` is set in the environment.
+    - `gemini` → `~/.gemini/oauth_creds.json` exists, or
+       `~/.config/gemini-cli/` exists, or `GEMINI_API_KEY` /
+       `GOOGLE_API_KEY` are set.
+
+  Then call `AskUserQuestion` with `multiSelect: true`, pre-marking the
+  detected ones, with options:
+    - "Claude (Claude Code)"
+    - "Codex (OpenAI)"
+    - "Gemini (Google)"
+
+  If NONE were detected (rare — the user invoked this skill at all), ask
+  the same multi-select with all unchecked and require at least one.
+  Send `provider_claude`, `provider_codex`, `provider_gemini` flags
+  (`true` for selected, omit for not-selected — the broker treats the
+  absence as "keep current", which on a fresh provision means disabled).
 
 ### 4. POST the provision
 
 Call `wall_monitor_provision` with the values from steps 1–3 (do not
-pass `psk_hex` — let the broker generate it). Expected return on success:
+pass `psk_hex` — let the broker generate it; do pass each selected
+provider as `provider_claude=true` / `provider_codex=true` /
+`provider_gemini=true`). Expected return on success:
 
 ```json
 {
