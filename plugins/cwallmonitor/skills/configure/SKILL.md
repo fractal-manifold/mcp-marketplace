@@ -1,13 +1,13 @@
 ---
 name: configure
-description: cwallmonitor plugin — provision or reconfigure a C Wall Monitor device from the LAN. Discovers devices in BOOT_NEEDS_CONFIG via mDNS (`_cwm._tcp.local.`), prompts the user for the 8-digit pairing code shown on the device's screen, then pushes the broker URL, PSK (derived from a passphrase) and any optional config (city, brightness, providers) to it. Also registers the device in the local cwm-mcp registry so future control-plane polls (/device/<id>/sync) recognise it. Use this when the user says they have a new wall monitor, the device shows "Waiting for setup", they reset a device, or they ask to "configure", "provision" or "set up" a wall monitor.
+description: cwallmonitor plugin — provision or reconfigure a C Wall Monitor device from the LAN. Discovers devices in BOOT_NEEDS_CONFIG via mDNS (`_cwm._tcp.local.`), prompts the user for the 6-digit pairing code shown on the device's screen, then pushes the broker URL and an auto-generated PSK to it. Also registers the device in the local cwm-mcp registry so future control-plane polls (/device/<id>/sync) recognise it. Use this when the user says they have a new wall monitor, the device shows "Waiting for setup", they reset a device, or they ask to "configure", "provision" or "set up" a wall monitor.
 ---
 
 # /cwallmonitor:configure
 
 Provision a C Wall Monitor device that has just connected to WiFi
 but does not yet know which broker to talk to. The device sits at the
-"Waiting for setup" screen, showing its IP and an 8-digit pairing
+"Waiting for setup" screen, showing its IP and a 6-digit pairing
 code; this skill bridges that gap end-to-end without leaving Claude Code.
 
 ## When to invoke
@@ -38,8 +38,8 @@ code; this skill bridges that gap end-to-end without leaving Claude Code.
 
 Call `wall_monitor_discover_devices` (default 4-second scan). If no
 devices come back, ask the user to confirm the device finished its WiFi
-connection (the screen should read "Waiting for setup" and show an
-8-digit pairing code). Retry once with `timeout_seconds: 8` before
+connection (the screen should read "Waiting for setup" and show a
+6-digit pairing code). Retry once with `timeout_seconds: 8` before
 giving up.
 
 Each entry in the result includes:
@@ -55,13 +55,15 @@ one. Show device_id and IP side by side.
 
 ### 2. Get the pairing code from the user
 
-Ask: "What 8-digit code is shown on the device's screen?" The code is
+Ask: "What 6-digit code is shown on the device's screen?" The code is
 intentionally not retrievable over the network — typing it proves the
-user is physically present.
+user is physically present. The on-device label displays it grouped
+3+3 (e.g. "071 718") for legibility; the user can type it with or
+without the space.
 
 ### 3. Choose the config to push
 
-Resolve the broker URL and PSK before asking:
+Resolve only the broker URL before asking the user anything else:
 
 - **broker_url** — default to the laptop's reachable broker. Run
   `wall_monitor_provision_hint` to get the laptop's non-loopback IPv4
@@ -71,11 +73,12 @@ Resolve the broker URL and PSK before asking:
   bound to `127.0.0.1`, stop and tell the user to edit
   `~/.config/claude-wall-monitor/service.toml` (`[server] bind =
   "0.0.0.0"`) and restart the broker.
-- **psk_hex** — ask the user for a memorable passphrase. Derive
-  `sha256(passphrase)` and pass the hex digest. **Never** transmit the
-  raw passphrase, and never echo it back to the user once entered.
-  Suggest using `openssl rand -hex 32` if they want a random PSK
-  instead.
+- **psk_hex** — DO NOT ask the user. The broker auto-generates a fresh
+  32-byte random PSK on every `wall_monitor_provision` call where
+  `psk_hex` is omitted (recommended). The PSK lives on the broker
+  registry + device NVS only; the user never has to memorise or pick
+  one. Pass `psk_hex` only if reproducing a known key (e.g. migrating
+  a device between brokers).
 - **city** — optional, but recommended (drives ambient weather).
   Default to nothing and let the user fill it in later via
   `wall_monitor_set_device_pending` if they don't want to think about
@@ -85,17 +88,21 @@ Resolve the broker URL and PSK before asking:
 
 ### 4. POST the provision
 
-Call `wall_monitor_provision` with the values from steps 1–3. Expected
-return on success:
+Call `wall_monitor_provision` with the values from steps 1–3 (do not
+pass `psk_hex` — let the broker generate it). Expected return on success:
 
 ```json
 {
   "ok": true,
   "device_id": "ab12cd34",
   "registered": true,
+  "psk_generated": true,
   "device_response": { "ok": true, "device_id": "ab12cd34", "next": "rebooting" }
 }
 ```
+
+`psk_generated: true` confirms the broker created a fresh random PSK
+and stored it in the registry; nothing else is needed from the user.
 
 If `registered` is false and `note` is present, tell the user the
 device was provisioned but the local registry write failed (rare; e.g.

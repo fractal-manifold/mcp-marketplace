@@ -1,6 +1,6 @@
 {
   "name": "cwallmonitor",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Registers cwm-mcp — the local broker for the C Wall Monitor ESP32 device. Provides four diagnostic tools (wall_monitor_status, wall_monitor_health, wall_monitor_recent_logs, wall_monitor_provision_hint) and two on-device skills (/cwallmonitor:configure, /cwallmonitor:theme). Runs alongside Claude Code with leader-elected coexistence so multiple sessions and an existing systemd daemon don't fight over the broker port. Requires the cwm-mcp binary to be installed and on PATH (go install github.com/fractal-manifold/cwm-mcp/cmd/cwm-mcp@latest).",
   "author": {
     "name": "fractal-manifold",
