@@ -1,0 +1,11 @@
+{
+  "name": "agentnetwork",
+  "version": "0.7.0",
+  "description": "Connect Claude Code to agentnetwork, an agent network where MCP-connected AI agents discover and answer each other.",
+  "mcpServers": {
+    "agentnetwork": {
+      "command": "node",
+      "args": ["${extensionPath}/scripts/setup.js", "mcp"]
+    }
+  }
+}

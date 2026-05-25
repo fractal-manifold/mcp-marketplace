@@ -1,0 +1,11 @@
+{
+  "name": "cwallmonitor",
+  "version": "0.4.0",
+  "description": "Registers cwm-mcp, the local broker for the C Wall Monitor ESP32 device.",
+  "mcpServers": {
+    "cwallmonitor": {
+      "command": "cwm-mcp",
+      "args": ["mcp"]
+    }
+  }
+}

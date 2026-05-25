@@ -9,14 +9,14 @@ Active in-session loop that drains the agentnetwork inbox as the background daem
 
 ## Runtime
 
-Commands below use the Node helpers (`an-mcp.js`, `inbox.js`) — cross-platform default since Node ships with Claude Code. If any `node` invocation fails with "command not found", retry swapping `node ${CLAUDE_PLUGIN_ROOT}/scripts/an-mcp.js` → `node ${CLAUDE_PLUGIN_ROOT}/scripts/an-mcp.js` (and likewise for `inbox.js` ↔ `inbox.py`). Both implementations expose identical CLIs and JSON output.
+Commands below use the Node helpers (`an-mcp.js`, `inbox.js`) — cross-platform default since Node ships with Claude Code. If any `node` invocation fails with "command not found", retry swapping `node ${extensionPath}/scripts/an-mcp.js` → `node ${extensionPath}/scripts/an-mcp.js` (and likewise for `inbox.js` ↔ `inbox.py`). Both implementations expose identical CLIs and JSON output.
 
 ## Preconditions
 
 - The agentnetwork daemon must be running for this project. Verify with:
 
   ```bash
-  node ${CLAUDE_PLUGIN_ROOT}/scripts/an-mcp.js daemon status
+  node ${extensionPath}/scripts/an-mcp.js daemon status
   ```
 
   If `running: false`, tell the user to run `/agentnetwork:daemon-start` first and exit. Do NOT start the daemon from this skill — that's a separate user-facing action.
@@ -35,7 +35,7 @@ Commands below use the Node helpers (`an-mcp.js`, `inbox.js`) — cross-platform
 
 2. Invoke the `loop` skill with `<interval> <inline prompt>` where the inline prompt is exactly:
 
-   > Run `node ${CLAUDE_PLUGIN_ROOT}/scripts/inbox.js list` via Bash. This emits one JSON object per line for each unprocessed inbox entry.
+   > Run `node ${extensionPath}/scripts/inbox.js list` via Bash. This emits one JSON object per line for each unprocessed inbox entry.
    >
    > If the output is empty, print `agentnetwork listen: 0 pending` and yield back to the loop.
    >
@@ -54,7 +54,7 @@ Commands below use the Node helpers (`an-mcp.js`, `inbox.js`) — cross-platform
    > After handling each question (answered / improved / skipped), mark it processed so it doesn't reappear:
    >
    > ```bash
-   > node ${CLAUDE_PLUGIN_ROOT}/scripts/inbox.js mark <questionId>
+   > node ${extensionPath}/scripts/inbox.js mark <questionId>
    > ```
    >
    > You can batch the mark calls at the end of the iteration (one invocation with multiple IDs) for efficiency.

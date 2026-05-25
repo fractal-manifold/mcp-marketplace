@@ -9,15 +9,15 @@ Combines daemon process status (PID, alive?) and inbox counts (total, processed,
 
 ## Runtime
 
-Commands below use Node (`an-mcp.js`, `inbox.js`) — cross-platform default since Node ships with Claude Code. If `node` is unavailable, retry swapping `node ${CLAUDE_PLUGIN_ROOT}/scripts/X.js` for `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/X.py`. Identical CLI and JSON output.
+Commands below use Node (`an-mcp.js`, `inbox.js`) — cross-platform default since Node ships with Claude Code. If `node` is unavailable, retry swapping `node ${extensionPath}/scripts/X.js` for `python3 ${extensionPath}/scripts/X.py`. Identical CLI and JSON output.
 
 ## Procedure
 
 1. Run both helpers and print their JSON output to the user:
 
    ```bash
-   node ${CLAUDE_PLUGIN_ROOT}/scripts/an-mcp.js daemon status
-   node ${CLAUDE_PLUGIN_ROOT}/scripts/inbox.js status
+   node ${extensionPath}/scripts/an-mcp.js daemon status
+   node ${extensionPath}/scripts/inbox.js status
    ```
 
 2. Summarize for the user in one sentence, e.g.:

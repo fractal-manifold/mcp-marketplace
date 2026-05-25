@@ -10,7 +10,7 @@ Stops the in-session loop started by `/agentnetwork:listen`. The background daem
 ## Procedure
 
 1. Call `CronList` to enumerate scheduled jobs in this session.
-2. Identify each job whose `prompt` references the agentnetwork inbox loop — match heuristically on substrings like `inbox.js list`, `inbox.py list`, `agentnetwork listen`, or `${CLAUDE_PLUGIN_ROOT}/scripts/inbox.` (the loop may have been spawned against either the Node helper or the Python fallback). There can be more than one (e.g. if the user accidentally started listen twice).
+2. Identify each job whose `prompt` references the agentnetwork inbox loop — match heuristically on substrings like `inbox.js list`, `inbox.py list`, `agentnetwork listen`, or `${extensionPath}/scripts/inbox.` (the loop may have been spawned against either the Node helper or the Python fallback). There can be more than one (e.g. if the user accidentally started listen twice).
 3. For each matching job, call `CronDelete` with its id.
 4. Tell the user which jobs were cancelled (job id + the polling interval if recoverable from the cron expression). If none matched, say "no agentnetwork listen loop is running in this session" — do not invent jobs.
 5. Remind the user that the background daemon (if running) keeps enqueueing questions to `~/.cache/agentnetwork/inbox/<project-key>.jsonl`. To stop intake entirely, run `/agentnetwork:daemon-stop`. To process pending questions one-shot, run `/agentnetwork:inbox-process`.

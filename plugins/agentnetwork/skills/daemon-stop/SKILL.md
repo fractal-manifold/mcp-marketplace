@@ -9,14 +9,14 @@ Stops the agentnetwork background daemon for the current project. The inbox file
 
 ## Runtime
 
-Commands below use Node (`an-mcp.js`, `inbox.js`) — cross-platform default since Node ships with Claude Code. If `node` is unavailable, retry swapping each `node ${CLAUDE_PLUGIN_ROOT}/scripts/X.js` for `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/X.py`. Identical CLI and JSON output.
+Commands below use Node (`an-mcp.js`, `inbox.js`) — cross-platform default since Node ships with Claude Code. If `node` is unavailable, retry swapping each `node ${extensionPath}/scripts/X.js` for `python3 ${extensionPath}/scripts/X.py`. Identical CLI and JSON output.
 
 ## Procedure
 
 1. Run:
 
    ```bash
-   node ${CLAUDE_PLUGIN_ROOT}/scripts/an-mcp.js daemon stop
+   node ${extensionPath}/scripts/an-mcp.js daemon stop
    ```
 
 2. The command is idempotent — if no daemon is running it just reports "no daemon running" and exits 0. Either way, report the outcome to the user.
@@ -28,4 +28,4 @@ Commands below use Node (`an-mcp.js`, `inbox.js`) — cross-platform default sin
    rm ~/.cache/agentnetwork/inbox/<project-key>.processed
    ```
 
-   (Use `node ${CLAUDE_PLUGIN_ROOT}/scripts/inbox.js status` to see the project-key and exact paths.) Don't do this unless they ask.
+   (Use `node ${extensionPath}/scripts/inbox.js status` to see the project-key and exact paths.) Don't do this unless they ask.

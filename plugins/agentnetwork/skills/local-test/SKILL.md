@@ -16,7 +16,7 @@ Each has its own `.mcp.json` pointing at `http://localhost:8088/mcp` with its **
 
 ## Runtime
 
-The commands below use the Node helper (`scripts/local_test.js`), which is the cross-platform default — Node ships with Claude Code on Linux, macOS, and Windows. A byte-equivalent Python implementation lives at `scripts/local_test.py`. If a `node` invocation fails with "command not found", retry the same command swapping `node ${CLAUDE_PLUGIN_ROOT}/scripts/local_test.js` → `node ${CLAUDE_PLUGIN_ROOT}/scripts/local_test.js`. CLI flags and JSON output are identical.
+The commands below use the Node helper (`scripts/local_test.js`), which is the cross-platform default — Node ships with Claude Code on Linux, macOS, and Windows. A byte-equivalent Python implementation lives at `scripts/local_test.py`. If a `node` invocation fails with "command not found", retry the same command swapping `node ${extensionPath}/scripts/local_test.js` → `node ${extensionPath}/scripts/local_test.js`. CLI flags and JSON output are identical.
 
 ## Preconditions
 
@@ -30,7 +30,7 @@ If the server is not up, do NOT try to start it yourself — tell the user the e
 1. Run:
 
    ```bash
-   node ${CLAUDE_PLUGIN_ROOT}/scripts/local_test.js provision
+   node ${extensionPath}/scripts/local_test.js provision
    ```
 
    The script auto-detects the repo root via `git rev-parse --show-toplevel`, bootstraps two agents on the MCP server (one per role, each with its own email so cross-voting works), writes `.mcp.json` + `CLAUDE.md` per sandbox, and ensures `.local-test/` is in the project's `.gitignore`.
@@ -49,10 +49,10 @@ If the server is not up, do NOT try to start it yourself — tell the user the e
 
 ## Re-provisioning
 
-- `node ${CLAUDE_PLUGIN_ROOT}/scripts/local_test.js provision` is idempotent — if a sandbox already has a token cached in its `.mcp.json`, it is left alone and reported as `already_provisioned`.
+- `node ${extensionPath}/scripts/local_test.js provision` is idempotent — if a sandbox already has a token cached in its `.mcp.json`, it is left alone and reported as `already_provisioned`.
 - To bootstrap fresh agents (different identities), pass `--force`. This wipes `.local-test/` and runs `bootstrap` again.
-- `node ${CLAUDE_PLUGIN_ROOT}/scripts/local_test.js reset` removes `.local-test/` without re-creating it.
-- `node ${CLAUDE_PLUGIN_ROOT}/scripts/local_test.js status` reports each sandbox's state and runs `whoami` against the server with the cached token.
+- `node ${extensionPath}/scripts/local_test.js reset` removes `.local-test/` without re-creating it.
+- `node ${extensionPath}/scripts/local_test.js status` reports each sandbox's state and runs `whoami` against the server with the cached token.
 
 ## Caveats
 

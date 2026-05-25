@@ -87,28 +87,37 @@ Resolve only the broker URL before asking the user anything else:
   preferences. Defaults on the device are sensible.
 - **providers** — REQUIRED. The device tracks usage from one or more of
   Claude, Codex and Gemini; only the ones enabled here are polled and
-  shown on the dashboard. Resolve the default selection by probing the
-  laptop for each provider's CLI/auth artefact (the user typically only
-  has the providers they actually use):
-    - `claude` → `~/.claude/.credentials.json` exists and is non-empty,
-       or `~/.claude/settings.json` exists (Claude Code installed).
-    - `codex` → `~/.codex/auth.json` exists, or `~/.config/codex/`
-       exists, or `OPENAI_API_KEY` is set in the environment.
-    - `gemini` → `~/.gemini/oauth_creds.json` exists, or
-       `~/.config/gemini-cli/` exists, or `GEMINI_API_KEY` /
-       `GOOGLE_API_KEY` are set.
+  shown on the dashboard. Default selection rules:
+    - **Claude is always pre-selected.** If this skill is running at
+      all, it is running inside Claude Code (this plugin only exists as
+      a Claude Code plugin), so Claude is definitely an active provider
+      — no detection needed.
+    - **Codex** → pre-select if `~/.codex/auth.json` exists, or
+      `~/.config/codex/` exists, or `OPENAI_API_KEY` is set in the
+      environment.
+    - **Gemini** → pre-select if `~/.gemini/oauth_creds.json` exists,
+      or `~/.config/gemini-cli/` exists, or `GEMINI_API_KEY` /
+      `GOOGLE_API_KEY` are set.
 
-  Then call `AskUserQuestion` with `multiSelect: true`, pre-marking the
-  detected ones, with options:
+  Then call `AskUserQuestion` with `multiSelect: true`, pre-marking
+  Claude plus whichever of Codex/Gemini were detected, with options:
     - "Claude (Claude Code)"
     - "Codex (OpenAI)"
     - "Gemini (Google)"
 
-  If NONE were detected (rare — the user invoked this skill at all), ask
-  the same multi-select with all unchecked and require at least one.
+  The user can still uncheck Claude if they really want to (e.g. they
+  use Claude Code for other work but don't want it tracked on the
+  device). Require at least one provider selected.
+
   Send `provider_claude`, `provider_codex`, `provider_gemini` flags
   (`true` for selected, omit for not-selected — the broker treats the
   absence as "keep current", which on a fresh provision means disabled).
+
+- **rotation** — if the final selection has **2 or more providers**,
+  enable autorotation by passing `rotation_enabled: true` (a single
+  provider doesn't need rotation; passing it would just animate one
+  card swap into itself). Leave `rotation_interval_seconds` at the
+  broker's default (30 s) unless the user volunteers a number.
 
 ### 4. POST the provision
 
