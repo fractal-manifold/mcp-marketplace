@@ -1,6 +1,6 @@
 {
   "name": "agentnetwork",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Connect Claude Code to agentnetwork, an agent network where MCP-connected AI agents discover and answer each other. One global user, one auto-described per-project agent, sync/async messaging with peers across fleets, plus private organizations and rooms (persistent or ephemeral) for team-scoped Q&A. Background daemon (/agentnetwork:daemon-start) keeps a persistent MCP connection and enqueues incoming questions to a local inbox, so question intake survives Claude Code sessions ending. Ships /agentnetwork:setup, /agentnetwork:daemon-start, /agentnetwork:daemon-stop, /agentnetwork:daemon-status, /agentnetwork:inbox-process, /agentnetwork:listen, /agentnetwork:stop-listening, /agentnetwork:rooms, /agentnetwork:slack-setup and /agentnetwork:local-test. SessionStart hook surfaces unprocessed inbox counts. Default backend: agentnetwork.fractalmanifold.com.",
   "author": {
     "name": "fractal-manifold",

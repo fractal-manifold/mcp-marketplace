@@ -8,16 +8,20 @@ Identity model:
     and language manifests by `project_context.py`.
 
 Subcommands:
-  check               Probe server health, project key, cached tokens, MCP registration.
-                      Prints a single JSON line for the skill to branch on.
-  bootstrap           First-ever setup. Calls MCP `bootstrap` with no auth, captures
-                      both `userToken` (usr_*) and `agentBearerToken` (agt_*), caches
-                      them. Project context auto-derived from cwd/git toplevel.
-  register-project    Have user-token but no agent for this project. Calls MCP
-                      `register_agent` with the user-token, stores the new agt_* under
-                      the project key. Project context auto-derived.
-  install             Run `claude mcp add` with the project's cached agent token
-                      (default scope: project, writes to .mcp.json at the project root).
+  check                  Probe server health, project key, cached tokens, MCP registration.
+                         Prints a single JSON line for the skill to branch on.
+  start-verification     First-ever setup. Calls MCP `start_email_verification`; the
+                         server emails a 6-digit OTP AND a magic-link to the address.
+                         Returns `verificationId`.
+  complete-verification  Finish the verification flow. --code <N> for the OTP path,
+                         or --wait to poll the magic-link path. On success caches
+                         the user-token (usr_*) at USER_TOKEN_PATH.
+  list-emails            Print the user's verified emails (requires user-token).
+  register-project       Have user-token but no agent for this project. Calls MCP
+                         `register_agent` with the user-token, stores the new agt_*
+                         under the project key. Project context auto-derived.
+  install                Run `claude mcp add` with the project's cached agent token
+                         (default scope: project, writes to .mcp.json at the project root).
 
 stdlib only — no third-party deps.
 """
@@ -29,6 +33,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -302,35 +307,70 @@ def cmd_check(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_bootstrap(args: argparse.Namespace) -> int:
-    """First-ever setup: no tokens at all → create user + first agent for this project."""
-    root = project_root()
-    key = project_key(root)
-    ctx = extract_project_context(root)
+def cmd_start_verification(args: argparse.Namespace) -> int:
+    """Begin the real production-style email verification flow."""
     endpoint = args.base_url.rstrip("/") + "/mcp"
     sid = _open_session(endpoint, token=None)
-    payload = _call_tool(endpoint, token=None, sid=sid, name="bootstrap", args={
+    payload = _call_tool(endpoint, token=None, sid=sid, name="start_email_verification", args={
         "email": args.email,
-        "name": ctx["name"],
-        "description": ctx["description"],
-        "projectDescription": ctx["project_description"],
-        "tags": ctx["tags"],
+        "intent": args.intent or "create_account",
     })
-    user_token = payload.get("userToken")
-    agent_token = payload.get("agentBearerToken")
-    if not user_token or not agent_token:
-        raise RuntimeError(f"bootstrap response missing tokens: {payload}")
-    write_user_token(user_token)
-    write_agent_token(key, agent_token)
     print(json.dumps({
-        "status": "ok",
-        "project_root": str(root),
-        "project_key": key,
-        "user_token_path": str(USER_TOKEN_PATH),
-        "agent_token_path": str(agent_token_path(key)),
-        "agent_name": ctx["name"],
-        "tags": ctx["tags"],
+        "status": "sent",
+        "verificationId": payload.get("verificationId"),
+        "email": args.email,
+        "expiresInSeconds": payload.get("expiresInSeconds"),
     }))
+    return 0
+
+
+def cmd_complete_verification(args: argparse.Namespace) -> int:
+    """Complete an email verification.
+
+    Two modes:
+      • --code <N>   OTP path: verify once and exit.
+      • --wait       Polling path (magic-link): poll every 3s up to --timeout.
+    On success caches the user-token at USER_TOKEN_PATH.
+    """
+    endpoint = args.base_url.rstrip("/") + "/mcp"
+    sid = _open_session(endpoint, token=None)
+    timeout_s = args.timeout or 600
+    deadline = time.time() + timeout_s if args.wait else 0
+    while True:
+        call_args = {"verificationId": args.verification_id}
+        if args.code:
+            call_args["code"] = args.code
+        payload = _call_tool(endpoint, token=None, sid=sid, name="complete_email_verification", args=call_args)
+        status = payload.get("status")
+        if status == "issued":
+            user_token = payload.get("userToken")
+            if not user_token:
+                raise RuntimeError("complete_email_verification returned issued but no userToken")
+            write_user_token(user_token)
+            print(json.dumps({
+                "status": "issued",
+                "email": payload.get("email"),
+                "user_token_path": str(USER_TOKEN_PATH),
+            }))
+            return 0
+        if status == "pending" and args.wait and time.time() < deadline:
+            time.sleep(3)
+            continue
+        # pending (no --wait), bad_code, expired, already_consumed, unknown — surface verbatim.
+        print(json.dumps(payload))
+        return 0 if status == "issued" else (2 if status == "pending" else 1)
+
+
+def cmd_list_emails(args: argparse.Namespace) -> int:
+    """Print the calling user's verified emails."""
+    user_token = read_user_token()
+    if not user_token:
+        print(json.dumps({"status": "error", "reason": "no_user_token"}), file=sys.stderr)
+        return 2
+    endpoint = args.base_url.rstrip("/") + "/mcp"
+    sid = _open_session(endpoint, token=user_token)
+    payload = _call_tool(endpoint, token=user_token, sid=sid, name="list_my_emails", args={})
+    print(json.dumps(payload))
     return 0
 
 
@@ -345,10 +385,33 @@ def cmd_register_project(args: argparse.Namespace) -> int:
     ctx = extract_project_context(root)
     endpoint = args.base_url.rstrip("/") + "/mcp"
     sid = _open_session(endpoint, token=user_token)
+
+    # The server requires `email` and validates it is one of the calling user's
+    # verified emails. Resolve it: explicit --email wins; otherwise pick the
+    # primary verified email via list_my_emails. Fall back to the first one.
+    email = getattr(args, "email", None)
+    if not email:
+        try:
+            emails = _call_tool(endpoint, token=user_token, sid=sid, name="list_my_emails", args={})
+            items = emails.get("items") or []
+            primary = next((e for e in items if e and e.get("isPrimary")), None) or (items[0] if items else None)
+            if primary and primary.get("email"):
+                email = primary["email"]
+        except Exception:
+            pass
+        if not email:
+            print(json.dumps({
+                "status": "error",
+                "reason": "no_verified_email",
+                "hint": "No verified email cached for this user. Pass --email <addr> (must be a verified email on the agentnetwork user) or run start_email_verification + complete_email_verification first.",
+            }), file=sys.stderr)
+            return 2
+
     payload = _call_tool(endpoint, token=user_token, sid=sid, name="register_agent", args={
         "name": ctx["name"],
         "description": ctx["description"],
         "projectDescription": ctx["project_description"],
+        "email": email,
         "tags": ctx["tags"],
     })
     agent_token = payload.get("agentBearerToken")
@@ -361,6 +424,7 @@ def cmd_register_project(args: argparse.Namespace) -> int:
         "project_key": key,
         "agent_token_path": str(agent_token_path(key)),
         "agent_name": ctx["name"],
+        "agent_email": email,
         "tags": ctx["tags"],
     }))
     return 0
@@ -427,12 +491,27 @@ def main() -> int:
     pc.add_argument("--base-url", default=os.environ.get("AN_BASE_URL", "https://agentnetwork.fractalmanifold.com"))
     pc.add_argument("--scope", default="project", choices=["user", "project", "local"])
 
-    pb = sub.add_parser("bootstrap")
-    pb.add_argument("--base-url", default=os.environ.get("AN_BASE_URL", "https://agentnetwork.fractalmanifold.com"))
-    pb.add_argument("--email", required=True)
+    psv = sub.add_parser("start-verification")
+    psv.add_argument("--base-url", default=os.environ.get("AN_BASE_URL", "https://agentnetwork.fractalmanifold.com"))
+    psv.add_argument("--email", required=True)
+    psv.add_argument("--intent", default="create_account", choices=["create_account", "add_email"])
+
+    pcv = sub.add_parser("complete-verification")
+    pcv.add_argument("--base-url", default=os.environ.get("AN_BASE_URL", "https://agentnetwork.fractalmanifold.com"))
+    pcv.add_argument("--verification-id", required=True, dest="verification_id")
+    pcv.add_argument("--code", default=None)
+    pcv.add_argument("--wait", action="store_true",
+                     help="Poll until status=issued, status=expired, or --timeout elapses.")
+    pcv.add_argument("--timeout", type=int, default=600,
+                     help="Max seconds to poll when --wait is set (default 600).")
+
+    ple = sub.add_parser("list-emails")
+    ple.add_argument("--base-url", default=os.environ.get("AN_BASE_URL", "https://agentnetwork.fractalmanifold.com"))
 
     pr = sub.add_parser("register-project")
     pr.add_argument("--base-url", default=os.environ.get("AN_BASE_URL", "https://agentnetwork.fractalmanifold.com"))
+    pr.add_argument("--email", default=None,
+                    help="Override which verified email the new agent registers from. Defaults to the user's primary verified email (queried via list_my_emails).")
 
     pi = sub.add_parser("install")
     pi.add_argument("--base-url", default=os.environ.get("AN_BASE_URL", "https://agentnetwork.fractalmanifold.com"))
@@ -444,8 +523,12 @@ def main() -> int:
     try:
         if args.cmd == "check":
             return cmd_check(args)
-        if args.cmd == "bootstrap":
-            return cmd_bootstrap(args)
+        if args.cmd == "start-verification":
+            return cmd_start_verification(args)
+        if args.cmd == "complete-verification":
+            return cmd_complete_verification(args)
+        if args.cmd == "list-emails":
+            return cmd_list_emails(args)
         if args.cmd == "register-project":
             return cmd_register_project(args)
         if args.cmd == "install":
