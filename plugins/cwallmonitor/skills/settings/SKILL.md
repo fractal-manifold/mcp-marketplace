@@ -60,20 +60,54 @@ argument from the table below. **Only send arguments the user actually
 asked to change** — every other field is left as-is on the device
 (omitted arguments mean "keep current").
 
+On the device the Settings screen is grouped into five visible
+sections; the same grouping is reflected here so it's easy to find
+the matching MCP argument when the user references "the Display
+section" or "the Audio settings".
+
+#### Providers
+
 | User intent                       | MCP argument               | Valid range / format               |
 | --------------------------------- | -------------------------- | ---------------------------------- |
-| City (weather / sunrise)          | `city`                     | string, 1..64 chars                |
-| Day brightness                    | `br_day`                   | int, 10..100 (% of backlight)      |
-| Night brightness                  | `br_night`                 | int, 5..100 (% of backlight)       |
-| Alert volume                      | `vol`                      | int, 0..100 (% of audio level)     |
 | Enable Claude provider            | `provider_claude`          | bool                               |
 | Enable Codex provider             | `provider_codex`           | bool                               |
 | Enable Gemini provider            | `provider_gemini`          | bool                               |
+
+#### Display
+
+| User intent                       | MCP argument               | Valid range / format               |
+| --------------------------------- | -------------------------- | ---------------------------------- |
 | Auto-rotate enabled               | `autorotate_enabled`       | bool                               |
 | Auto-rotate interval (seconds)    | `autorotate_interval_s`    | int, 10..300                       |
 | Theme (day / night / auto)        | `theme_mode`               | one of `day`, `night`, `auto`      |
+| Day brightness                    | `br_day`                   | int, 10..100 (% of backlight)      |
+| Night brightness                  | `br_night`                 | int, 5..100 (% of backlight)       |
+
+#### Network
+
+| User intent                       | MCP argument               | Valid range / format               |
+| --------------------------------- | -------------------------- | ---------------------------------- |
+| City (weather / sunrise)          | `city`                     | string, 1..64 chars                |
 | Broker URL                        | `broker_url`               | full URL (e.g. `http://10.0.0.5:8787`) |
 | Pairing passphrase / PSK rotation | `psk_hex`                  | exactly 64 lowercase hex chars     |
+
+#### Audio
+
+| User intent                       | MCP argument               | Valid range / format               |
+| --------------------------------- | -------------------------- | ---------------------------------- |
+| Alert volume                      | `vol`                      | int, 0..100 (% of audio level)     |
+
+#### About (read-only on the device)
+
+The device's Settings screen also exposes an **About** section with
+Device ID, running firmware version, IP address and active broker
+URL. These are diagnostic readouts — there is no MCP argument to
+change them (Device ID is assigned at first boot, firmware comes
+from the running image, IP from DHCP, and Broker URL mirrors the
+editable `broker_url` above). If the user asks "what's the IP /
+firmware / device ID of my wall monitor", call
+`wall_monitor_list_devices` and read the active fields from the
+registry — do NOT queue a pending change.
 
 Clamp numeric values to the listed ranges and warn the user if you had
 to clamp. For `theme_mode`, normalise (`dark`→`night`, `light`→`day`,
