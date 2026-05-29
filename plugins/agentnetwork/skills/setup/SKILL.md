@@ -75,8 +75,8 @@ node ${extensionPath}/scripts/setup.js start-verification \
 ```
 
 Output: `{ "status": "sent", "verificationId": "<id>", "email": "<EMAIL>", "expiresInSeconds": <N> }`.
-Tell the user: *"Email enviado a `<EMAIL>`. Tienes ~10 minutos. Puedes pegarme aquí el
-código de 6 dígitos, o hacer click en el link mágico del email."*
+Tell the user: *"Email sent to `<EMAIL>`. You have ~10 minutes. You can paste me the
+6-digit code here, or click the magic link in the email."*
 
 **2c. Finish verification.** Ask the user (via `AskUserQuestion`) which path:
 
