@@ -226,7 +226,26 @@ async def _dispatch(deps: Deps, name: str, args: dict) -> Any:
         return await _discover_devices(args)
     if name == "wall_monitor_provision":
         return await _provision(deps, args)
+    if name == "wall_monitor_check_updates":
+        return await _check_updates(deps, args)
     return {"error": f"unknown tool {name}"}
+
+
+def _ota_info(cfg: Config) -> dict:
+    """Static OTA-channel config for wall_monitor_status. Live data (latest
+    release per SKU, would-stage devices) is intentionally not here — it
+    needs a network round-trip and may differ per process; use
+    wall_monitor_check_updates (dry_run) for that. Mirror of Go otaInfoOf."""
+    out: dict[str, Any] = {
+        "enabled": cfg.ota.enabled,
+        "configured": cfg.ota.configured(),
+        "configured_keys": len(cfg.ota.keys),
+    }
+    if cfg.ota.releases_repo:
+        out["releases_repo"] = cfg.ota.releases_repo
+    if cfg.ota.poll_interval_minutes:
+        out["poll_interval_minutes"] = cfg.ota.poll_interval_minutes
+    return out
 
 
 def _status(deps: Deps) -> dict:
@@ -236,8 +255,24 @@ def _status(deps: Deps) -> dict:
         "addr": _broker_addr(deps.cfg),
         "oauth_path": deps.cfg.oauth_path_abs(),
         "config": _config_info(deps.cfg),
+        "ota": _ota_info(deps.cfg),
         "snapshot": snap.to_dict(),
     }
+
+
+async def _check_updates(deps: Deps, args: dict) -> dict:
+    """Force an OTA-channel check now and report (or stage) what the
+    background loop would do. Works from any process — it only needs the
+    config + registry — so a follower session can preview updates even when
+    a different process owns the broker. Mirror of Go handleCheckUpdates."""
+    from .. import ota
+
+    if deps.registry is None:
+        return {"error": _registry_unavailable_text()}
+    dry_run = bool(args.get("dry_run", True))
+    sku = (args.get("sku") or "").strip().upper()
+    device_id = (args.get("device_id") or "").strip().lower()
+    return await ota.check(deps.cfg, deps.registry, dry_run=dry_run, sku_filter=sku, device_filter=device_id)
 
 
 async def _health(deps: Deps) -> dict:

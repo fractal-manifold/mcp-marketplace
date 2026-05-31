@@ -12,6 +12,7 @@ import { randomBytes, createHash } from "node:crypto";
 
 import * as auth from "../auth.js";
 import * as creds from "../creds.js";
+import * as ota from "../ota.js";
 import { validDeviceID } from "../registry/store.js";
 import { firmwarePath } from "../config.js";
 
@@ -167,8 +168,24 @@ async function dispatch(deps, name, args) {
     case "wall_monitor_revert_firmware": return revertFirmwareTool(deps, args);
     case "wall_monitor_discover_devices": return await discoverDevicesTool(args);
     case "wall_monitor_provision": return await provisionTool(deps, args);
+    case "wall_monitor_check_updates": return await checkUpdatesTool(deps, args);
     default: return { error: `unknown tool ${name}` };
   }
+}
+
+// Static OTA-channel config for wall_monitor_status. Live data (latest
+// release per SKU, would-stage devices) is intentionally not here — it
+// needs a network round-trip and may differ per process; use
+// wall_monitor_check_updates (dry_run) for that. Mirror of Go otaInfoOf.
+function otaInfo(cfg) {
+  const out = {
+    enabled: cfg.ota.enabled,
+    configured: cfg.otaConfigured(),
+    configured_keys: cfg.ota.keys.length,
+  };
+  if (cfg.ota.releases_repo) out.releases_repo = cfg.ota.releases_repo;
+  if (cfg.ota.poll_interval_minutes) out.poll_interval_minutes = cfg.ota.poll_interval_minutes;
+  return out;
 }
 
 function statusTool(deps) {
@@ -177,8 +194,21 @@ function statusTool(deps) {
     addr: brokerAddr(deps.cfg),
     oauth_path: deps.cfg.oauthPathAbs(),
     config: configInfo(deps.cfg),
+    ota: otaInfo(deps.cfg),
     snapshot: deps.state.snapshot(),
   };
+}
+
+// Force an OTA-channel check now and report (or stage) what the background
+// loop would do. Works from any process — it only needs the config +
+// registry — so a follower session can preview updates even when a
+// different process owns the broker. Mirror of Go handleCheckUpdates.
+async function checkUpdatesTool(deps, args) {
+  if (!deps.registry) return { error: registryUnavailableMsg() };
+  const dryRun = args.dry_run === undefined ? true : !!args.dry_run;
+  const sku = String(args.sku || "").trim().toUpperCase();
+  const deviceID = String(args.device_id || "").trim().toLowerCase();
+  return await ota.check(deps.cfg, deps.registry, { dryRun, skuFilter: sku, deviceFilter: deviceID });
 }
 
 async function healthTool(deps) {

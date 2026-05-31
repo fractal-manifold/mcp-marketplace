@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import os
 import tomllib
@@ -88,6 +90,47 @@ class Serial:
 
 
 @dataclass
+class OTAKey:
+    """One entry in the OTA verification keyring: a key_id matching the
+    manifest's key_id field, and the 32-byte raw Ed25519 public key,
+    base64-std encoded. Mirror of Go config.OTAKey."""
+
+    key_id: str = ""
+    pubkey_b64: str = ""
+
+
+@dataclass
+class OTA:
+    """Broker-driven OTA config. Mirror of Go config.OTAConfig.
+
+    The loop runs only on the leader and is inert (does nothing) unless
+    enabled, a repo is set, and at least one key is present — without a
+    pubkey the broker cannot verify a manifest and refuses to stage one
+    it can't authenticate."""
+
+    enabled: bool = True
+    releases_repo: str = "https://github.com/fractal-manifold/cwm-ota-releases"
+    poll_interval_minutes: int = 60
+    keys: list[OTAKey] = field(default_factory=list)
+
+    def configured(self) -> bool:
+        return self.enabled and bool(self.releases_repo) and len(self.keys) > 0
+
+    def pubkey(self, key_id: str) -> bytes | None:
+        """Return the 32-byte raw Ed25519 public key for key_id, or None
+        when the keyring has no matching, well-formed entry."""
+        for k in self.keys:
+            if k.key_id != key_id:
+                continue
+            try:
+                b = base64.b64decode(k.pubkey_b64.strip(), validate=True)
+            except (binascii.Error, ValueError):
+                return None
+            return b if len(b) == 32 else None
+        return None
+
+
+@dataclass
 class Config:
     server: Server = field(default_factory=Server)
     auth: Auth = field(default_factory=Auth)
@@ -98,6 +141,7 @@ class Config:
     security: Security = field(default_factory=Security)
     logging: Logging = field(default_factory=Logging)
     serial: Serial = field(default_factory=Serial)
+    ota: OTA = field(default_factory=OTA)
     psk_bytes: bytes = b""
 
     def psk(self) -> bytes:
@@ -153,6 +197,20 @@ def load(path: str | None = None) -> Config:
     _section(raw, "security", cfg.security)
     _section(raw, "logging", cfg.logging)
     _section(raw, "serial", cfg.serial)
+
+    # [ota] needs bespoke parsing: the nested [[ota.keys]] array of tables
+    # doesn't map through _section's flat setattr loop.
+    ota_raw = raw.get("ota") or {}
+    if "enabled" in ota_raw:
+        cfg.ota.enabled = bool(ota_raw["enabled"])
+    if "releases_repo" in ota_raw:
+        cfg.ota.releases_repo = str(ota_raw["releases_repo"])
+    if "poll_interval_minutes" in ota_raw:
+        cfg.ota.poll_interval_minutes = int(ota_raw["poll_interval_minutes"])
+    cfg.ota.keys = [
+        OTAKey(key_id=str(k.get("key_id", "")), pubkey_b64=str(k.get("pubkey_b64", "")))
+        for k in (ota_raw.get("keys") or [])
+    ]
 
     if cfg.auth.psk_passphrase:
         if len(cfg.auth.psk_passphrase) < 8:

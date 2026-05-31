@@ -48,6 +48,16 @@ function defaults() {
     security: { max_timestamp_skew_seconds: 60, nonce_cache_ttl_seconds: 300 },
     logging: { level: "INFO" },
     serial: { device: "", baud: 115200, lines: 2000 },
+    // Broker-driven OTA. Mirror of Go config.OTAConfig. Enabled by default
+    // but inert until a [[ota.keys]] entry is added — without a pubkey the
+    // broker can't verify a manifest and refuses to stage one it can't
+    // authenticate.
+    ota: {
+      enabled: true,
+      releases_repo: "https://github.com/fractal-manifold/cwm-ota-releases",
+      poll_interval_minutes: 60,
+      keys: [],
+    },
     pskBytes: Buffer.alloc(0),
   };
 }
@@ -69,9 +79,16 @@ export function load(path) {
   const raw = readFileSync(resolved, "utf8");
   const parsed = TOML.parse(raw);
   const cfg = defaults();
-  for (const k of ["server", "auth", "credentials", "codex", "gemini", "usage", "security", "logging", "serial"]) {
+  for (const k of ["server", "auth", "credentials", "codex", "gemini", "usage", "security", "logging", "serial", "ota"]) {
     mergeSection(cfg, parsed, k);
   }
+  // @iarna/toml parses [[ota.keys]] into an array of {key_id, pubkey_b64}
+  // objects; Object.assign copies it verbatim. Normalise to a clean array
+  // of strings so callers don't trip on missing fields.
+  cfg.ota.keys = (Array.isArray(cfg.ota.keys) ? cfg.ota.keys : []).map((k) => ({
+    key_id: String((k && k.key_id) || ""),
+    pubkey_b64: String((k && k.pubkey_b64) || ""),
+  }));
   if (cfg.auth.psk_passphrase) {
     if (cfg.auth.psk_passphrase.length < 8) throw new Error("auth.psk_passphrase must be at least 8 characters");
     cfg.pskBytes = createHash("sha256").update(cfg.auth.psk_passphrase, "utf8").digest();
@@ -95,6 +112,18 @@ export function load(path) {
       ? cfg.gemini.models
       : DEFAULT_GEMINI_MODELS;
     return src.slice(0, MAX_GEMINI_MODELS);
+  };
+  // OTA keyring helpers — mirror of Go OTAConfig.Configured()/Pubkey().
+  cfg.otaConfigured = () => cfg.ota.enabled && !!cfg.ota.releases_repo && cfg.ota.keys.length > 0;
+  cfg.otaPubkey = (keyID) => {
+    for (const k of cfg.ota.keys) {
+      if (k.key_id !== keyID) continue;
+      let b;
+      try { b = Buffer.from(k.pubkey_b64.trim(), "base64"); }
+      catch { return null; }
+      return b.length === 32 ? b : null;
+    }
+    return null;
   };
   return cfg;
 }

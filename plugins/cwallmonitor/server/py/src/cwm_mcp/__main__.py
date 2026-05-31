@@ -14,6 +14,7 @@ from aiohttp import web
 
 from . import RUNTIME, __version__
 from . import auth, creds
+from . import ota
 from . import usage
 from .broker.server import make_app
 from .config import devices_path, load
@@ -118,9 +119,15 @@ async def _run_daemon(cfg, logs: Buffer, logger: logging.Logger) -> int:
             mdns_pub = await MdnsPublisher.start(cfg.server.bind, cfg.server.port, registry)
         except Exception as e:  # noqa: BLE001
             logger.warning("mdns: %s (broker discovery disabled)", e)
+    # Pull-OTA poller (inert unless [ota] is configured). This process is the
+    # leader by construction in daemon mode (it owns the bound socket).
+    ota_stop = asyncio.Event()
+    ota_task = asyncio.create_task(ota.run(cfg, registry, ota_stop))
     try:
         await asyncio.Event().wait()
     finally:
+        ota_stop.set()
+        await ota_task
         if mdns_pub is not None:
             await mdns_pub.close()
         if tailer:
@@ -158,9 +165,13 @@ async def _run_mcp(cfg, logs: Buffer, logger: logging.Logger) -> int:
                 mdns_pub = await MdnsPublisher.start(cfg.server.bind, cfg.server.port, registry)
             except Exception as e:  # noqa: BLE001
                 logger.warning("mdns: %s (broker discovery disabled)", e)
+        # Pull-OTA poller, scoped to leadership: it shares the same `stop`
+        # event, so losing the bind tears it down alongside mDNS/the tailer.
+        ota_task = asyncio.create_task(ota.run(cfg, registry, stop))
         try:
             await stop.wait()
         finally:
+            await ota_task
             if mdns_pub is not None:
                 await mdns_pub.close()
             if tailer:

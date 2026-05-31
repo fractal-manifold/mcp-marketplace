@@ -8,6 +8,7 @@ import process from "node:process";
 import { VERSION, RUNTIME } from "./version.js";
 import * as auth from "./auth.js";
 import * as creds from "./creds.js";
+import * as ota from "./ota.js";
 import * as usage from "./usage.js";
 import { load as loadConfig, devicesPath } from "./config.js";
 import { Buffer as LogBuffer } from "./logbuf.js";
@@ -122,9 +123,14 @@ async function runDaemon(cfg, logs, logger) {
     try { mdnsPub = await MdnsPublisher.start(cfg.server.bind, cfg.server.port, registry, logger); }
     catch (e) { logger.warn(`mdns: ${e.message} (broker discovery disabled)`); }
   }
+  // Pull-OTA poller (inert unless [ota] is configured). This process is the
+  // leader by construction in daemon mode — it owns the bound socket.
+  const otaAbort = new AbortController();
+  ota.run(cfg, registry, otaAbort.signal, logger);
   try {
     await new Promise(() => {}); // run until killed
   } finally {
+    otaAbort.abort();
     if (mdnsPub) await mdnsPub.close();
   }
   return 0;
@@ -161,6 +167,9 @@ async function runMCP(cfg, logs, logger) {
       try { mdnsPub = await MdnsPublisher.start(cfg.server.bind, cfg.server.port, registry, logger); }
       catch (e) { logger.warn(`mdns: ${e.message} (broker discovery disabled)`); }
     }
+    // Pull-OTA poller, scoped to leadership: it shares the leader's abort
+    // signal, so losing the bind tears it down alongside mDNS/the tailer.
+    ota.run(cfg, registry, abortCtrl.signal, logger);
     try {
       await new Promise((resolve) => {
         abortCtrl.signal.addEventListener("abort", resolve, { once: true });
