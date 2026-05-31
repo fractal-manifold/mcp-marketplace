@@ -1,7 +1,7 @@
 {
   "name": "cwallmonitor",
-  "version": "0.4.0",
-  "description": "Registers cwm-mcp — the local broker for the C Wall Monitor ESP32 device. Provides four diagnostic tools (wall_monitor_status, wall_monitor_health, wall_monitor_recent_logs, wall_monitor_provision_hint) and three on-device skills (/cwallmonitor:configure for first-time pairing, /cwallmonitor:settings to remotely change any runtime setting the on-device Settings panel exposes, /cwallmonitor:theme as a shortcut for Day/Night/Auto theme switching). Runs alongside Claude Code with leader-elected coexistence so multiple sessions and an existing systemd daemon don't fight over the broker port. Requires the cwm-mcp binary to be installed and on PATH (go install github.com/fractal-manifold/cwm-mcp/cmd/cwm-mcp@latest).",
+  "version": "0.5.0",
+  "description": "Registers cwm-mcp — the local broker for the C Wall Monitor ESP32 device. Provides four diagnostic tools (wall_monitor_status, wall_monitor_health, wall_monitor_recent_logs, wall_monitor_provision_hint) and three on-device skills (/cwallmonitor:configure for first-time pairing, /cwallmonitor:settings to remotely change any runtime setting the on-device Settings panel exposes, /cwallmonitor:theme as a shortcut for Day/Night/Auto theme switching). Runs alongside Claude Code with leader-elected coexistence so multiple sessions and an existing systemd daemon don't fight over the broker port. Self-contained: bundles the MCP server under server/ and resolves its runtime (Node, Python or Go) on first launch into a per-user cache — no separate go install / pipx / npm step.",
   "author": {
     "name": "fractal-manifold",
     "url": "https://github.com/fractal-manifold"

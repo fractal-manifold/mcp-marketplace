@@ -1,0 +1,387 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema",
+  "$comment": "Authoritative MCP tool definitions for cwm-mcp. Every impl (Go, Python, JS) must register tools with these exact name/description/inputSchema triples. The Python and JS servers load this file at runtime; the Go server hardcodes equivalent mcp.NewTool registrations in internal/mcp/{server,devices,discovery,ota}.go and must be kept in sync by hand.",
+  "version": 5,
+  "tools": [
+    {
+      "name": "wall_monitor_status",
+      "description": "Snapshot of the cwm-mcp broker: role (leader/follower), when the role started, and the most recent ESP32 request (timestamp, remote address, HTTP status, count).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "wall_monitor_health",
+      "description": "End-to-end diagnostic. Checks the OAuth credentials file (presence, parseability, expiry) and self-pings the broker over HTTP with a signed request. Returns one PASS/FAIL block per component.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "wall_monitor_recent_logs",
+      "description": "Tail the broker log buffer (in-memory). Useful to see why the device is being rejected or which IPs are polling. Default is the last 50 lines.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "limit": {
+            "type": "string",
+            "description": "How many lines to return (1..500). Defaults to 50."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "wall_monitor_firmware_logs",
+      "description": "Tail the ESP-IDF log stream from the device over USB-CDC. Requires `[serial] device` to be set in cwm.toml on the laptop running cwm-mcp. The tool fetches via a signed HTTP GET to the broker, so any cwm-mcp session (leader or follower) returns the same lines. Default is the last 200 lines; max 2000.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "limit": {
+            "type": "string",
+            "description": "How many lines to return (1..2000). Defaults to 200."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "wall_monitor_provision_hint",
+      "description": "Print the address(es) the device should be told to poll in its captive portal `svc_url` field \u2014 i.e. the laptop's non-loopback IPv4 interfaces, paired with the configured broker port.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "wall_monitor_list_devices",
+      "description": "List every device known to the local cwm-mcp registry, with its active config version, whether a pending update is queued, the last time it polled, and which providers are enabled. Returns an empty list when no devices have been registered yet.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "wall_monitor_register_device",
+      "description": "Register a device in the local registry so its future polls are recognised. Required for any device that was originally provisioned via the captive portal (which doesn't know about device_ids). Pass the device_id printed on the device (or the first 8 hex chars of its MAC), the broker_url it points to, the PSK hex it derived from its passphrase, and any optional config you want to seed.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "device_id": {
+            "type": "string",
+            "description": "8 lowercase hex chars (the device prints this in serial logs)."
+          },
+          "broker_url": {
+            "type": "string",
+            "description": "HTTP(S) URL of the cwm-mcp broker the device should poll. Use wall_monitor_provision_hint to learn the laptop's reachable address; the URL depends on the user's network."
+          },
+          "psk_hex": {
+            "type": "string",
+            "description": "64 lowercase hex chars; for legacy devices it's sha256(passphrase) hex."
+          },
+          "city": {
+            "type": "string",
+            "description": "e.g. Madrid"
+          },
+          "br_day": {
+            "type": "number",
+            "description": "Daytime brightness, 10..100."
+          },
+          "br_night": {
+            "type": "number",
+            "description": "Nighttime brightness, 5..100."
+          },
+          "vol": {
+            "type": "number",
+            "description": "Alert volume, 0..100."
+          }
+        },
+        "required": [
+          "device_id",
+          "broker_url",
+          "psk_hex"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "wall_monitor_set_device_pending",
+      "description": "Stage a pending config update for a registered device. The next time the device polls /device/<id>/sync, it will receive the encrypted payload and apply it under the candidate/rollback safety net. Only fields you supply are changed; omitted fields keep their active value. Setting psk_hex triggers a key rotation that the broker tracks via two-PSK acceptance until the device confirms.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "device_id": {
+            "type": "string",
+            "description": "8 lowercase hex chars."
+          },
+          "broker_url": {
+            "type": "string",
+            "description": "New broker URL."
+          },
+          "psk_hex": {
+            "type": "string",
+            "description": "New 64-hex PSK to rotate to."
+          },
+          "city": {
+            "type": "string",
+            "description": "New city for ambient weather."
+          },
+          "br_day": {
+            "type": "number",
+            "description": "Daytime brightness 10..100."
+          },
+          "br_night": {
+            "type": "number",
+            "description": "Nighttime brightness 5..100."
+          },
+          "vol": {
+            "type": "number",
+            "description": "Alert volume 0..100."
+          },
+          "provider_claude": {
+            "type": "boolean",
+            "description": "Enable the Claude provider on the device."
+          },
+          "provider_codex": {
+            "type": "boolean",
+            "description": "Enable the Codex provider on the device."
+          },
+          "provider_gemini": {
+            "type": "boolean",
+            "description": "Enable the Gemini provider on the device."
+          },
+          "autorotate_enabled": {
+            "type": "boolean",
+            "description": "Cycle through enabled providers on the dashboard."
+          },
+          "autorotate_interval_s": {
+            "type": "number",
+            "description": "Seconds between provider cycles, 1..300."
+          },
+          "theme_mode": {
+            "type": "string",
+            "enum": [
+              "day",
+              "night",
+              "auto"
+            ],
+            "description": "Theme mode applied on the device: 'day' (light palette), 'night' (dark palette) or 'auto' (follows sunrise/sunset). The change takes effect on the reboot that follows promotion."
+          },
+          "gemini_models": {
+            "type": "string",
+            "description": "Comma-separated list of Gemini model IDs to show on the dashboard (max 3). Example: 'gemini-2.5-pro,gemini-2.5-flash'. Empty string clears the override and falls back to the broker's global default (service.toml [gemini].models)."
+          },
+          "firmware_url": {
+            "type": "string",
+            "description": "Direct HTTPS URL of the .bin to install. Either point at this broker's own /firmware/<file> (preferred for LAN dev) or any external HTTPS host (GitHub release, S3\u2026). Must be set together with firmware_sha256 and firmware_version; otherwise the device ignores all three. Prefer wall_monitor_publish_firmware for the local-hosting flow."
+          },
+          "firmware_sha256": {
+            "type": "string",
+            "description": "Lowercase hex SHA-256 (64 chars) of the .bin at firmware_url. The device computes the SHA from what actually landed in the inactive flash slot and refuses to set_boot_partition on mismatch."
+          },
+          "firmware_version": {
+            "type": "string",
+            "description": "Version string baked into the .bin's esp_app_desc header (CONFIG_APP_PROJECT_VER in sdkconfig.defaults). The device refuses to install if the running image already matches this string, preventing reinstall loops."
+          },
+          "firmware_manifest_b64": {
+            "type": "string",
+            "description": "Base64 of the canonical-JSON Ed25519 manifest produced by `firmware/components/ota/scripts/manifest.py sign`. The device verifies sig(manifest) BEFORE downloading the .bin and refuses unsigned manifests unless built with CWM_OTA_UNSIGNED=y. Must be supplied together with firmware_manifest_sig_b64."
+          },
+          "firmware_manifest_sig_b64": {
+            "type": "string",
+            "description": "Base64 of the 64-byte Ed25519 signature over the manifest bytes (the `signature_b64` field from `manifest.py sign`'s output). Must be supplied together with firmware_manifest_b64."
+          }
+        },
+        "required": [
+          "device_id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "wall_monitor_publish_firmware",
+      "description": "Stage a firmware OTA for a registered device. Copies the .bin from bin_path into the broker's firmware directory (~/.config/claude-wall-monitor/firmware), computes the SHA-256, then queues a pending update with firmware_url pointing back at this broker's /firmware/<file> endpoint. The device picks up the change on its next /sync, downloads + verifies via the encrypted pending blob, switches the boot slot and reboots. If the new image's first broker poll fails, the bootloader auto-rolls back. Use external_url to point at an off-broker host (S3, GitHub Releases) instead of copying locally.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "device_id": {
+            "type": "string",
+            "description": "8 lowercase hex chars."
+          },
+          "bin_path": {
+            "type": "string",
+            "description": "Absolute path to the freshly-built firmware .bin (e.g. firmware/build/cwm_wall_monitor.bin). Required when external_url is not set."
+          },
+          "firmware_version": {
+            "type": "string",
+            "description": "Version string matching CWM_VERSION_STRING / CONFIG_APP_PROJECT_VER in the built image. Used as the destination filename (cwm-<version>.bin) and as the on-device dedupe key."
+          },
+          "external_url": {
+            "type": "string",
+            "description": "Optional HTTPS URL to use instead of /firmware/<file>. When set, bin_path is ignored and the SHA must be supplied via sha256_hex."
+          },
+          "sha256_hex": {
+            "type": "string",
+            "description": "Optional precomputed SHA-256. Required when external_url is set; ignored otherwise (we compute it from bin_path)."
+          }
+        },
+        "required": [
+          "device_id",
+          "firmware_version"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "wall_monitor_revert_firmware",
+      "description": "Stage a rollback to a previously-shipped firmware version. The broker enforces anti-rollback: if target_min_secure_version is below the device's current floor (Active.MinSecureVersion in the registry), the call is rejected upfront. The device's own gate against the manifest's min_secure_version is the ultimate authority.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "device_id",
+          "firmware_url",
+          "firmware_sha256",
+          "firmware_version",
+          "firmware_manifest_b64",
+          "firmware_manifest_sig_b64"
+        ],
+        "properties": {
+          "device_id": {
+            "type": "string",
+            "description": "8 lowercase hex chars."
+          },
+          "firmware_url": {
+            "type": "string",
+            "description": "HTTPS URL of the target .bin."
+          },
+          "firmware_sha256": {
+            "type": "string",
+            "description": "64 lowercase hex chars."
+          },
+          "firmware_version": {
+            "type": "string",
+            "description": "semver MAJOR.MINOR.PATCH of the target."
+          },
+          "firmware_manifest_b64": {
+            "type": "string",
+            "description": "Canonical manifest base64."
+          },
+          "firmware_manifest_sig_b64": {
+            "type": "string",
+            "description": "Ed25519 sig base64."
+          },
+          "target_min_secure_version": {
+            "type": "number",
+            "description": "Packed 8.8.16 semver. Broker rejects if below the device's cwm_min_sv mirror."
+          }
+        }
+      }
+    },
+    {
+      "name": "wall_monitor_discover_devices",
+      "description": "Scan the local network via mDNS for Claude Wall Monitor devices that have just connected to WiFi and are waiting for an initial config (`_cwm._tcp.local.`). Returns one entry per device with its device_id, firmware version, hostname, IPv4 address(es) and the URL to POST a /provision payload to. The pairing code is NOT returned \u2014 the user must read it from the device's screen. Default scan window is 4 seconds.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "timeout_seconds": {
+            "type": "number",
+            "description": "Browse window in seconds (1..15). Defaults to 4."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "wall_monitor_provision",
+      "description": "Send the initial config to a device that is currently in BOOT_NEEDS_CONFIG. Requires the 6-digit pairing code the user reads off the device's screen, plus the broker URL and PSK hex you want the device to start using. On success the device persists the config to NVS and reboots into BOOT_READY. If broker_url + psk_hex are supplied, this tool also registers the device in the local cwm-mcp registry so subsequent control-plane polls (/device/<id>/sync) are recognised.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "device_id": {
+            "type": "string",
+            "description": "8 lowercase hex chars from the device screen or wall_monitor_discover_devices output."
+          },
+          "provision_url": {
+            "type": "string",
+            "description": "The full http://HOST:80/provision URL from wall_monitor_discover_devices."
+          },
+          "pairing_code": {
+            "type": "string",
+            "description": "6-digit code shown on the device's screen."
+          },
+          "broker_url": {
+            "type": "string",
+            "description": "HTTP(S) URL of the cwm-mcp broker the device should poll. Run wall_monitor_provision_hint to learn the laptop's reachable URL on this LAN; do not assume a specific IP. If omitted, only the optional fields below are pushed."
+          },
+          "psk_hex": {
+            "type": "string",
+            "description": "64-hex PSK the device should sign requests with."
+          },
+          "city": {
+            "type": "string",
+            "description": "Optional city for ambient weather."
+          },
+          "br_day": {
+            "type": "number",
+            "description": "Daytime brightness 10..100."
+          },
+          "br_night": {
+            "type": "number",
+            "description": "Nighttime brightness 5..100."
+          },
+          "vol": {
+            "type": "number",
+            "description": "Alert volume 0..100."
+          },
+          "provider_claude": {
+            "type": "boolean",
+            "description": "Enable Claude provider."
+          },
+          "provider_codex": {
+            "type": "boolean",
+            "description": "Enable Codex provider."
+          },
+          "provider_gemini": {
+            "type": "boolean",
+            "description": "Enable Gemini provider."
+          }
+        },
+        "required": [
+          "device_id",
+          "provision_url",
+          "pairing_code"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "wall_monitor_check_updates",
+      "description": "Poll the public OTA releases repo (configured in cwm.toml [ota].releases_repo) for the latest signed firmware per SKU, and stage a pending OTA for every registered device whose SKU matches and whose installed version is older. The broker verifies the manifest's Ed25519 signature against the [[ota.keys]] keyring BEFORE staging; the device verifies it again on-device. By default this runs as a background loop every [ota].poll_interval_minutes on the leader; this tool forces a check now. Use dry_run=true (the default) to preview what would be staged without writing anything.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "dry_run": {
+            "type": "boolean",
+            "description": "When true (default), report what would be staged without writing any pending. Set false to actually stage the updates."
+          },
+          "sku": {
+            "type": "string",
+            "description": "Optional 2-char SKU (or 'DEV') to restrict the check to a single SKU. Omit to check every SKU present among registered devices."
+          },
+          "device_id": {
+            "type": "string",
+            "description": "Optional 8-lowercase-hex device id to restrict staging to a single device. Omit to consider every matching device."
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  ]
+}

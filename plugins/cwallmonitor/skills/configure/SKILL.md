@@ -19,14 +19,19 @@ code; this skill bridges that gap end-to-end without leaving Claude Code.
 
 ## Prerequisites
 
-- `cwm-mcp` is running on the user's laptop (the `cwallmonitor`
-  plugin's MCP server registers it). Verify with
-  `wall_monitor_status` — if it errors, tell the user to install/start
-  `cwm-mcp` and stop. `cwm-mcp` is a launcher: it auto-selects one of
-  Go / Python / JS implementations. If the user reports that
-  `wall_monitor_status` errors with "no working implementation found",
-  ask them to run `cwm-mcp --probe` in a terminal — the stderr output
-  identifies which runtime got picked or which install hint applies.
+- The `cwallmonitor` plugin's MCP server is up. The plugin **bundles**
+  the server under its `server/` directory and runs it directly
+  (`${CLAUDE_PLUGIN_ROOT}/server/cwm-mcp`) — installing the plugin is
+  enough, there is no separate `go install` / `pipx` / `npm` step.
+  Verify with `wall_monitor_status`. If it errors, the bundled server
+  failed to start: the launcher (`server/cwm-mcp`) auto-selects one of
+  the Go / Python / JS impls and needs ONE language toolchain on the
+  user's PATH (node+npm, python3+uv/pip, or go), resolving that runtime's
+  dependencies on first launch (one-time, can be slow). It logs the
+  chosen runtime — or an install hint when none is usable — to stderr,
+  visible in Claude Code's MCP server logs for `cwallmonitor`. Tell the
+  user to make sure a toolchain is installed and reload the plugin, then
+  stop.
 - The device is on the same LAN segment as the laptop (mDNS does not
   cross VLANs).
 - The user is physically in front of the device — the pairing code is

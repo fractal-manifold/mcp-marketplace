@@ -1,0 +1,11 @@
+# Build artifacts resolved on-demand into ~/.cache/claude-wall-monitor/ — never
+# committed. NOTE: do NOT add a bare `cwm-mcp` rule here; `server/cwm-mcp` is the
+# tracked launcher. The Go binaries below live under go/ and don't collide.
+js/node_modules/
+py/.venv/
+py/venv/
+**/__pycache__/
+**/*.pyc
+**/*.egg-info/
+go/cwm-mcp
+go/cwm-mcp-go

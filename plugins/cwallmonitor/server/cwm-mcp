@@ -1,0 +1,321 @@
+#!/bin/sh
+# cwm-mcp launcher — picks one of the cwm-mcp implementations (Go,
+# Python, JS) and execs it. Runs from Claude Code's MCP stdio plumbing,
+# so:
+#   - stdin/stdout must be pristine for the JSON-RPC peer; only stderr
+#     can be used for diagnostics.
+#   - the launcher MUST `exec` (no extra layers of shell) once it picks,
+#     so signal handling and stdio pipes belong to the chosen impl, not
+#     to this wrapper.
+#
+# Two modes, auto-detected from where this script lives:
+#
+#   BUNDLE MODE — the launcher sits inside the plugin next to packaged
+#   runtime source (`js/`, `py/`, `go/`), a `compat/` dir and a `VERSION`
+#   file. Used when the cwallmonitor plugin ships its own server. Nothing
+#   is expected on PATH except the language toolchain (node+npm, python3
+#   +uv/pip, or go). On first run the launcher resolves the first usable
+#   runtime ON DEMAND into a per-user, per-version cache
+#   (~/.cache/claude-wall-monitor/<version>/<rt>/): npm install / venv +
+#   pip / go build. Subsequent runs are a cache hit. Heavy deps (incl.
+#   native modules) are therefore built for the host, never committed.
+#
+#   PATH MODE — the launcher was installed standalone (e.g. to
+#   ~/.local/bin via install.sh). It looks for cwm-mcp-go / cwm-mcp-py /
+#   cwm-mcp-js already on PATH and execs the first that passes --probe.
+#
+# Selection in both modes:
+#   1. Read $XDG_CONFIG_HOME/claude-wall-monitor/launcher.conf (or
+#      ~/.config/claude-wall-monitor/launcher.conf). Format:
+#          runtime=auto|go|python|js
+#      Missing file or invalid value -> "auto".
+#   2. Order candidates: preferred first (when not auto), then the rest.
+#      Bundle-mode default order is js -> python -> go (JS/Python need no
+#      compile step); PATH-mode default stays go -> python -> js.
+#
+# POSIX sh, no bashisms. Tested with dash + zsh.
+set -u
+
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/claude-wall-monitor"
+conf_file="$config_dir/launcher.conf"
+cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/claude-wall-monitor"
+
+# Resolve the directory this launcher lives in (physical, no symlinks),
+# so bundle detection and the packaged runtimes resolve correctly even
+# when invoked through a symlink.
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+
+runtime="auto"
+if [ -r "$conf_file" ]; then
+    # Source as shell so values like runtime=go don't need quotes. The
+    # file is user-owned and never world-writable in practice, but if
+    # the user has weird values we ignore them.
+    # shellcheck disable=SC1090
+    . "$conf_file" 2>/dev/null || true
+fi
+case "$runtime" in
+    auto|go|python|js) : ;;
+    *) runtime=auto ;;
+esac
+
+log() { printf 'cwm-mcp launcher: %s\n' "$*" >&2; }
+
+# ---------------------------------------------------------------------------
+# Bundle mode
+# ---------------------------------------------------------------------------
+
+# Bundle mode when this launcher sits next to the packaged runtimes.
+is_bundle=0
+if [ -f "$script_dir/VERSION" ] && [ -d "$script_dir/compat" ] && \
+   { [ -d "$script_dir/js" ] || [ -d "$script_dir/py" ] || [ -d "$script_dir/go" ]; }; then
+    is_bundle=1
+fi
+
+bundle_version() { cat "$script_dir/VERSION" 2>/dev/null || echo dev; }
+
+# mkdir-based lock (atomic, POSIX). Serializes concurrent first-run
+# setups across multiple Claude Code sessions sharing the cache.
+acquire_lock() {
+    _lock="$1"
+    _tries=0
+    while ! mkdir "$_lock" 2>/dev/null; do
+        _tries=$((_tries + 1))
+        if [ "$_tries" -gt 600 ]; then
+            log "timed out waiting for lock $_lock"
+            return 1
+        fi
+        sleep 1
+    done
+    return 0
+}
+release_lock() { rmdir "$1" 2>/dev/null || true; }
+
+# Copy the version-pinned shared files (VERSION + compat/) into the cache
+# so the runtimes' upward "find ../compat / find ../VERSION" walks resolve
+# without touching impl code.
+mirror_common() {
+    _verdir="$1"
+    mkdir -p "$_verdir"
+    [ -e "$_verdir/VERSION" ] || cp -f "$script_dir/VERSION" "$_verdir/VERSION"
+    [ -d "$_verdir/compat" ]  || cp -R "$script_dir/compat" "$_verdir/compat"
+}
+
+# needs_setup <ready-marker> <bundle-source-dir>: true (exit 0) when the
+# cache must be (re)built — marker missing, or any bundled source file is
+# newer than the marker. The cache is keyed by VERSION, but this also
+# refreshes it when the bundled source changes WITHOUT a version bump
+# (e.g. local iteration), so a regenerated bundle never runs stale code.
+needs_setup() {
+    [ -f "$1" ] || return 0
+    [ -n "$(find "$2" -newer "$1" -print 2>/dev/null | head -n 1)" ]
+}
+
+# Each ensure_* returns non-zero (without execing) when its toolchain is
+# missing or setup fails, so the caller can fall through to the next
+# candidate. On success it `exec`s and never returns.
+
+ensure_js() {
+    command -v node >/dev/null 2>&1 || { log "js: node not found"; return 1; }
+    command -v npm  >/dev/null 2>&1 || { log "js: npm not found";  return 1; }
+    _verdir="$cache_root/$(bundle_version)"
+    _rt="$_verdir/js"
+    _ready="$_rt/.cwm-ready"
+    mkdir -p "$_verdir"
+    if needs_setup "$_ready" "$script_dir/js"; then
+        acquire_lock "$_verdir/.lock-js" || return 1
+        if needs_setup "$_ready" "$script_dir/js"; then
+            mirror_common "$_verdir"
+            rm -rf "$_rt"
+            cp -R "$script_dir/js" "$_rt"
+            log "installing JS deps (first run, ~once per version) in $_rt"
+            if ( cd "$_rt" && npm install --omit=dev --no-audit --no-fund --loglevel=error ) 1>&2; then
+                : > "$_ready"
+            else
+                release_lock "$_verdir/.lock-js"
+                log "js: npm install failed"
+                return 1
+            fi
+        fi
+        release_lock "$_verdir/.lock-js"
+    fi
+    log "using js ($_rt)"
+    exec node "$_rt/src/index.js" "$@"
+}
+
+ensure_py() {
+    command -v python3 >/dev/null 2>&1 || { log "python: python3 not found"; return 1; }
+    _verdir="$cache_root/$(bundle_version)"
+    _rt="$_verdir/py"
+    _venv="$_rt/.venv"
+    _ready="$_rt/.cwm-ready"
+    mkdir -p "$_verdir"
+    if needs_setup "$_ready" "$script_dir/py"; then
+        acquire_lock "$_verdir/.lock-py" || return 1
+        if needs_setup "$_ready" "$script_dir/py"; then
+            mirror_common "$_verdir"
+            rm -rf "$_rt"
+            cp -R "$script_dir/py" "$_rt"
+            log "installing Python deps (first run, ~once per version) in $_venv"
+            _ok=1
+            if command -v uv >/dev/null 2>&1; then
+                uv venv "$_venv" 1>&2 \
+                    && uv pip install --python "$_venv/bin/python" -e "$_rt" 1>&2 \
+                    || _ok=0
+            else
+                python3 -m venv "$_venv" 1>&2 \
+                    && "$_venv/bin/pip" install --disable-pip-version-check -e "$_rt" 1>&2 \
+                    || _ok=0
+            fi
+            if [ "$_ok" -eq 1 ]; then
+                : > "$_ready"
+            else
+                release_lock "$_verdir/.lock-py"
+                log "python: dependency install failed"
+                return 1
+            fi
+        fi
+        release_lock "$_verdir/.lock-py"
+    fi
+    log "using python ($_rt)"
+    exec "$_venv/bin/python" -m cwm_mcp "$@"
+}
+
+ensure_go() {
+    _verdir="$cache_root/$(bundle_version)"
+    _rt="$_verdir/go"
+    _bin="$_rt/cwm-mcp-go"
+    _ready="$_rt/.cwm-ready"
+    # Fresh cached binary -> run it.
+    if [ -x "$_bin" ] && ! needs_setup "$_ready" "$script_dir/go"; then
+        log "using go ($_bin)"
+        exec "$_bin" "$@"
+    fi
+    if ! command -v go >/dev/null 2>&1; then
+        # No toolchain to (re)build. A stale-but-present binary still beats
+        # falling through to no runtime at all.
+        if [ -x "$_bin" ]; then
+            log "go: toolchain gone, using existing cached binary (may be stale)"
+            exec "$_bin" "$@"
+        fi
+        log "go: toolchain not found (and no cached binary)"
+        return 1
+    fi
+    mkdir -p "$_verdir"
+    acquire_lock "$_verdir/.lock-go" || return 1
+    if [ ! -x "$_bin" ] || needs_setup "$_ready" "$script_dir/go"; then
+        mirror_common "$_verdir"
+        rm -rf "$_rt"
+        cp -R "$script_dir/go" "$_rt"
+        log "compiling Go impl (first run, ~once per version) in $_rt"
+        if ( cd "$_rt" && CGO_ENABLED=0 go build -trimpath \
+                 -ldflags="-s -w -X main.Version=$(bundle_version)" \
+                 -o cwm-mcp-go ./cmd/cwm-mcp ) 1>&2; then
+            : > "$_ready"
+        else
+            release_lock "$_verdir/.lock-go"
+            log "go: build failed"
+            return 1
+        fi
+    fi
+    release_lock "$_verdir/.lock-go"
+    log "using go ($_bin)"
+    exec "$_bin" "$@"
+}
+
+bundle_run() {
+    case "$runtime" in
+        auto|js) order="js python go" ;;
+        python)  order="python js go" ;;
+        go)      order="go js python" ;;
+    esac
+    for impl in $order; do
+        case "$impl" in
+            js)     ensure_js "$@" ;;
+            python) ensure_py "$@" ;;
+            go)     ensure_go "$@" ;;
+        esac
+        # Reaching here means ensure_* returned without exec -> try next.
+    done
+    printf '%s\n' \
+        "cwm-mcp launcher: no runtime could be prepared (tried:$order)." \
+        "" \
+        "The bundled server resolves dependencies on first run; it needs" \
+        "ONE of these toolchains on PATH:" \
+        "  Node:    node (>=20) + npm" \
+        "  Python:  python3 (>=3.11) + uv (or pip/venv)" \
+        "  Go:      go (>=1.25)" \
+        "" \
+        "To pin a preferred runtime, write 'runtime=js' (or python, go) to" \
+        "  $conf_file" >&2
+    exit 127
+}
+
+# ---------------------------------------------------------------------------
+# PATH mode (standalone install: cwm-mcp-go / -py / -js already on PATH)
+# ---------------------------------------------------------------------------
+
+# Map an impl name to the binary the launcher invokes.
+binary_for() {
+    case "$1" in
+        go)     echo "cwm-mcp-go" ;;
+        python) echo "cwm-mcp-py" ;;
+        js)     echo "cwm-mcp-js" ;;
+    esac
+}
+
+path_run() {
+    case "$runtime" in
+        auto)   order="go python js" ;;
+        go)     order="go python js" ;;
+        python) order="python go js" ;;
+        js)     order="js go python"  ;;
+    esac
+
+    # Try each candidate. Probe is short: --probe must answer in <2s.
+    attempted=""
+    for impl in $order; do
+        bin=$(binary_for "$impl")
+        # command -v silently fails when not on PATH.
+        bin_path=$(command -v "$bin" 2>/dev/null || true)
+        if [ -z "$bin_path" ]; then
+            attempted="$attempted $impl(not-on-PATH)"
+            continue
+        fi
+        if "$bin_path" --probe >/dev/null 2>&1; then
+            printf 'cwm-mcp launcher: using %s (%s)\n' "$impl" "$bin_path" >&2
+            exec "$bin_path" "$@"
+        fi
+        attempted="$attempted $impl(probe-failed)"
+    done
+
+    # No candidate worked. Tell the user how to install at least one.
+    # Use printf (POSIX shell builtin) rather than cat so the diagnostic
+    # still surfaces when PATH is empty (e.g. under `env -i`).
+    printf '%s\n' \
+        "cwm-mcp launcher: no working implementation found on PATH." \
+        "Tried:$attempted" \
+        "" \
+        "The supported path is the cwallmonitor plugin, which bundles the" \
+        "server and runs it directly (no PATH binary needed) — install the" \
+        "plugin from the marketplace instead of using PATH mode." \
+        "" \
+        "If you really want a standalone PATH binary, build one from the" \
+        "bundled source and put it on \$PATH, e.g.:" \
+        "  Go:     (cd <plugin>/server/go && go build -o ~/.local/bin/cwm-mcp-go ./cmd/cwm-mcp)" \
+        "  Python: pipx install <plugin>/server/py" \
+        "  Node:   (cd <plugin>/server/js && npm install -g .)" \
+        "" \
+        "To pin a preferred runtime, write 'runtime=go' (or python, js) to" \
+        "  $conf_file" >&2
+    exit 127
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+if [ "$is_bundle" -eq 1 ]; then
+    bundle_run "$@"
+else
+    path_run "$@"
+fi
