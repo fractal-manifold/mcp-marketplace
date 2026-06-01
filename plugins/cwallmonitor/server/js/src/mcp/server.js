@@ -13,6 +13,7 @@ import { randomBytes, createHash } from "node:crypto";
 import * as auth from "../auth.js";
 import * as creds from "../creds.js";
 import * as ota from "../ota.js";
+import * as devlog from "../devlog.js";
 import { validDeviceID } from "../registry/store.js";
 import { firmwarePath } from "../config.js";
 
@@ -85,6 +86,7 @@ function pendingChanges(a, p) {
   if (p.vol && p.vol !== a.vol) out.push("vol");
   if (p.providers && (!a.providers || p.providers.claude !== a.providers.claude || p.providers.codex !== a.providers.codex || p.providers.gemini !== a.providers.gemini)) out.push("providers");
   if (p.autorotate_enabled != null && p.autorotate_enabled !== a.autorotate_enabled) out.push("autorotate_enabled");
+  if (p.log_enabled != null && (a.log_enabled == null || p.log_enabled !== a.log_enabled)) out.push("log_enabled");
   if (p.autorotate_interval_s != null && p.autorotate_interval_s !== a.autorotate_interval_s) out.push("autorotate_interval_s");
   if (p.theme_mode && p.theme_mode !== a.theme_mode) out.push("theme_mode");
   if (Array.isArray(p.gemini_models)) {
@@ -160,6 +162,7 @@ async function dispatch(deps, name, args) {
     case "wall_monitor_health": return await healthTool(deps);
     case "wall_monitor_recent_logs": return recentLogsTool(deps, args);
     case "wall_monitor_firmware_logs": return await firmwareLogsTool(deps, args);
+    case "wall_monitor_device_logs": return deviceLogsTool(deps, args);
     case "wall_monitor_provision_hint": return provisionHintTool(deps);
     case "wall_monitor_list_devices": return listDevicesTool(deps);
     case "wall_monitor_register_device": return registerDeviceTool(deps, args);
@@ -293,6 +296,25 @@ function firmwareLogsTool(deps, args) {
   });
 }
 
+// Read the scrubbed diagnostic log the device uploaded to the broker
+// (POST /device/<id>/logs, stored under <config>/device-logs/<id>.log).
+// Works from any cwm-mcp process — it reads the file directly, no signed
+// loopback — so a follower session can inspect a device even when another
+// process owns the broker port. Mirror of Go handleDeviceLogs / py _device_logs.
+function deviceLogsTool(deps, args) {
+  if (!deps.registry) return { error: registryUnavailableMsg() };
+  const deviceID = String(args.device_id || "").trim().toLowerCase();
+  if (!validDeviceID(deviceID)) return { error: "device_id must be 8 lowercase hex chars" };
+  let limit = 200;
+  if (args.limit != null && args.limit !== "") {
+    const n = Number.parseInt(args.limit, 10);
+    if (Number.isFinite(n)) limit = clamp(n, 1, devlog.MAX_LINES);
+  }
+  const lines = devlog.read(deps.registry.dir, deviceID);
+  const total = lines.length;
+  return { device_id: deviceID, total_available: total, lines: limit < total ? lines.slice(total - limit) : lines };
+}
+
 function provisionHintTool(deps) {
   const ips = localIPv4s();
   const port = deps.cfg.server.port;
@@ -331,7 +353,7 @@ function setDevicePendingTool(deps, args) {
   if (!deps.registry) return { error: registryUnavailableMsg() };
   const deviceID = String(args.device_id || "").trim().toLowerCase();
   if (!validDeviceID(deviceID)) return { error: "device_id must be 8 lowercase hex chars" };
-  const upd = { version: 0, broker_url: "", psk_hex: "", city: "", br_day: 0, br_night: 0, vol: 0, providers: null, autorotate_enabled: null, autorotate_interval_s: null, theme_mode: "", gemini_models: null, firmware_url: "", firmware_sha256: "", firmware_version: "", firmware_manifest_b64: "", firmware_manifest_sig_b64: "", min_secure_version: 0 };
+  const upd = { version: 0, broker_url: "", psk_hex: "", city: "", br_day: 0, br_night: 0, vol: 0, providers: null, autorotate_enabled: null, autorotate_interval_s: null, theme_mode: "", gemini_models: null, log_enabled: null, firmware_url: "", firmware_sha256: "", firmware_version: "", firmware_manifest_b64: "", firmware_manifest_sig_b64: "", min_secure_version: 0 };
   if (args.broker_url) upd.broker_url = String(args.broker_url).trim();
   if (args.psk_hex) {
     const v = String(args.psk_hex).trim().toLowerCase();
@@ -355,6 +377,7 @@ function setDevicePendingTool(deps, args) {
     upd.providers = { claude: base.claude, codex: base.codex, gemini: base.gemini };
   }
   if ("autorotate_enabled" in args) upd.autorotate_enabled = !!args.autorotate_enabled;
+  if ("log_enabled" in args) upd.log_enabled = !!args.log_enabled;
   if ("autorotate_interval_s" in args) {
     const v = Number.parseInt(args.autorotate_interval_s, 10);
     if (Number.isFinite(v)) upd.autorotate_interval_s = clamp(v, 1, 300);

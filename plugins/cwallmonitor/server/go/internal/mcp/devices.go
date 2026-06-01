@@ -100,6 +100,11 @@ func pendingChanges(active, pending registry.ConfigPayload) []string {
 	if pending.GeminiModels != nil && !stringSliceEqual(active.GeminiModels, pending.GeminiModels) {
 		diffs = append(diffs, "gemini_models")
 	}
+	if pending.LogEnabled != nil {
+		if active.LogEnabled == nil || *active.LogEnabled != *pending.LogEnabled {
+			diffs = append(diffs, "log_enabled")
+		}
+	}
 	if pending.FirmwareVersion != "" && pending.FirmwareVersion != active.FirmwareVersion {
 		diffs = append(diffs, "firmware: "+pending.FirmwareVersion)
 	}
@@ -322,6 +327,11 @@ func handleSetDevicePending(d Deps) server.ToolHandlerFunc {
 				models = []string{}
 			}
 			update.GeminiModels = models
+		}
+
+		if _, ok := anyProv["log_enabled"]; ok {
+			v := req.GetBool("log_enabled", false)
+			update.LogEnabled = &v
 		}
 
 		// Firmware fields ride the same pending blob. All-or-nothing on

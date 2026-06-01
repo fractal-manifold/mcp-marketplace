@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .. import auth, creds
+from .. import auth, creds, devlog
 from ..config import Config
 from ..logbuf import Buffer
 from ..registry.store import NotFound, Registry, valid_device_id, ConfigPayload, ProviderSet
@@ -137,6 +137,8 @@ def _pending_changes(active: ConfigPayload, pending: ConfigPayload) -> list[str]
         pm = list(pending.gemini_models or [])
         if am != pm:
             diffs.append("gemini_models")
+    if pending.log_enabled is not None and (active.log_enabled is None or pending.log_enabled != active.log_enabled):
+        diffs.append("log_enabled")
     return diffs
 
 
@@ -210,6 +212,8 @@ async def _dispatch(deps: Deps, name: str, args: dict) -> Any:
         return _recent_logs(deps, args)
     if name == "wall_monitor_firmware_logs":
         return await _firmware_logs(deps, args)
+    if name == "wall_monitor_device_logs":
+        return _device_logs(deps, args)
     if name == "wall_monitor_provision_hint":
         return _provision_hint(deps)
     if name == "wall_monitor_list_devices":
@@ -333,6 +337,26 @@ def _recent_logs(deps: Deps, args: dict) -> dict:
         except ValueError:
             pass
     return {"total_available": len(deps.logs), "lines": deps.logs.tail(limit)}
+
+
+def _device_logs(deps: Deps, args: dict) -> dict:
+    if deps.registry is None:
+        return {"error": _registry_unavailable_text()}
+    device_id = str(args.get("device_id", "")).strip().lower()
+    if not valid_device_id(device_id):
+        return {"error": "device_id must be 8 lowercase hex chars"}
+    limit = 200
+    raw = args.get("limit")
+    if raw:
+        try:
+            limit = _clamp(int(raw), 1, devlog.MAX_LINES)
+        except ValueError:
+            pass
+    lines = devlog.read(deps.registry.dir, device_id)
+    total = len(lines)
+    if limit < total:
+        lines = lines[total - limit:]
+    return {"device_id": device_id, "total_available": total, "lines": lines}
 
 
 async def _firmware_logs(deps: Deps, args: dict) -> dict:
@@ -485,6 +509,8 @@ def _set_device_pending(deps: Deps, args: dict) -> dict:
         if len(parts) > 3:
             return {"error": "gemini_models must list at most 3 entries"}
         update.gemini_models = parts  # empty list clears the override
+    if "log_enabled" in args:
+        update.log_enabled = bool(args["log_enabled"])
     # Firmware fields: all-or-nothing. Mirror Go's validation so a
     # malformed partial spec fails fast instead of being silently
     # dropped by the device.

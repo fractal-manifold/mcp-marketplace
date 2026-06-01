@@ -37,6 +37,7 @@ import (
 	"github.com/fractal-manifold/cwm-mcp/internal/auth"
 	"github.com/fractal-manifold/cwm-mcp/internal/config"
 	"github.com/fractal-manifold/cwm-mcp/internal/creds"
+	"github.com/fractal-manifold/cwm-mcp/internal/devlog"
 	"github.com/fractal-manifold/cwm-mcp/internal/logbuf"
 	"github.com/fractal-manifold/cwm-mcp/internal/registry"
 	"github.com/fractal-manifold/cwm-mcp/internal/state"
@@ -99,6 +100,17 @@ func NewServer(d Deps) *server.MCPServer {
 	)
 
 	s.AddTool(
+		mcp.NewTool("wall_monitor_device_logs",
+			mcp.WithDescription("Tail the diagnostic log lines a registered device has uploaded over the air (via its authenticated config-sync channel). Shows the device's operational flow and errors without a USB cable. Lines are scrubbed of secrets on-device and stamped with the broker's receive time. Default is the last 200 lines; max 2000. Returns an empty list if the device hasn't uploaded yet or has log upload disabled."),
+			mcp.WithString("device_id", mcp.Required(),
+				mcp.Description("8 lowercase hex chars (see wall_monitor_list_devices).")),
+			mcp.WithString("limit",
+				mcp.Description("How many lines to return (1..2000). Defaults to 200.")),
+		),
+		handleDeviceLogs(d),
+	)
+
+	s.AddTool(
 		mcp.NewTool("wall_monitor_provision_hint",
 			mcp.WithDescription("Print the address(es) the device should be told to poll in its captive portal `svc_url` field — i.e. the laptop's non-loopback IPv4 interfaces, paired with the configured broker port."),
 		),
@@ -147,6 +159,9 @@ func NewServer(d Deps) *server.MCPServer {
 			),
 			mcp.WithString("gemini_models",
 				mcp.Description("Comma-separated list of Gemini model IDs to show on the dashboard (max 3). Example: 'gemini-2.5-pro,gemini-2.5-flash'. Set to an empty string to clear the override and fall back to the broker's global default (service.toml [gemini].models)."),
+			),
+			mcp.WithBoolean("log_enabled",
+				mcp.Description("Enable (true) or disable (false) over-the-air diagnostic log upload on the device. Dev units default on and factory units default off, so set true to stream a production unit's logs (visible via wall_monitor_device_logs) or false to silence one. Takes effect after the device promotes and reboots."),
 			),
 			mcp.WithString("firmware_url",
 				mcp.Description("Direct HTTPS URL of the .bin to install. Either point at this broker's own /firmware/<file> (preferred for LAN dev) or any external HTTPS host (GitHub release, S3…). Must be set together with firmware_sha256 and firmware_version; otherwise the device ignores all three. Prefer wall_monitor_publish_firmware for the local-hosting flow."),
@@ -397,6 +412,47 @@ func handleRecentLogs(d Deps) server.ToolHandlerFunc {
 			Total int      `json:"total_available"`
 			Lines []string `json:"lines"`
 		}{Total: d.Logs.Len(), Lines: lines})
+	}
+}
+
+// --- wall_monitor_device_logs -----------------------------------------------
+
+func handleDeviceLogs(d Deps) server.ToolHandlerFunc {
+	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if d.Registry == nil {
+			return mcp.NewToolResultError("device registry is not configured on this cwm-mcp install"), nil
+		}
+		deviceID := req.GetString("device_id", "")
+		if !registry.ValidDeviceID(deviceID) {
+			return mcp.NewToolResultError("device_id must be 8 lowercase hex chars"), nil
+		}
+		limit := 200
+		if raw := req.GetString("limit", ""); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil {
+				switch {
+				case n < 1:
+					limit = 1
+				case n > devlog.MaxLines:
+					limit = devlog.MaxLines
+				default:
+					limit = n
+				}
+			}
+		}
+
+		lines, err := devlog.Read(devlog.DirFor(d.Registry.Dir()), deviceID)
+		if err != nil {
+			return mcp.NewToolResultErrorFromErr("reading device logs", err), nil
+		}
+		total := len(lines)
+		if limit < total {
+			lines = lines[total-limit:]
+		}
+		return mcp.NewToolResultJSON(struct {
+			DeviceID string   `json:"device_id"`
+			Total    int      `json:"total_available"`
+			Lines    []string `json:"lines"`
+		}{DeviceID: deviceID, Total: total, Lines: lines})
 	}
 }
 

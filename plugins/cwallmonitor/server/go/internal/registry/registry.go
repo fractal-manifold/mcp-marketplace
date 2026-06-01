@@ -80,6 +80,12 @@ type ConfigPayload struct {
 	// for the device. Empty means "use the global default". Max 3 entries;
 	// excess is silently clamped on the broker side.
 	GeminiModels         []string     `toml:"gemini_models,omitempty"`
+	// LogEnabled toggles the device's diagnostic log upload (NVS key
+	// cwm_log_en). Pointer so an omitted field means "no change": dev
+	// units default ON on-device and factory units default OFF, so this is
+	// how an operator opts a production unit into log streaming (or
+	// silences a dev unit) without a reflash.
+	LogEnabled           *bool        `toml:"log_enabled,omitempty"`
 	// FirmwareURL / FirmwareSHA256 / FirmwareVersion carry a staged OTA
 	// update through the same pending envelope as a config change. All
 	// three must be present in the pending payload for the firmware's
@@ -629,6 +635,10 @@ func mergePayload(base, upd ConfigPayload) ConfigPayload {
 		m := make([]string, len(upd.GeminiModels))
 		copy(m, upd.GeminiModels)
 		out.GeminiModels = m
+	}
+	if upd.LogEnabled != nil {
+		v := *upd.LogEnabled
+		out.LogEnabled = &v
 	}
 	if upd.FirmwareURL != "" {
 		out.FirmwareURL = upd.FirmwareURL

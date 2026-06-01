@@ -5,6 +5,7 @@
 import * as auth from "../auth.js";
 import * as creds from "../creds.js";
 import * as usage from "../usage.js";
+import * as devlog from "../devlog.js";
 import { encryptPending } from "../registry/crypto.js";
 import { NotFound, validDeviceID } from "../registry/store.js";
 import { firmwarePath } from "../config.js";
@@ -41,6 +42,8 @@ export function createHandler({ cfg, cache, state, fwLogs, registry, logger, usa
     }
     const m = path.match(/^\/device\/([^/]+)\/sync$/);
     if (m && req.method === "GET") return handleDeviceSync({ cfg, cache, state, registry, logger, deviceID: m[1] }, req, res);
+    const lm = path.match(/^\/device\/([^/]+)\/logs$/);
+    if (lm && req.method === "POST") return handleDeviceLogs({ cfg, cache, state, registry, logger, deviceID: lm[1] }, req, res);
     const fwm = path.match(/^\/firmware\/([^/]+)$/);
     if (fwm && (req.method === "GET" || req.method === "HEAD")) {
       return handleFirmware({ cfg, cache, registry, logger, name: fwm[1] }, req, res);
@@ -438,6 +441,57 @@ function handleDeviceSync({ cfg, cache, state, registry, logger, deviceID }, req
   return finish(200, out);
 }
 
+// Receive a diagnostic log batch the device POSTs and append it to the
+// per-device log file. Auth is identical to /sync; the signature does not
+// cover the body (scrubbed, diagnostic-only). Body is size-capped.
+function handleDeviceLogs({ cfg, cache, state, registry, logger, deviceID }, req, res) {
+  let recordStatus = 202;
+  const finishErr = (s, m) => { recordStatus = s; writeError(res, s, m); };
+  res.on("close", () => { try { state.recordRequest(req.socket.remoteAddress || "", recordStatus); } catch {} });
+
+  if (!registry) return finishErr(404, "device registry not configured");
+  if (!validDeviceID(deviceID)) return finishErr(400, "invalid device_id");
+
+  let active, pending;
+  try { ({ active, pending } = registry.psksFor(deviceID)); }
+  catch (e) {
+    if (e instanceof NotFound) return finishErr(404, "unknown device");
+    logger.warn(`registry lookup ${deviceID}: ${e.message}`); return finishErr(500, "registry error");
+  }
+  const signedPath = `/device/${deviceID}/logs`;
+  try {
+    auth.verifyMulti(
+      [active, pending],
+      "POST", signedPath,
+      req.headers["x-cwm-timestamp"] || "", req.headers["x-cwm-nonce"] || "", req.headers["x-cwm-signature"] || "",
+      req.headers["x-cwm-device"] || "", req.headers["x-cwm-config-version"] || "",
+      cache, cfg.security.max_timestamp_skew_seconds,
+    );
+  } catch (e) { logger.info(`auth rejected ${signedPath}: ${e.message}`); return finishErr(401, "unauthorized"); }
+
+  const cl = Number.parseInt(req.headers["content-length"] || "", 10);
+  if (Number.isFinite(cl) && cl > devlog.MAX_BODY_BYTES) return finishErr(413, "body too large");
+
+  const chunks = [];
+  let total = 0;
+  let aborted = false;
+  req.on("data", (c) => {
+    total += c.length;
+    if (total > devlog.MAX_BODY_BYTES) { aborted = true; req.destroy(); return; }
+    chunks.push(c);
+  });
+  req.on("error", () => { if (!aborted) { aborted = true; try { finishErr(400, "read error"); } catch {} } });
+  req.on("end", () => {
+    if (aborted) return finishErr(413, "body too large");
+    const body = Buffer.concat(chunks).toString("utf8");
+    const lines = devlog.stampLines(body, new Date());
+    try { devlog.append(registry.dir, deviceID, lines); }
+    catch (e) { logger.warn(`devlog append ${deviceID}: ${e.message}`); return finishErr(500, "log store error"); }
+    recordStatus = 202;
+    writeJSON(res, 202, { stored: lines.length });
+  });
+}
+
 function pendingPayloadJSON(p) {
   const wire = { version: p.version };
   if (p.broker_url) wire.broker_url = p.broker_url;
@@ -462,6 +516,7 @@ function pendingPayloadJSON(p) {
     // writes it to NVS key cwm_gem_mdls.
     wire.gemini_models = p.gemini_models.map(String).join(",");
   }
+  if (p.log_enabled != null) wire.log_enabled = !!p.log_enabled;  // → NVS cwm_log_en
   // OTA staging fields. All-or-nothing: the firmware ignores the bundle
   // if any of the three is missing, so don't emit partial state.
   if (p.firmware_url && p.firmware_sha256 && p.firmware_version) {

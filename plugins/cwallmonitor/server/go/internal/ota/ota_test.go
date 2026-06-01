@@ -324,6 +324,57 @@ func TestCheckUpToDate(t *testing.T) {
 	}
 }
 
+// TestCheckNoStageWhenRunningEqualsRelease guards the anti-churn fix: a device
+// whose RUNNING firmware (Active.FirmwareVersion) already equals the release
+// must report up_to_date even when its anti-rollback FLOOR
+// (Active.MinSecureVersion) sits a patch below that version — which is the
+// normal case, since a manifest sets a conservative floor, not one equal to
+// its own version. Comparing the release to the floor alone (the pre-fix
+// behaviour) would re-stage 0.5.1 forever and the device would re-download
+// and reject it every cycle.
+func TestCheckNoStageWhenRunningEqualsRelease(t *testing.T) {
+	v := loadVectors(t)
+	canonical, sigB64 := s1Vector(t, v)
+	idx := Index{
+		Version:      "0.5.1",
+		ManifestB64:  base64.StdEncoding.EncodeToString([]byte(canonical)),
+		SignatureB64: sigB64,
+		BinURL:       "https://downloads.example/cwm-S1-0.5.1.bin",
+	}
+	srv := mockReleases(t, map[string]Index{"S1": idx})
+	defer srv.Close()
+
+	cfg := otaConfigForVectors(t, v, srv.URL)
+	// Floor is 0.5.0, one patch BELOW the release...
+	floor, _ := PackSemver("0.5.0")
+	reg := newRegistryWithDevice(t, testDevice, "S1", floor)
+	// ...but the device is already running 0.5.1. Promote a 0.5.1 firmware
+	// into Active so Active.FirmwareVersion == release without moving the
+	// floor (mirrors a normal install: cwm_min_sv tracks the manifest's
+	// conservative floor, not the running version).
+	dev, err := reg.SetPending(testDevice, registry.ConfigPayload{
+		FirmwareURL:     idx.BinURL,
+		FirmwareSHA256:  "00",
+		FirmwareVersion: "0.5.1",
+	})
+	if err != nil {
+		t.Fatalf("SetPending: %v", err)
+	}
+	if _, err := reg.MaybePromote(testDevice, dev.Pending.Version, false); err != nil {
+		t.Fatalf("MaybePromote: %v", err)
+	}
+
+	checker := NewChecker(cfg, reg, nil)
+	rep, err := checker.Check(context.Background(), false, "", "")
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if rep.Staged != 0 || rep.Devices[0].Action != "up_to_date" {
+		t.Fatalf("got staged=%d action=%s, want up_to_date (running==release, floor below)",
+			rep.Staged, rep.Devices[0].Action)
+	}
+}
+
 func TestCheckRejectsTamperedSignature(t *testing.T) {
 	v := loadVectors(t)
 	canonical, sigB64 := s1Vector(t, v)

@@ -21,7 +21,7 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 from aiohttp import web
 
-from .. import auth, creds, usage
+from .. import auth, creds, devlog, usage
 from ..config import Config, firmware_path
 from ..registry import crypto as reg_crypto
 from ..registry import store as registry  # alias kept for parity with Go broker
@@ -69,6 +69,7 @@ def make_app(
     app.router.add_get("/credentials/codex", _handle_credentials_codex)
     app.router.add_get("/firmware-logs", _handle_firmware_logs)
     app.router.add_get("/device/{device_id}/sync", _handle_device_sync)
+    app.router.add_post("/device/{device_id}/logs", _handle_device_logs)
     app.router.add_get("/usage/{provider}", _handle_usage)
     app.router.add_get("/firmware/{name}", _handle_firmware)
     app.router.add_head("/firmware/{name}", _handle_firmware)
@@ -608,6 +609,60 @@ async def _handle_device_sync(req: web.Request) -> web.Response:
             pass
 
 
+async def _handle_device_logs(req: web.Request) -> web.Response:
+    """Receive a diagnostic log batch the device POSTs and append it to the
+    per-device log file. Auth is identical to /sync; the signature does not
+    cover the body (scrubbed, diagnostic-only). Body is size-capped."""
+    cfg: Config = req.app["cfg"]
+    cache: auth.NonceCache = req.app["cache"]
+    registry: Registry | None = req.app["registry"]
+    if registry is None:
+        return _error(404, "device registry not configured")
+
+    device_id = req.match_info["device_id"]
+    if not valid_device_id(device_id):
+        return _error(400, "invalid device_id")
+
+    try:
+        active, pending = registry.psks_for(device_id)
+    except NotFound:
+        return _error(404, "unknown device")
+    except Exception as e:
+        log.warning("registry lookup %s: %s", device_id, e)
+        return _error(500, "registry error")
+
+    signed_path = req.path
+    try:
+        auth.verify_multi(
+            [active, pending],
+            "POST", signed_path,
+            req.headers.get("X-Cwm-Timestamp", ""),
+            req.headers.get("X-Cwm-Nonce", ""),
+            req.headers.get("X-Cwm-Signature", ""),
+            req.headers.get("X-Cwm-Device", ""),
+            req.headers.get("X-Cwm-Config-Version", ""),
+            cache,
+            cfg.security.max_timestamp_skew_seconds,
+        )
+    except auth.AuthError as e:
+        log.info("auth rejected /device/%s/logs from %s: %s", device_id, req.remote, e)
+        return _error(401, "unauthorized")
+
+    if req.content_length is not None and req.content_length > devlog.MAX_BODY_BYTES:
+        return _error(413, "body too large")
+    raw = await req.read()
+    if len(raw) > devlog.MAX_BODY_BYTES:
+        return _error(413, "body too large")
+
+    lines = devlog.stamp_lines(raw.decode("utf-8", errors="replace"))
+    try:
+        devlog.append(registry.dir, device_id, lines)
+    except Exception as e:
+        log.warning("devlog append %s: %s", device_id, e)
+        return _error(500, "log store error")
+    return web.json_response({"stored": len(lines)}, status=202)
+
+
 def _parse_uint32(s: str) -> int:
     if not s:
         return 0
@@ -654,6 +709,9 @@ def _pending_payload_json(p) -> str:
         # firmware/config_sync.c reads "gemini_models" as a CSV string
         # and writes it to NVS key cwm_gem_mdls.
         wire["gemini_models"] = ",".join(str(m) for m in gm)
+    if getattr(p, "log_enabled", None) is not None:
+        # firmware/config_sync.c reads "log_enabled" → NVS key cwm_log_en.
+        wire["log_enabled"] = bool(p.log_enabled)
     # OTA staging fields. All three must be present or the device
     # ignores the bundle entirely (see firmware/components/net/src/
     # config_sync.c promote_candidate). Mirror that all-or-nothing on

@@ -240,6 +240,9 @@ function emptyPayload() {
     theme_mode: "",
     // null = "no opinion" (use global default); [] = clear override.
     gemini_models: null,
+    // Diagnostic log upload toggle (NVS cwm_log_en). null = no change;
+    // dev units default on, factory units default off on-device.
+    log_enabled: null,
     // All-or-nothing OTA fields. Empty strings travel alongside any
     // config change without arming an update; the firmware ignores
     // the trio unless all three are non-empty + well-formed.
@@ -268,6 +271,7 @@ function payloadToTomlObj(p) {
   if (Array.isArray(p.gemini_models) && p.gemini_models.length > 0) {
     d.gemini_models = p.gemini_models.map(String);
   }
+  if (p.log_enabled != null) d.log_enabled = !!p.log_enabled;
   if (p.firmware_url) d.firmware_url = String(p.firmware_url);
   if (p.firmware_sha256) d.firmware_sha256 = String(p.firmware_sha256);
   if (p.firmware_version) d.firmware_version = String(p.firmware_version);
@@ -292,6 +296,7 @@ function tomlObjToPayload(d) {
     autorotate_interval_s: typeof d.autorotate_interval_s === "number" ? d.autorotate_interval_s : null,
     theme_mode: String(d.theme_mode || ""),
     gemini_models: Array.isArray(d.gemini_models) ? d.gemini_models.map(String) : null,
+    log_enabled: typeof d.log_enabled === "boolean" ? d.log_enabled : null,
     firmware_url: String(d.firmware_url || ""),
     firmware_sha256: String(d.firmware_sha256 || ""),
     firmware_version: String(d.firmware_version || ""),
@@ -349,6 +354,7 @@ function mergePayload(base, upd) {
     gemini_models: Array.isArray(upd.gemini_models)
       ? upd.gemini_models.slice()
       : base.gemini_models,
+    log_enabled: upd.log_enabled != null ? upd.log_enabled : base.log_enabled,
     firmware_url: upd.firmware_url || base.firmware_url,
     firmware_sha256: upd.firmware_sha256 || base.firmware_sha256,
     firmware_version: upd.firmware_version || base.firmware_version,
@@ -375,6 +381,8 @@ function payloadEquivalent(a, b) {
   for (let i = 0; i < am.length; i++) {
     if (am[i] !== bm[i]) return false;
   }
+  if ((a.log_enabled == null) !== (b.log_enabled == null)) return false;
+  if (a.log_enabled != null && a.log_enabled !== b.log_enabled) return false;
   if ((a.firmware_url || "") !== (b.firmware_url || "")) return false;
   if ((a.firmware_sha256 || "") !== (b.firmware_sha256 || "")) return false;
   if ((a.firmware_version || "") !== (b.firmware_version || "")) return false;

@@ -29,6 +29,7 @@ import (
 	"github.com/fractal-manifold/cwm-mcp/internal/auth"
 	"github.com/fractal-manifold/cwm-mcp/internal/config"
 	"github.com/fractal-manifold/cwm-mcp/internal/creds"
+	"github.com/fractal-manifold/cwm-mcp/internal/devlog"
 	"github.com/fractal-manifold/cwm-mcp/internal/logbuf"
 	"github.com/fractal-manifold/cwm-mcp/internal/registry"
 	"github.com/fractal-manifold/cwm-mcp/internal/state"
@@ -130,7 +131,13 @@ func NewMux(cfg *config.Config, cache *auth.NonceCache, st *state.State, logger 
 	})
 	mux.HandleFunc("/device/", func(w http.ResponseWriter, r *http.Request) {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		handleDeviceSync(cfg, cache, logger, reg, rec, r)
+		// /device/{id}/sync (GET, control plane) vs /device/{id}/logs
+		// (POST, diagnostic upload). Both authenticate the same way.
+		if strings.HasSuffix(r.URL.Path, "/logs") {
+			handleDeviceLogs(cfg, cache, logger, reg, rec, r)
+		} else {
+			handleDeviceSync(cfg, cache, logger, reg, rec, r)
+		}
 		if st != nil {
 			st.RecordRequest(r.RemoteAddr, rec.status, time.Now())
 		}
@@ -708,6 +715,11 @@ func pendingPayloadJSON(p registry.ConfigPayload) ([]byte, error) {
 		// broker restarts before the next sync.
 		wire["gemini_models"] = strings.Join(p.GeminiModels, ",")
 	}
+	if p.LogEnabled != nil {
+		// firmware/config_sync.c reads "log_enabled" and writes NVS key
+		// cwm_log_en, gating the device's diagnostic log upload.
+		wire["log_enabled"] = *p.LogEnabled
+	}
 	// OTA staging fields. firmware/components/net/src/config_sync.c
 	// requires ALL THREE to be present and well-formed before arming
 	// the on-device cwm_ota_* NVS keys, so we send them together or
@@ -879,6 +891,80 @@ func handleDeviceSync(cfg *config.Config, cache *auth.NonceCache, logger *log.Lo
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
+}
+
+// handleDeviceLogs receives a diagnostic log batch the device POSTs to
+// /device/{id}/logs and appends it to the per-device log file. Auth is
+// identical to /sync (HMAC over method+path+ts+nonce+device+cfgver). The
+// signature does NOT cover the body — that is acceptable: the body is
+// scrubbed of secrets on-device and is diagnostic only, so a tamperer who
+// is somehow on-path can corrupt debug text but cannot forge a privileged
+// action. The body is capped (MaxBodyBytes) to bound abuse.
+func handleDeviceLogs(cfg *config.Config, cache *auth.NonceCache, logger *log.Logger, reg *registry.Registry, w http.ResponseWriter, r *http.Request) {
+	if reg == nil {
+		writeError(w, http.StatusNotFound, "device registry not configured")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/device/"), "/")
+	if len(parts) != 2 || parts[1] != "logs" {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	deviceID := parts[0]
+	if !registry.ValidDeviceID(deviceID) {
+		writeError(w, http.StatusBadRequest, "invalid device_id")
+		return
+	}
+
+	active, pending, perr := reg.PSKsFor(deviceID)
+	if errors.Is(perr, registry.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "unknown device")
+		return
+	} else if perr != nil {
+		logger.Printf("registry lookup %s: %v", deviceID, perr)
+		writeError(w, http.StatusInternalServerError, "registry error")
+		return
+	}
+
+	signedPath := r.URL.Path
+	if _, verr := auth.VerifyMulti(
+		[][]byte{active, pending},
+		"POST", signedPath,
+		r.Header.Get("X-Cwm-Timestamp"),
+		r.Header.Get("X-Cwm-Nonce"),
+		r.Header.Get("X-Cwm-Signature"),
+		r.Header.Get("X-Cwm-Device"),
+		r.Header.Get("X-Cwm-Config-Version"),
+		cache,
+		time.Duration(cfg.Security.MaxTimestampSkewSeconds)*time.Second,
+		time.Now(),
+	); verr != nil {
+		logger.Printf("auth rejected /device/%s/logs from %s: %v", deviceID, r.RemoteAddr, verr)
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, devlog.MaxBodyBytes)
+	raw, rerr := io.ReadAll(r.Body)
+	if rerr != nil {
+		writeError(w, http.StatusRequestEntityTooLarge, "body too large")
+		return
+	}
+
+	lines := devlog.StampLines(string(raw), time.Now())
+	if aerr := devlog.Append(devlog.DirFor(reg.Dir()), deviceID, lines); aerr != nil {
+		logger.Printf("devlog append %s: %v", deviceID, aerr)
+		writeError(w, http.StatusInternalServerError, "log store error")
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, struct {
+		Stored int `json:"stored"`
+	}{Stored: len(lines)})
 }
 
 func parseUint32Header(s string) (uint32, error) {

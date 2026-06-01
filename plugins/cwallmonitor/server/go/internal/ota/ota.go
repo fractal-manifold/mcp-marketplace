@@ -13,10 +13,13 @@
 //     in depth — the device verifies the same signature again before it
 //     installs — but it stops a misconfigured release from ever reaching
 //     a device.
-//  4. For every device of that SKU whose installed version (mirrored in
-//     Active.MinSecureVersion as packed 8.8.16) is older than the
-//     release, stage a pending carrying the firmware fields. The device
-//     picks it up on its next /device/<id>/sync.
+//  4. For every device of that SKU whose installed version
+//     (Active.FirmwareVersion, packed 8.8.16) is strictly older than the
+//     release — and that also clears the anti-rollback floor
+//     (Active.MinSecureVersion) — stage a pending carrying the firmware
+//     fields. The device picks it up on its next /device/<id>/sync. A
+//     release equal to or older than what the device already runs is never
+//     announced, so a re-published "latest" can't churn the device.
 //
 // The broker never holds a signing key — only public verification keys.
 // A compromised or misconfigured broker cannot forge a manifest, and the
@@ -331,10 +334,22 @@ func (c *Checker) decide(dev *registry.Device, r *resolved, dryRun bool) DeviceR
 		return out
 	}
 	out.From = dev.Active.FirmwareVersion
-	// Compare against the device's reported anti-rollback floor, which the
-	// firmware bumps to packed(running) after a successful boot. A release
-	// at or below the floor is already installed (or would be refused
-	// on-device anyway).
+	// Primary guard: never announce a release that isn't STRICTLY newer than
+	// the version the device is actually running. Active.FirmwareVersion is
+	// the last version we saw the device promote, i.e. what's installed.
+	// MinSecureVersion is only the anti-rollback FLOOR, which a manifest can
+	// (and usually does) set BELOW its own version to leave room for limited
+	// rollback — so comparing the release to the floor alone re-stages a
+	// version the device already runs, and the device just re-downloads and
+	// rejects it as same-version every cycle. That churn is exactly what this
+	// check prevents. Skipped only when we don't yet have a parseable running
+	// version (fresh device), in which case the floor guard below decides.
+	if running, ok := PackSemver(dev.Active.FirmwareVersion); ok && releasePacked <= running {
+		out.Action = "up_to_date"
+		return out
+	}
+	// Secondary guard (defense in depth): respect the reported anti-rollback
+	// floor. A release at or below it would be refused on-device anyway.
 	if releasePacked <= dev.Active.MinSecureVersion {
 		out.Action = "up_to_date"
 		return out

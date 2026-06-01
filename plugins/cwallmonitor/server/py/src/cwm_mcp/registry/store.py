@@ -68,6 +68,10 @@ class ConfigPayload:
     # /usage/gemini slots. None = "no opinion" (use global default);
     # empty list = "clear the override". Max 3 entries.
     gemini_models: list[str] | None = None
+    # Diagnostic log upload toggle (NVS key cwm_log_en). None = "no
+    # change"; dev units default on and factory units default off
+    # on-device, so this is how an operator opts a production unit in.
+    log_enabled: bool | None = None
     # OTA staging fields. The firmware's config_sync only arms the
     # on-device cwm_ota_* NVS keys when all three are present and
     # well-formed; empty strings mean "no firmware update" and travel
@@ -108,6 +112,8 @@ class ConfigPayload:
             d["theme_mode"] = str(self.theme_mode)
         if self.gemini_models is not None and len(self.gemini_models) > 0:
             d["gemini_models"] = [str(m) for m in self.gemini_models]
+        if self.log_enabled is not None:
+            d["log_enabled"] = bool(self.log_enabled)
         if self.firmware_url:
             d["firmware_url"] = self.firmware_url
         if self.firmware_sha256:
@@ -138,6 +144,7 @@ class ConfigPayload:
             autorotate_interval_s=int(d["autorotate_interval_s"]) if "autorotate_interval_s" in d else None,
             theme_mode=str(d.get("theme_mode", "")),
             gemini_models=[str(m) for m in d["gemini_models"]] if "gemini_models" in d else None,
+            log_enabled=bool(d["log_enabled"]) if "log_enabled" in d else None,
             firmware_url=str(d.get("firmware_url", "")),
             firmware_sha256=str(d.get("firmware_sha256", "")),
             firmware_version=str(d.get("firmware_version", "")),
@@ -465,6 +472,7 @@ def _merge_payload(base: ConfigPayload, upd: ConfigPayload) -> ConfigPayload:
         autorotate_interval_s=upd.autorotate_interval_s if upd.autorotate_interval_s is not None else base.autorotate_interval_s,
         theme_mode=upd.theme_mode or base.theme_mode,
         gemini_models=list(upd.gemini_models) if upd.gemini_models is not None else base.gemini_models,
+        log_enabled=upd.log_enabled if upd.log_enabled is not None else base.log_enabled,
         firmware_url=upd.firmware_url or base.firmware_url,
         firmware_sha256=upd.firmware_sha256 or base.firmware_sha256,
         firmware_version=upd.firmware_version or base.firmware_version,
@@ -505,6 +513,10 @@ def _payload_equivalent(a: ConfigPayload, b: ConfigPayload) -> bool:
     am = a.gemini_models or []
     bm = b.gemini_models or []
     if am != bm:
+        return False
+    if (a.log_enabled is None) != (b.log_enabled is None):
+        return False
+    if a.log_enabled is not None and a.log_enabled != b.log_enabled:
         return False
     if (
         a.firmware_url != b.firmware_url
