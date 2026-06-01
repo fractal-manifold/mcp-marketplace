@@ -91,6 +91,15 @@ func (r *statusRecorder) WriteHeader(s int) {
 	r.ResponseWriter.WriteHeader(s)
 }
 
+// Unwrap exposes the wrapped ResponseWriter so http.ResponseController can
+// walk through to the underlying connection — without it, per-request
+// SetWriteDeadline/Flush calls (e.g. the firmware download's extended write
+// deadline) return ErrNotSupported and silently fall back to the tight
+// server-wide WriteTimeout.
+func (r *statusRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
+}
+
 // NewMux returns the HTTP handler used by both Serve and tests. The
 // returned mux records every /credentials hit on `st` (remote addr +
 // response code). `fwLogs` may be nil — the handler substitutes a
@@ -159,6 +168,14 @@ type firmwareSHACacheEntry struct {
 var (
 	firmwareSHACache   = map[string]firmwareSHACacheEntry{}
 	firmwareSHACacheMu sync.Mutex
+)
+
+// fwVersionSeen remembers the last X-Cwm-Fw-Version reported by each
+// device so the sync handler logs the running firmware only when it
+// changes rather than on every 60s poll.
+var (
+	fwVersionSeen = map[string]string{}
+	fwVersionMu   sync.Mutex
 )
 
 func firmwareSHA(path string, fi os.FileInfo) (string, error) {
@@ -271,6 +288,15 @@ func handleFirmware(cfg *config.Config, cache *auth.NonceCache, logger *log.Logg
 	if sum, err := firmwareSHA(full, fi); err == nil {
 		w.Header().Set("ETag", `"`+sum+`"`)
 		w.Header().Set("X-Cwm-Firmware-SHA256", sum)
+	}
+	// A full firmware image takes far longer than the server-wide 10s
+	// WriteTimeout to stream — especially when the device reads slowly
+	// while rendering the UI over a congested 2.4 GHz link. That 10s cap
+	// severed the .bin at ~60% (the device saw ENOTCONN and the OTA
+	// attempt failed). Extend the write deadline for this download only;
+	// the tight server-wide timeout still guards the small JSON endpoints.
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(5 * time.Minute)); err != nil {
+		logger.Printf("firmware: extend write deadline unsupported: %v", err)
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "no-store")
@@ -796,6 +822,18 @@ func handleDeviceSync(cfg *config.Config, cache *auth.NonceCache, logger *log.Lo
 				logger.Printf("registry bump-min-sv %s: %v", deviceID, berr)
 			}
 		}
+	}
+	// The device reports its running firmware version on every request
+	// (X-Cwm-Fw-Version, unsigned metadata like serial/sku). It's the
+	// hook for future version-aware responses; for now we just surface
+	// it, logging only on change so a 60s poll doesn't spam.
+	if fw := r.Header.Get("X-Cwm-Fw-Version"); fw != "" {
+		fwVersionMu.Lock()
+		if fwVersionSeen[deviceID] != fw {
+			fwVersionSeen[deviceID] = fw
+			logger.Printf("device %s running firmware %s", deviceID, fw)
+		}
+		fwVersionMu.Unlock()
 	}
 
 	dev, lerr := reg.Load(deviceID)
