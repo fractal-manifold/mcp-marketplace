@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema",
   "$comment": "Authoritative MCP tool definitions for cwm-mcp. Every impl (Go, Python, JS) must register tools with these exact name/description/inputSchema triples. The Python and JS servers load this file at runtime; the Go server hardcodes equivalent mcp.NewTool registrations in internal/mcp/{server,devices,discovery,ota}.go and must be kept in sync by hand.",
-  "version": 6,
+  "version": 7,
   "tools": [
     {
       "name": "wall_monitor_status",
@@ -121,6 +121,14 @@
           "vol": {
             "type": "number",
             "description": "Alert volume, 0..100."
+          },
+          "channel": {
+            "type": "string",
+            "enum": [
+              "stable",
+              "dev"
+            ],
+            "description": "Release channel this device follows. 'stable' (default) installs only stable firmware (GitHub 'latest'). 'dev' lets the device receive dev-channel test builds (rolling prerelease) AND enables the OTA canary (probation + broker-triggered revert). Only mark genuine development units 'dev' — production units (serial FAC != DEV) refuse dev firmware on-device regardless."
           }
         },
         "required": [
@@ -221,6 +229,14 @@
           "firmware_manifest_sig_b64": {
             "type": "string",
             "description": "Base64 of the 64-byte Ed25519 signature over the manifest bytes (the `signature_b64` field from `manifest.py sign`'s output). Must be supplied together with firmware_manifest_b64."
+          },
+          "channel": {
+            "type": "string",
+            "enum": [
+              "stable",
+              "dev"
+            ],
+            "description": "Change the device's release channel ('stable' or 'dev'). Device-level attribute applied immediately (not staged in the pending), since it only steers which GitHub asset the broker fetches; the firmware never receives it. Production units refuse dev firmware on-device regardless of this setting."
           }
         },
         "required": [

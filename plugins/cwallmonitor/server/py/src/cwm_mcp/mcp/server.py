@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import secrets
 import socket
 import time
@@ -19,7 +20,7 @@ from typing import Any
 from .. import auth, creds, devlog
 from ..config import Config
 from ..logbuf import Buffer
-from ..registry.store import NotFound, Registry, valid_device_id, ConfigPayload, ProviderSet
+from ..registry.store import NotFound, Registry, valid_device_id, ConfigPayload, ProviderSet, effective_channel
 from ..state import State
 
 log = logging.getLogger("cwm_mcp.mcp")
@@ -92,6 +93,7 @@ def _device_summary(dev) -> dict:
         out["serial_number"] = dev.serial_number
     if getattr(dev, "hw_sku", ""):
         out["hw_sku"] = dev.hw_sku
+    out["channel"] = effective_channel(dev)
     if dev.active.payload.min_secure_version:
         out["min_secure_version"] = dev.active.payload.min_secure_version
     if dev.active.payload.broker_url:
@@ -171,6 +173,19 @@ def _registry_unavailable_text() -> str:
 
 def _clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
+
+
+_CHANNEL_ARG_RE = re.compile(r"^[a-z]{1,7}$")
+
+
+def _valid_channel_arg(raw) -> str | None:
+    """Accept "stable"/"dev" (and, defensively, any 1..7 lowercase letters
+    for a future channel). Returns the canonical string or None if invalid.
+    "" / "stable" both map to "stable". Mirror of JS validChannelArg."""
+    s = str(raw or "").strip().lower()
+    if s in ("", "stable"):
+        return "stable"
+    return s if _CHANNEL_ARG_RE.fullmatch(s) else None
 
 
 async def serve(deps: Deps) -> None:
@@ -424,6 +439,13 @@ def _register_device(deps: Deps, args: dict) -> dict:
         bytes.fromhex(psk_hex)
     except ValueError:
         return {"error": "psk_hex is not valid hex"}
+    # Release channel is a device-level attribute, NOT part of the config
+    # payload. "" / "stable" -> stable; "dev" -> dev.
+    channel = "stable"
+    if (raw := args.get("channel")) not in (None, ""):
+        channel = _valid_channel_arg(raw)
+        if channel is None:
+            return {"error": "channel must be 'stable' or 'dev'"}
     payload = ConfigPayload(broker_url=broker_url, psk_hex=psk_hex, city=(args.get("city") or "").strip())
     if (v := args.get("br_day")):
         try:
@@ -441,7 +463,7 @@ def _register_device(deps: Deps, args: dict) -> dict:
         except (TypeError, ValueError):
             pass
     try:
-        dev = deps.registry.register(device_id, payload)
+        dev = deps.registry.register(device_id, payload, channel)
     except Exception as e:
         return {"error": str(e)}
     return {"ok": True, "device": _device_summary(dev)}
@@ -453,6 +475,19 @@ def _set_device_pending(deps: Deps, args: dict) -> dict:
     device_id = (args.get("device_id") or "").strip().lower()
     if not valid_device_id(device_id):
         return {"error": "device_id must be 8 lowercase hex chars"}
+    # Release channel is a device-level attribute (steers which GitHub
+    # asset the OTA loop fetches), NOT part of the config pending. Apply it
+    # immediately, before any pending merge.
+    if (raw := args.get("channel")) not in (None, ""):
+        ch = _valid_channel_arg(raw)
+        if ch is None:
+            return {"error": "channel must be 'stable' or 'dev'"}
+        try:
+            deps.registry.set_channel(device_id, ch)
+        except NotFound:
+            return {"error": f"device {device_id} not registered — call wall_monitor_register_device first"}
+        except Exception as e:
+            return {"error": str(e)}
     update = ConfigPayload()
     if (v := (args.get("broker_url") or "").strip()):
         update.broker_url = v

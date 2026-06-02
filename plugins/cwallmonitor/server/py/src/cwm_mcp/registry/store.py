@@ -18,13 +18,41 @@ from pathlib import Path
 import tomli_w
 import tomllib
 
-SCHEMA_VERSION = 2  # v2 adds serial_number, hw_sku, firmware_manifest_*, min_secure_version
+# v2 adds serial_number, hw_sku, firmware_manifest_*, min_secure_version.
+# v3 adds device.channel (release track: "" / "stable" vs "dev") — a
+# device-level attribute (like serial_number / hw_sku), NOT a config
+# payload field. The firmware never sees it; the broker uses it only to
+# pick which GitHub asset to fetch. v0/v1/v2 files load with channel=""
+# (== stable) and are re-serialised as v3 on the next save.
+SCHEMA_VERSION = 3
 
 _DEVICE_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 
 
 def valid_device_id(device_id: str) -> bool:
     return bool(_DEVICE_ID_RE.fullmatch(device_id))
+
+
+def normalize_channel(c: str | None) -> str:
+    """Canonicalise a release-channel string.
+
+    Trim + lowercase; "stable" and "" both collapse to "" (the stable
+    track, omitted on disk). Anything else is the lowercased string
+    verbatim (today only "dev"). Mirror of JS normalizeChannel.
+    """
+    s = str(c or "").strip().lower()
+    return "" if s == "stable" else s
+
+
+def effective_channel(dev: "Device | None") -> str:
+    """Return the device's release track as a non-empty string.
+
+    The stored channel, or "stable" when empty. Mirror of JS
+    effectiveChannel.
+    """
+    if dev is not None and dev.channel:
+        return dev.channel
+    return "stable"
 
 
 class RegistryError(Exception):
@@ -179,6 +207,11 @@ class Device:
     # wins.
     serial_number: str = ""
     hw_sku: str = ""
+    # Schema v3 — OTA release track. "" / "stable" both mean the stable
+    # track (the key is OMITTED on disk in that case); "dev" means the
+    # rolling dev tag. Device-level (a sibling of hw_sku), NOT part of the
+    # config payload. Always stored canonical via normalize_channel.
+    channel: str = ""
     active: Active = field(default_factory=Active)
     pending: Pending | None = None
 
@@ -191,6 +224,8 @@ class Device:
             doc["serial_number"] = self.serial_number
         if self.hw_sku:
             doc["hw_sku"] = self.hw_sku
+        if self.channel:
+            doc["channel"] = self.channel
         doc["active"] = self.active.payload.to_toml_dict()
         if self.active.last_seen:
             doc["active"]["last_seen"] = self.active.last_seen
@@ -204,10 +239,10 @@ class Device:
 def _device_from_toml(text: str) -> Device:
     d = tomllib.loads(text)
     schema = int(d.get("schema_version", 0))
-    # v0 = freshly-decoded zero value. v1 is the pre-serial schema —
-    # migrated transparently: serial / sku stay empty until the next
-    # /sync round populates them from headers. Next save bumps to v2.
-    if schema not in (0, 1, SCHEMA_VERSION):
+    # v0 = freshly-decoded zero value. v1 is the pre-serial schema, v2 is
+    # pre-channel — all migrated transparently: serial / sku / channel
+    # stay empty/default until populated. Next save bumps to SCHEMA_VERSION.
+    if schema not in (0, 1, 2, SCHEMA_VERSION):
         raise RegistryError(f"registry: schema {schema}, expected {SCHEMA_VERSION}")
     device_id = str(d.get("device_id", ""))
     active_d = d.get("active") or {}
@@ -226,6 +261,7 @@ def _device_from_toml(text: str) -> Device:
         device_id=device_id,
         serial_number=str(d.get("serial_number", "")),
         hw_sku=str(d.get("hw_sku", "")),
+        channel=normalize_channel(d.get("channel")),
         active=active,
         pending=pending,
     )
@@ -300,7 +336,7 @@ class Registry:
             os.close(fd)
         os.replace(tmp, path)
 
-    def register(self, device_id: str, active: ConfigPayload) -> Device:
+    def register(self, device_id: str, active: ConfigPayload, channel: str = "") -> Device:
         if not valid_device_id(device_id):
             raise RegistryError(f"registry: invalid device_id {device_id!r}")
         if not active.psk_hex or not active.broker_url:
@@ -309,13 +345,17 @@ class Registry:
             raise RegistryError("registry: psk_hex must be 64 lowercase hex chars")
         active.psk_hex = active.psk_hex.lower()
         active.version = 1
+        # Release channel is a device-level attribute, NOT part of the
+        # config payload. Mirror of JS register() pulling `channel` off
+        # the incoming payload.
+        ch = normalize_channel(channel)
         with self._with_lock(device_id):
             try:
                 self._load_locked(device_id)
                 raise RegistryError(f"registry: device {device_id} already exists")
             except NotFound:
                 pass
-            dev = Device(device_id=device_id, active=Active(payload=active))
+            dev = Device(device_id=device_id, channel=ch, active=Active(payload=active))
             self._save_locked(dev)
             return dev
 
@@ -396,6 +436,27 @@ class Registry:
                 dev.hw_sku = sku
                 changed = True
             if changed:
+                self._save_locked(dev)
+
+    def set_channel(self, device_id: str, channel: str) -> None:
+        """Persist the device's OTA release track ("" / "stable" vs "dev").
+
+        Device-level (like set_serial), applied immediately — it only
+        steers which GitHub asset the OTA loop fetches; the firmware
+        never sees it. The value is canonicalised via normalize_channel;
+        the file is re-written only when the channel actually changes.
+        Unknown devices are silently ignored. Mirror of JS setChannel.
+        """
+        if not valid_device_id(device_id):
+            return
+        norm = normalize_channel(channel)
+        with self._with_lock(device_id):
+            try:
+                dev = self._load_locked(device_id)
+            except NotFound:
+                return
+            if norm != dev.channel:
+                dev.channel = norm
                 self._save_locked(dev)
 
     def bump_min_sv(self, device_id: str, sv: int) -> None:

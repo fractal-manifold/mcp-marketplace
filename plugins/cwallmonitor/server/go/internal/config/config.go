@@ -150,7 +150,11 @@ type OTAConfig struct {
 	Enabled             bool     `toml:"enabled"`
 	ReleasesRepo        string   `toml:"releases_repo"`
 	PollIntervalMinutes int      `toml:"poll_interval_minutes"`
-	Keys                []OTAKey `toml:"keys"`
+	// DevTag is the rolling GitHub release tag the broker fetches the
+	// per-SKU asset from for devices on the "dev" channel. Stable devices
+	// ride the latest/download redirect instead. Defaults to "dev".
+	DevTag string   `toml:"dev_tag"`
+	Keys   []OTAKey `toml:"keys"`
 }
 
 // OTAKey is one entry in the verification keyring: a key_id (matching the
@@ -296,6 +300,7 @@ func defaults() *Config {
 			Enabled:             true,
 			ReleasesRepo:        "https://github.com/fractal-manifold/cwm-ota-releases",
 			PollIntervalMinutes: 60,
+			DevTag:              "dev",
 		},
 	}
 }

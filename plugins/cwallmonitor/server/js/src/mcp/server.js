@@ -62,6 +62,7 @@ function deviceSummary(dev) {
   const out = { device_id: dev.deviceID, active_version: dev.active.payload.version, has_pending: !!dev.pending };
   if (dev.serialNumber) out.serial_number = dev.serialNumber;
   if (dev.hwSku) out.hw_sku = dev.hwSku;
+  out.channel = dev.channel || "stable";
   if (dev.active.payload.min_secure_version) out.min_secure_version = dev.active.payload.min_secure_version;
   if (dev.active.payload.broker_url) out.active_broker_url = dev.active.payload.broker_url;
   if (dev.active.payload.city) out.active_city = dev.active.payload.city;
@@ -332,6 +333,15 @@ function listDevicesTool(deps) {
   return { count: devs.length, devices: devs.map(deviceSummary) };
 }
 
+// validChannelArg accepts "stable"/"dev" (and, defensively, any 1..7
+// lowercase letters for a future channel). Returns the canonical string or
+// null if invalid. "" / "stable" both map to "stable".
+function validChannelArg(raw) {
+  const s = String(raw || "").trim().toLowerCase();
+  if (s === "" || s === "stable") return "stable";
+  return /^[a-z]{1,7}$/.test(s) ? s : null;
+}
+
 function registerDeviceTool(deps, args) {
   if (!deps.registry) return { error: registryUnavailableMsg() };
   const deviceID = String(args.device_id || "").trim().toLowerCase();
@@ -341,7 +351,12 @@ function registerDeviceTool(deps, args) {
   if (!brokerURL) return { error: "broker_url required" };
   if (pskHex.length !== 64) return { error: "psk_hex must be exactly 64 hex chars" };
   if (!/^[0-9a-fA-F]{64}$/.test(pskHex)) return { error: "psk_hex is not valid hex" };
-  const payload = { broker_url: brokerURL, psk_hex: pskHex, city: String(args.city || "").trim(), br_day: 0, br_night: 0, vol: 0, providers: null, autorotate_enabled: null, autorotate_interval_s: null, version: 0 };
+  let channel = "stable";
+  if (args.channel != null && args.channel !== "") {
+    channel = validChannelArg(args.channel);
+    if (channel === null) return { error: "channel must be 'stable' or 'dev'" };
+  }
+  const payload = { broker_url: brokerURL, psk_hex: pskHex, city: String(args.city || "").trim(), br_day: 0, br_night: 0, vol: 0, providers: null, autorotate_enabled: null, autorotate_interval_s: null, version: 0, channel };
   if (args.br_day) payload.br_day = clamp(Number.parseInt(args.br_day, 10) || 0, 10, 100);
   if (args.br_night) payload.br_night = clamp(Number.parseInt(args.br_night, 10) || 0, 5, 100);
   if (args.vol != null) payload.vol = clamp(Number.parseInt(args.vol, 10) || 0, 0, 100);
@@ -353,6 +368,18 @@ function setDevicePendingTool(deps, args) {
   if (!deps.registry) return { error: registryUnavailableMsg() };
   const deviceID = String(args.device_id || "").trim().toLowerCase();
   if (!validDeviceID(deviceID)) return { error: "device_id must be 8 lowercase hex chars" };
+  // Release channel is a device-level attribute (steers which GitHub asset
+  // the OTA loop fetches), NOT part of the config pending. Apply it
+  // immediately, before any pending merge.
+  if (args.channel != null && args.channel !== "") {
+    const ch = validChannelArg(args.channel);
+    if (ch === null) return { error: "channel must be 'stable' or 'dev'" };
+    try { deps.registry.setChannel(deviceID, ch); }
+    catch (e) {
+      if (/not found/.test(e.message)) return { error: `device ${deviceID} not registered — call wall_monitor_register_device first` };
+      return { error: e.message };
+    }
+  }
   const upd = { version: 0, broker_url: "", psk_hex: "", city: "", br_day: 0, br_night: 0, vol: 0, providers: null, autorotate_enabled: null, autorotate_interval_s: null, theme_mode: "", gemini_models: null, log_enabled: null, firmware_url: "", firmware_sha256: "", firmware_version: "", firmware_manifest_b64: "", firmware_manifest_sig_b64: "", min_secure_version: 0 };
   if (args.broker_url) upd.broker_url = String(args.broker_url).trim();
   if (args.psk_hex) {

@@ -25,10 +25,14 @@ try {
 // v2 adds: device.serial_number, device.hw_sku (factory identity from
 // X-Cwm-Serial / X-Cwm-Sku headers), pending.firmware_manifest_b64 /
 // firmware_manifest_sig_b64 (signed OTA manifest), and
-// active.min_secure_version (anti-rollback floor). v1 files load with
-// empty serial / sku / manifest fields and are re-serialised as v2 on
-// the next save.
-export const SCHEMA_VERSION = 2;
+// active.min_secure_version (anti-rollback floor).
+// v3 adds: device.channel (release track: "" / "stable" vs "dev"). It's
+// a device-level attribute (like serial_number / hw_sku), NOT a config
+// payload field — the firmware never receives it; the broker uses it only
+// to pick which GitHub asset to fetch (latest vs the rolling dev tag).
+// v1/v2 files load with channel="" (== stable) and are re-serialised as
+// v3 on the next save.
+export const SCHEMA_VERSION = 3;
 
 const DEVICE_ID_RE = /^[0-9a-f]{8}$/;
 export function validDeviceID(id) { return DEVICE_ID_RE.test(id); }
@@ -72,10 +76,11 @@ export class Registry {
     if (!existsSync(path)) throw new NotFound(`registry: device ${id} not found`);
     const raw = readFileSync(path, "utf8");
     const dev = deviceFromTOML(raw);
-    // 0 = freshly-decoded zero value, 1 = pre-serial schema (migrated
-    // transparently — serial/sku stay empty until the next /sync round
-    // populates them, next save bumps to v2). Anything else is foreign.
-    if (![0, 1, SCHEMA_VERSION].includes(dev.schemaVersion)) {
+    // 0 = freshly-decoded zero value; 1 = pre-serial schema; 2 = pre-channel
+    // schema. All migrate transparently (missing fields stay empty/default;
+    // the next save bumps to the current SCHEMA_VERSION). Anything else is
+    // foreign.
+    if (![0, 1, 2, SCHEMA_VERSION].includes(dev.schemaVersion)) {
       throw new RegistryError(`registry: schema ${dev.schemaVersion}, expected ${SCHEMA_VERSION}`);
     }
     return dev;
@@ -104,7 +109,8 @@ export class Registry {
         this._loadLocked(id);
         throw new RegistryError(`registry: device ${id} already exists`);
       } catch (e) { if (!(e instanceof NotFound)) throw e; }
-      const dev = { schemaVersion: SCHEMA_VERSION, deviceID: id, serialNumber: "", hwSku: "", active: { payload: active, lastSeen: null }, pending: null };
+      const dev = { schemaVersion: SCHEMA_VERSION, deviceID: id, serialNumber: "", hwSku: "", channel: normalizeChannel(active.channel), active: { payload: active, lastSeen: null }, pending: null };
+      delete active.channel; // channel is device-level, not part of the config payload
       this._saveLocked(dev);
       return dev;
     });
@@ -174,6 +180,20 @@ export class Registry {
       if (serial && serial !== dev.serialNumber) { dev.serialNumber = serial; changed = true; }
       if (sku && sku !== dev.hwSku) { dev.hwSku = sku; changed = true; }
       if (changed) this._saveLocked(dev);
+    });
+  }
+
+  // setChannel persists the device's release track ("" / "stable" vs "dev").
+  // Device-level (like setSerial), applied immediately — it only steers which
+  // GitHub asset the OTA loop fetches; the firmware never sees it. Unknown
+  // devices are silently ignored.
+  setChannel(id, channel) {
+    if (!validDeviceID(id)) return;
+    const norm = normalizeChannel(channel);
+    this._withLock(id, () => {
+      let dev;
+      try { dev = this._loadLocked(id); } catch (e) { if (e instanceof NotFound) return; throw e; }
+      if (norm !== dev.channel) { dev.channel = norm; this._saveLocked(dev); }
     });
   }
 
@@ -306,10 +326,23 @@ function tomlObjToPayload(d) {
   };
 }
 
+// Release channel normalisation: "" and "stable" both mean the stable
+// track (field omitted on disk); anything else is lowercased verbatim
+// (today only "dev"). Centralised so the registry, the OTA loop and the
+// tools agree on the canonical form.
+export function normalizeChannel(c) {
+  const s = String(c || "").trim().toLowerCase();
+  return s === "stable" ? "" : s;
+}
+export function effectiveChannel(dev) {
+  return (dev && dev.channel) ? dev.channel : "stable";
+}
+
 function deviceToTOML(dev) {
   const doc = { schema_version: SCHEMA_VERSION, device_id: dev.deviceID };
   if (dev.serialNumber) doc.serial_number = dev.serialNumber;
   if (dev.hwSku) doc.hw_sku = dev.hwSku;
+  if (dev.channel) doc.channel = dev.channel;
   const a = payloadToTomlObj(dev.active.payload);
   if (dev.active.lastSeen) a.last_seen = dev.active.lastSeen;
   doc.active = a;
@@ -333,6 +366,7 @@ function deviceFromTOML(text) {
     deviceID: String(d.device_id || ""),
     serialNumber: String(d.serial_number || ""),
     hwSku: String(d.hw_sku || ""),
+    channel: normalizeChannel(d.channel),
     active,
     pending,
   };

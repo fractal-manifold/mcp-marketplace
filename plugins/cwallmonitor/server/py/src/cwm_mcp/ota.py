@@ -35,7 +35,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .config import Config
-from .registry.store import ConfigPayload, Registry
+from .registry.store import ConfigPayload, Registry, effective_channel
 
 log = logging.getLogger("cwm_mcp.ota")
 
@@ -93,11 +93,19 @@ class _SkuError(Exception):
     pass
 
 
-async def _fetch_index(session, repo: str, sku: str) -> dict:
-    """GET the update-<SKU>.json release asset. aiohttp follows GitHub's
-    cross-host redirect chain (github.com -> objects.githubusercontent.com)
-    automatically."""
-    url = repo.rstrip("/") + f"/releases/latest/download/update-{sku}.json"
+async def _fetch_index(session, repo: str, sku: str, channel: str = "stable", dev_tag: str = "dev") -> dict:
+    """GET the update-<SKU>.json release asset for one (SKU, channel).
+
+    Stable rides GitHub's latest/download redirect (newest non-prerelease);
+    dev rides the rolling prerelease tag, so a dev device never sees a
+    stable build and a stable device never sees a prerelease. aiohttp
+    follows GitHub's cross-host redirect chain
+    (github.com -> objects.githubusercontent.com) automatically."""
+    base = repo.rstrip("/")
+    if channel and channel != "stable":
+        url = base + f"/releases/download/{dev_tag or 'dev'}/update-{sku}.json"
+    else:
+        url = base + f"/releases/latest/download/update-{sku}.json"
     headers = {"Accept": "application/json", "User-Agent": "cwm-mcp-ota"}
     async with session.get(url, headers=headers) as resp:
         if resp.status != 200:
@@ -115,10 +123,12 @@ async def _fetch_index(session, repo: str, sku: str) -> dict:
     return idx
 
 
-def _resolve_sku(cfg: Config, idx: dict, sku: str) -> tuple[dict | None, dict]:
+def _resolve_sku(cfg: Config, idx: dict, sku: str, channel: str = "stable") -> tuple[dict | None, dict]:
     """Verify + parse a fetched index. Returns (resolved_or_None, sku_result).
-    sku_result mirrors Go SKUResult JSON."""
-    sres: dict = {"sku": sku, "latest_version": idx.get("version", ""), "verified": False}
+    sku_result mirrors Go SKUResult JSON. `channel` is the device's
+    effective channel; `want` collapses "" to "stable" defensively."""
+    want = channel if (channel and channel != "stable") else "stable"
+    sres: dict = {"sku": sku, "channel": want, "latest_version": idx.get("version", ""), "verified": False}
     try:
         man = base64.b64decode(str(idx["manifest_b64"]).strip(), validate=True)
     except (binascii.Error, ValueError):
@@ -157,6 +167,14 @@ def _resolve_sku(cfg: Config, idx: dict, sku: str) -> tuple[dict | None, dict]:
     if str(idx["version"]) != str(mf.get("version", "")):
         sres["error"] = f"index version {idx['version']!r} != manifest version {mf.get('version')!r}"
         return None, sres
+    # Channel must match what we asked for. Stable manifests OMIT the field
+    # (absent == stable); dev manifests carry channel:"dev". This is a
+    # sanity check on the signed authority — the device re-checks it too,
+    # and refuses a dev manifest outright on a production unit.
+    man_chan = str(mf.get("channel")) if mf.get("channel") else "stable"
+    if man_chan != want:
+        sres["error"] = f"manifest channel {man_chan!r} != requested {want!r}"
+        return None, sres
     if not str(idx["bin_url"]).startswith("https://"):
         sres["error"] = "bin_url must be HTTPS"
         return None, sres
@@ -172,12 +190,22 @@ def _decide(reg: Registry, dev, resolved: dict, dry_run: bool) -> dict:
     staging a pending when appropriate (unless dry_run). Mirrors Go decide."""
     mf = resolved["mf"]
     idx = resolved["idx"]
-    out: dict = {"device_id": dev.device_id, "sku": dev.hw_sku, "to": str(mf.get("version", ""))}
+    out: dict = {"device_id": dev.device_id, "sku": dev.hw_sku, "channel": effective_channel(dev), "to": str(mf.get("version", ""))}
     release_packed = pack_semver(str(mf.get("version", "")))
     if release_packed is None:
         out["action"] = "skipped:bad-version"
         return out
     out["from"] = dev.active.payload.firmware_version
+    # Release not strictly newer than the version the device is actually
+    # RUNNING? Then it's up to date even if the anti-rollback floor hasn't
+    # caught up yet. This matters during a dev unit's canary window (the
+    # floor bump is deferred, so the min_secure_version comparison alone
+    # would re-stage the running build every poll) and for USB-flashed
+    # images whose floor lags the installed version. Mirrors Go/JS decide.
+    running = pack_semver(str(dev.active.payload.firmware_version or ""))
+    if running is not None and release_packed <= running:
+        out["action"] = "up_to_date"
+        return out
     # Compare against the device's reported anti-rollback floor.
     if release_packed <= dev.active.payload.min_secure_version:
         out["action"] = "up_to_date"
@@ -253,7 +281,9 @@ async def check(
     sku_filter = sku_filter.strip().upper()
     device_filter = device_filter.strip().lower()
     wanted = []
-    sku_set: set[str] = set()
+    # One release lookup per distinct (SKU, channel): a dev S1 device and a
+    # stable S1 device pull different assets, so the SKU alone is not the key.
+    targets: dict[str, tuple[str, str]] = {}
     for dev in reg.list():
         if not dev.hw_sku:
             continue
@@ -262,31 +292,34 @@ async def check(
         if sku_filter and dev.hw_sku != sku_filter:
             continue
         wanted.append(dev)
-        sku_set.add(dev.hw_sku)
+        channel = effective_channel(dev)
+        targets[f"{dev.hw_sku} {channel}"] = (dev.hw_sku, channel)
 
     own_session = session is None
     if own_session:
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS))
     try:
-        resolved_by_sku: dict[str, dict] = {}
-        for sku in sorted(sku_set):
+        resolved_by_key: dict[str, dict] = {}
+        for key in sorted(targets):
+            sku, channel = targets[key]
             try:
-                idx = await _fetch_index(session, o.releases_repo, sku)
-                resolved, sres = _resolve_sku(cfg, idx, sku)
+                idx = await _fetch_index(session, o.releases_repo, sku, channel, o.dev_tag)
+                resolved, sres = _resolve_sku(cfg, idx, sku, channel)
             except _SkuError as e:
-                rep["per_sku"].append({"sku": sku, "verified": False, "error": str(e)})
+                rep["per_sku"].append({"sku": sku, "channel": channel, "verified": False, "error": str(e)})
                 continue
             rep["per_sku"].append(_drop_empty(sres, ("latest_version", "error")))
             if resolved is not None:
-                resolved_by_sku[sku] = resolved
+                resolved_by_key[key] = resolved
     finally:
         if own_session:
             await session.close()
 
     for dev in wanted:
-        resolved = resolved_by_sku.get(dev.hw_sku)
+        channel = effective_channel(dev)
+        resolved = resolved_by_key.get(f"{dev.hw_sku} {channel}")
         if resolved is None:
-            rep["devices"].append({"device_id": dev.device_id, "sku": dev.hw_sku, "action": "skipped:no-release"})
+            rep["devices"].append({"device_id": dev.device_id, "sku": dev.hw_sku, "channel": channel, "action": "skipped:no-release"})
             continue
         res = _decide(reg, dev, resolved, dry_run)
         if res.get("action") == "staged":

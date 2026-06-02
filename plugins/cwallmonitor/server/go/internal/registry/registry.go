@@ -42,7 +42,13 @@ import (
 //          from the device's cwm_min_sv NVS key).
 // v1 files load with empty serial / hw_sku / manifest fields and are
 // re-serialised as v2 on the next save (migration in loadLocked).
-const SchemaVersion = 2
+// v3 adds: device.channel (release track: "" / "stable" vs "dev"). It's
+// a device-level attribute (like serial_number / hw_sku), NOT a config
+// payload field — the firmware never receives it; the broker uses it only
+// to pick which GitHub asset to fetch (latest vs the rolling dev tag).
+// v0/v1/v2 files load with channel="" (== stable) and are re-serialised
+// as v3 on the next save.
+const SchemaVersion = 3
 
 // ProviderSet mirrors the firmware's per-provider NVS toggles (NVS keys
 // prov_claude, prov_codex, prov_gemini). Stored as plain bools so an
@@ -143,9 +149,40 @@ type Device struct {
 	// have to re-parse the serial. The broker NEVER promotes a pending
 	// whose firmware_manifest_b64.sku conflicts with this — the
 	// firmware would reject it anyway, this just spares the round trip.
-	HWSku   string   `toml:"hw_sku,omitempty"`
+	HWSku string `toml:"hw_sku,omitempty"`
+	// Channel is the device's OTA release track. "" / "stable" both mean
+	// the stable track (the key is OMITTED on disk in that case); "dev"
+	// means the rolling dev tag. Device-level (a sibling of hw_sku), NOT
+	// part of the config payload — the firmware never sees it; the broker
+	// uses it only to pick which GitHub asset to fetch. Always stored
+	// canonical via normalizeChannel (trim+lowercase; "stable" → "").
+	Channel string   `toml:"channel,omitempty"`
 	Active  Active   `toml:"active"`
 	Pending *Pending `toml:"pending,omitempty"`
+}
+
+// normalizeChannel canonicalises a release-channel string: trim +
+// lowercase, with "stable" and "" both collapsing to "" (the stable
+// track, omitted on disk). Anything else is the lowercased string
+// verbatim (today only "dev"). Centralised so the registry, the OTA loop
+// and the MCP tools agree on the canonical form. Mirror of JS
+// normalizeChannel.
+func normalizeChannel(c string) string {
+	s := strings.ToLower(strings.TrimSpace(c))
+	if s == "stable" {
+		return ""
+	}
+	return s
+}
+
+// EffectiveChannel returns the device's release track as a non-empty
+// string: the stored channel, or "stable" when empty. Mirror of JS
+// effectiveChannel.
+func EffectiveChannel(dev *Device) string {
+	if dev != nil && dev.Channel != "" {
+		return dev.Channel
+	}
+	return "stable"
 }
 
 // Registry owns the on-disk store under devicesDir. Construct via New.
@@ -215,15 +252,18 @@ func (r *Registry) loadLocked(dataPath string) (*Device, error) {
 		return nil, fmt.Errorf("registry: parse %s: %w", dataPath, err)
 	}
 	switch dev.SchemaVersion {
-	case 0, 1, SchemaVersion:
+	case 0, 1, 2, SchemaVersion:
 		// v0 = freshly-decoded zero value (no field set). v1 is the
-		// pre-serial schema — migrated transparently: serial_number /
-		// hw_sku stay empty until the next /sync round populates them
-		// from the X-Cwm-Serial header, and the next save bumps the
+		// pre-serial schema, v2 is pre-channel — all migrated
+		// transparently: serial_number / hw_sku / channel stay
+		// empty/default until populated, and the next save bumps the
 		// stored schema_version to SchemaVersion.
 	default:
 		return nil, fmt.Errorf("registry: %s schema %d, expected %d", dataPath, dev.SchemaVersion, SchemaVersion)
 	}
+	// Canonicalise the channel so a hand-edited "STABLE"/"Dev" loads the
+	// same as the broker would have written it.
+	dev.Channel = normalizeChannel(dev.Channel)
 	return &dev, nil
 }
 
@@ -278,7 +318,12 @@ func (r *Registry) Load(deviceID string) (*Device, error) {
 // Register creates a new device record with `active` populated from the
 // supplied payload (version forced to 1). Fails if the device already
 // exists — callers that want to overwrite must use SetActive explicitly.
-func (r *Registry) Register(deviceID string, active ConfigPayload) (*Device, error) {
+//
+// An optional release channel may be supplied as a trailing argument; it
+// is stored device-level (a sibling of hw_sku, NOT part of the config
+// payload) after canonicalisation. Mirrors the JS register() pulling
+// `channel` off the incoming payload.
+func (r *Registry) Register(deviceID string, active ConfigPayload, channel ...string) (*Device, error) {
 	if !ValidDeviceID(deviceID) {
 		return nil, fmt.Errorf("registry: invalid device_id %q", deviceID)
 	}
@@ -290,6 +335,10 @@ func (r *Registry) Register(deviceID string, active ConfigPayload) (*Device, err
 	}
 	active.PSKHex = strings.ToLower(active.PSKHex)
 	active.Version = 1
+	ch := ""
+	if len(channel) > 0 {
+		ch = normalizeChannel(channel[0])
+	}
 
 	var out *Device
 	err := r.withLock(deviceID, func(p string) error {
@@ -300,6 +349,7 @@ func (r *Registry) Register(deviceID string, active ConfigPayload) (*Device, err
 		}
 		dev := &Device{
 			DeviceID: deviceID,
+			Channel:  ch,
 			Active:   Active{ConfigPayload: active},
 		}
 		if err := r.saveLocked(dev, p); err != nil {
@@ -473,6 +523,33 @@ func (r *Registry) SetSerial(deviceID, serial, sku string) error {
 		if !changed {
 			return nil
 		}
+		return r.saveLocked(dev, p)
+	})
+}
+
+// SetChannel persists the device's OTA release track ("" / "stable" vs
+// "dev"). Device-level (like SetSerial), applied immediately — it only
+// steers which GitHub asset the OTA loop fetches; the firmware never sees
+// it. The value is canonicalised via normalizeChannel; the file is
+// re-written only when the channel actually changes. Unknown devices are
+// silently ignored. Mirror of JS setChannel.
+func (r *Registry) SetChannel(deviceID, channel string) error {
+	if !ValidDeviceID(deviceID) {
+		return fmt.Errorf("registry: invalid device_id %q", deviceID)
+	}
+	norm := normalizeChannel(channel)
+	return r.withLock(deviceID, func(p string) error {
+		dev, err := r.loadLocked(p)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return nil
+			}
+			return err
+		}
+		if norm == dev.Channel {
+			return nil
+		}
+		dev.Channel = norm
 		return r.saveLocked(dev, p)
 	})
 }

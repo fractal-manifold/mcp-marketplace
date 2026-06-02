@@ -111,6 +111,10 @@ class OTA:
     enabled: bool = True
     releases_repo: str = "https://github.com/fractal-manifold/cwm-ota-releases"
     poll_interval_minutes: int = 60
+    # dev_tag is the rolling GitHub release tag the broker fetches the
+    # per-SKU asset from for devices on the "dev" channel. Stable devices
+    # ride the latest/download redirect instead.
+    dev_tag: str = "dev"
     keys: list[OTAKey] = field(default_factory=list)
 
     def configured(self) -> bool:
@@ -207,6 +211,8 @@ def load(path: str | None = None) -> Config:
         cfg.ota.releases_repo = str(ota_raw["releases_repo"])
     if "poll_interval_minutes" in ota_raw:
         cfg.ota.poll_interval_minutes = int(ota_raw["poll_interval_minutes"])
+    if "dev_tag" in ota_raw:
+        cfg.ota.dev_tag = str(ota_raw["dev_tag"])
     cfg.ota.keys = [
         OTAKey(key_id=str(k.get("key_id", "")), pubkey_b64=str(k.get("pubkey_b64", "")))
         for k in (ota_raw.get("keys") or [])

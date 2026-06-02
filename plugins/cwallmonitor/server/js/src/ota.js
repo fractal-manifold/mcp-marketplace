@@ -20,6 +20,8 @@
 
 import { createPublicKey, verify as cryptoVerify } from "node:crypto";
 
+import { effectiveChannel } from "./registry/store.js";
+
 const DEFAULT_POLL_MINUTES = 60;
 const MIN_POLL_MINUTES = 5;
 const INITIAL_DELAY_MS = 30_000;
@@ -68,9 +70,15 @@ function nowISO() {
   return new Date().toISOString();
 }
 
-async function fetchIndex(cfg, sku) {
-  const url = cfg.ota.releases_repo.replace(/\/+$/, "") +
-    `/releases/latest/download/update-${sku}.json`;
+// fetchIndex GETs the per-SKU index for one (sku, channel). Stable rides
+// GitHub's latest/download redirect (newest non-prerelease); dev rides the
+// rolling prerelease tag, so a dev device never sees a stable build and a
+// stable device never sees a prerelease.
+async function fetchIndex(cfg, sku, channel = "stable") {
+  const base = cfg.ota.releases_repo.replace(/\/+$/, "");
+  const url = (channel && channel !== "stable")
+    ? `${base}/releases/download/${cfg.ota.dev_tag || "dev"}/update-${sku}.json`
+    : `${base}/releases/latest/download/update-${sku}.json`;
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), HTTP_TIMEOUT_MS);
   let resp;
@@ -99,8 +107,9 @@ async function fetchIndex(cfg, sku) {
 
 // resolveSKU verifies + parses a fetched index. Returns
 // { resolved, skuResult }; resolved is null on any failure.
-function resolveSKU(cfg, idx, sku) {
-  const sres = { sku, latest_version: String(idx.version || ""), verified: false };
+function resolveSKU(cfg, idx, sku, channel = "stable") {
+  const want = (channel && channel !== "stable") ? channel : "stable";
+  const sres = { sku, channel: want, latest_version: String(idx.version || ""), verified: false };
   let man;
   try { man = Buffer.from(String(idx.manifest_b64).trim(), "base64"); }
   catch { sres.error = "manifest_b64 decode failed"; return { resolved: null, skuResult: sres }; }
@@ -125,6 +134,15 @@ function resolveSKU(cfg, idx, sku) {
     sres.error = `index version ${JSON.stringify(idx.version)} != manifest version ${JSON.stringify(mf.version)}`;
     return { resolved: null, skuResult: sres };
   }
+  // Channel must match what we asked for. Stable manifests OMIT the field
+  // (absent == stable); dev manifests carry channel:"dev". This is a sanity
+  // check on the signed authority — the device re-checks it too, and refuses
+  // a dev manifest outright on a production unit.
+  const manChan = mf.channel ? String(mf.channel) : "stable";
+  if (manChan !== want) {
+    sres.error = `manifest channel ${JSON.stringify(manChan)} != requested ${JSON.stringify(want)}`;
+    return { resolved: null, skuResult: sres };
+  }
   if (!String(idx.bin_url).startsWith("https://")) { sres.error = "bin_url must be HTTPS"; return { resolved: null, skuResult: sres }; }
   if (packSemver(String(mf.version || "")) === null) { sres.error = "manifest version is not MAJOR.MINOR.PATCH"; return { resolved: null, skuResult: sres }; }
   sres.verified = true;
@@ -135,10 +153,18 @@ function resolveSKU(cfg, idx, sku) {
 // staging a pending when appropriate (unless dryRun). Mirrors Go decide.
 function decide(reg, dev, resolved, dryRun, logger) {
   const { idx, mf } = resolved;
-  const out = { device_id: dev.deviceID, sku: dev.hwSku, to: String(mf.version || "") };
+  const out = { device_id: dev.deviceID, sku: dev.hwSku, channel: effectiveChannel(dev), to: String(mf.version || "") };
   const releasePacked = packSemver(String(mf.version || ""));
   if (releasePacked === null) { out.action = "skipped:bad-version"; return out; }
   out.from = dev.active.payload.firmware_version || "";
+  // Release not strictly newer than the version the device is actually
+  // RUNNING? Then it's up to date even if the anti-rollback floor hasn't
+  // caught up yet. This matters during a dev unit's canary window (the
+  // floor bump is deferred, so the min_secure_version comparison alone
+  // would re-stage the running build every poll) and for USB-flashed
+  // images whose floor lags the installed version. Mirrors Go decide.
+  const running = packSemver(String(dev.active.payload.firmware_version || ""));
+  if (running !== null && releasePacked <= running) { out.action = "up_to_date"; return out; }
   if (releasePacked <= Number(dev.active.payload.min_secure_version || 0)) { out.action = "up_to_date"; return out; }
   if (dev.pending && dev.pending.payload.firmware_version === String(mf.version || "")) { out.action = "skipped:already-pending"; return out; }
   if (dryRun) { out.action = "would_stage"; return out; }
@@ -194,31 +220,36 @@ export async function check(cfg, reg, { dryRun, skuFilter = "", deviceFilter = "
   skuFilter = skuFilter.trim().toUpperCase();
   deviceFilter = deviceFilter.trim().toLowerCase();
   const wanted = [];
-  const skuSet = new Set();
+  // One release lookup per distinct (SKU, channel): a dev S1 device and a
+  // stable S1 device pull different assets, so the SKU alone is not the key.
+  const targets = new Map();
   for (const dev of reg.list()) {
     if (!dev.hwSku) continue;
     if (deviceFilter && dev.deviceID !== deviceFilter) continue;
     if (skuFilter && dev.hwSku !== skuFilter) continue;
     wanted.push(dev);
-    skuSet.add(dev.hwSku);
+    const channel = effectiveChannel(dev);
+    targets.set(`${dev.hwSku} ${channel}`, { sku: dev.hwSku, channel });
   }
 
-  const resolvedBySKU = new Map();
-  for (const sku of Array.from(skuSet).sort()) {
+  const resolvedByKey = new Map();
+  for (const key of Array.from(targets.keys()).sort()) {
+    const { sku, channel } = targets.get(key);
     try {
-      const idx = await fetchIndex(cfg, sku);
-      const { resolved, skuResult } = resolveSKU(cfg, idx, sku);
+      const idx = await fetchIndex(cfg, sku, channel);
+      const { resolved, skuResult } = resolveSKU(cfg, idx, sku, channel);
       rep.per_sku.push(dropEmpty(skuResult, ["latest_version", "error"]));
-      if (resolved) resolvedBySKU.set(sku, resolved);
+      if (resolved) resolvedByKey.set(key, resolved);
     } catch (e) {
-      rep.per_sku.push({ sku, verified: false, error: e.message });
+      rep.per_sku.push({ sku, channel, verified: false, error: e.message });
     }
   }
 
   for (const dev of wanted) {
-    const resolved = resolvedBySKU.get(dev.hwSku);
+    const key = `${dev.hwSku} ${effectiveChannel(dev)}`;
+    const resolved = resolvedByKey.get(key);
     if (!resolved) {
-      rep.devices.push({ device_id: dev.deviceID, sku: dev.hwSku, action: "skipped:no-release" });
+      rep.devices.push({ device_id: dev.deviceID, sku: dev.hwSku, channel: effectiveChannel(dev), action: "skipped:no-release" });
       continue;
     }
     const res = decide(reg, dev, resolved, dryRun, logger);

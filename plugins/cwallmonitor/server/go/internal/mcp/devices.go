@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -26,6 +27,7 @@ type deviceSummary struct {
 	DeviceID         string    `json:"device_id"`
 	SerialNumber     string    `json:"serial_number,omitempty"`
 	HWSku            string    `json:"hw_sku,omitempty"`
+	Channel          string    `json:"channel"`
 	ActiveVersion    uint32    `json:"active_version"`
 	ActiveBrokerURL  string    `json:"active_broker_url,omitempty"`
 	ActiveCity       string    `json:"active_city,omitempty"`
@@ -128,6 +130,7 @@ func summarise(dev *registry.Device) deviceSummary {
 		DeviceID:         dev.DeviceID,
 		SerialNumber:     dev.SerialNumber,
 		HWSku:            dev.HWSku,
+		Channel:          registry.EffectiveChannel(dev),
 		ActiveVersion:    dev.Active.Version,
 		ActiveBrokerURL:  dev.Active.BrokerURL,
 		ActiveCity:       dev.Active.City,
@@ -193,6 +196,17 @@ func handleRegisterDevice(d Deps) server.ToolHandlerFunc {
 			return mcp.NewToolResultError("psk_hex is not valid hex"), nil
 		}
 
+		// Release channel is a device-level attribute, NOT part of the
+		// config payload. "" / "stable" → stable; "dev" → dev.
+		channel := "stable"
+		if raw := strings.TrimSpace(req.GetString("channel", "")); raw != "" {
+			ch, ok := validChannelArg(raw)
+			if !ok {
+				return mcp.NewToolResultError("channel must be 'stable' or 'dev'"), nil
+			}
+			channel = ch
+		}
+
 		payload := registry.ConfigPayload{
 			BrokerURL: brokerURL,
 			PSKHex:    pskHex,
@@ -211,7 +225,7 @@ func handleRegisterDevice(d Deps) server.ToolHandlerFunc {
 			payload.Vol = &u8
 		}
 
-		dev, err := d.Registry.Register(deviceID, payload)
+		dev, err := d.Registry.Register(deviceID, payload, channel)
 		if err != nil {
 			return mcp.NewToolResultErrorFromErr("register", err), nil
 		}
@@ -230,6 +244,22 @@ func handleSetDevicePending(d Deps) server.ToolHandlerFunc {
 		deviceID := strings.ToLower(strings.TrimSpace(req.GetString("device_id", "")))
 		if !registry.ValidDeviceID(deviceID) {
 			return mcp.NewToolResultError("device_id must be 8 lowercase hex chars"), nil
+		}
+
+		// Release channel is a device-level attribute (steers which GitHub
+		// asset the OTA loop fetches), NOT part of the config pending.
+		// Apply it immediately, before any pending merge.
+		if raw := strings.TrimSpace(req.GetString("channel", "")); raw != "" {
+			ch, ok := validChannelArg(raw)
+			if !ok {
+				return mcp.NewToolResultError("channel must be 'stable' or 'dev'"), nil
+			}
+			if err := d.Registry.SetChannel(deviceID, ch); err != nil {
+				if errors.Is(err, registry.ErrNotFound) {
+					return mcp.NewToolResultError(fmt.Sprintf("device %s not registered — call wall_monitor_register_device first", deviceID)), nil
+				}
+				return mcp.NewToolResultErrorFromErr("set_channel", err), nil
+			}
 		}
 
 		var update registry.ConfigPayload
@@ -418,6 +448,23 @@ func parseGeminiModels(raw string) []string {
 		out = append(out, s)
 	}
 	return out
+}
+
+// validChannelArg accepts "stable"/"dev" (and, defensively, any 1..7
+// lowercase letters for a future channel). Returns the canonical string
+// and ok=false if invalid. "" / "stable" both map to "stable". Mirror of
+// JS validChannelArg.
+var channelArgRe = regexp.MustCompile(`^[a-z]{1,7}$`)
+
+func validChannelArg(raw string) (string, bool) {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	if s == "" || s == "stable" {
+		return "stable", true
+	}
+	if channelArgRe.MatchString(s) {
+		return s, true
+	}
+	return "", false
 }
 
 func clamp8(v, lo, hi uint8) uint8 {

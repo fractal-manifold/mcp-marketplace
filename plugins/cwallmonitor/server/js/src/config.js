@@ -57,6 +57,11 @@ function defaults() {
       releases_repo: "https://github.com/fractal-manifold/cwm-ota-releases",
       poll_interval_minutes: 60,
       keys: [],
+      // Rolling GitHub tag that holds the dev-channel prerelease assets.
+      // Devices on the "dev" channel fetch
+      // <repo>/releases/download/<dev_tag>/update-<SKU>.json instead of the
+      // stable latest/download redirect. Must match publish.py's dev tag.
+      dev_tag: "dev",
     },
     pskBytes: Buffer.alloc(0),
   };

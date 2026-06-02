@@ -35,6 +35,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -75,6 +76,9 @@ type manifestFields struct {
 	SHA256           string `json:"sha256"`
 	SKU              string `json:"sku"`
 	Version          string `json:"version"`
+	// Channel: a manifest carries channel:"dev" for the dev track; stable
+	// manifests OMIT it (absent == stable).
+	Channel string `json:"channel"`
 }
 
 // PackSemver packs MAJOR.MINOR.PATCH into the 8.8.16 u32 layout the
@@ -154,9 +158,10 @@ func (c *Checker) logf(format string, args ...any) {
 	}
 }
 
-// SKUResult reports the outcome of resolving one SKU's latest release.
+// SKUResult reports the outcome of resolving one (SKU, channel) release.
 type SKUResult struct {
 	SKU           string `json:"sku"`
+	Channel       string `json:"channel"`
 	LatestVersion string `json:"latest_version,omitempty"`
 	Verified      bool   `json:"verified"`
 	Error         string `json:"error,omitempty"`
@@ -166,6 +171,7 @@ type SKUResult struct {
 type DeviceResult struct {
 	DeviceID string `json:"device_id"`
 	SKU      string `json:"sku"`
+	Channel  string `json:"channel"`
 	Action   string `json:"action"` // staged | would_stage | up_to_date | skipped:<reason> | error:<reason>
 	From     string `json:"from,omitempty"`
 	To       string `json:"to,omitempty"`
@@ -219,11 +225,15 @@ func (c *Checker) Check(ctx context.Context, dryRun bool, skuFilter, deviceFilte
 		return rep, fmt.Errorf("list devices: %w", err)
 	}
 
-	// Filter devices and collect the SKUs we need to resolve.
+	// Filter devices and collect the (SKU, channel) pairs we need to
+	// resolve. One release lookup per distinct (SKU, channel): a dev S1
+	// device and a stable S1 device pull different assets, so the SKU
+	// alone is not the key.
 	skuFilter = strings.ToUpper(strings.TrimSpace(skuFilter))
 	deviceFilter = strings.ToLower(strings.TrimSpace(deviceFilter))
 	var wanted []*registry.Device
-	skuSet := map[string]bool{}
+	type target struct{ sku, channel string }
+	targets := map[string]target{}
 	for _, dev := range devices {
 		if dev.HWSku == "" {
 			continue
@@ -235,25 +245,34 @@ func (c *Checker) Check(ctx context.Context, dryRun bool, skuFilter, deviceFilte
 			continue
 		}
 		wanted = append(wanted, dev)
-		skuSet[dev.HWSku] = true
+		ch := registry.EffectiveChannel(dev)
+		targets[dev.HWSku+" "+ch] = target{sku: dev.HWSku, channel: ch}
 	}
 
-	// Resolve each SKU's latest signed release once.
-	resolvedBySKU := map[string]*resolved{}
-	for sku := range skuSet {
-		r, sres := c.resolveSKU(ctx, sku)
+	// Resolve each (SKU, channel) signed release once, iterating in a
+	// stable sorted key order so the report is deterministic.
+	resolvedByKey := map[string]*resolved{}
+	keys := make([]string, 0, len(targets))
+	for k := range targets {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		t := targets[k]
+		r, sres := c.resolveSKU(ctx, t.sku, t.channel)
 		rep.PerSKU = append(rep.PerSKU, sres)
 		if r != nil {
-			resolvedBySKU[sku] = r
+			resolvedByKey[k] = r
 		}
 	}
 
 	// Decide + (optionally) stage per device.
 	for _, dev := range wanted {
-		r := resolvedBySKU[dev.HWSku]
+		ch := registry.EffectiveChannel(dev)
+		r := resolvedByKey[dev.HWSku+" "+ch]
 		if r == nil {
 			rep.Devices = append(rep.Devices, DeviceResult{
-				DeviceID: dev.DeviceID, SKU: dev.HWSku, Action: "skipped:no-release",
+				DeviceID: dev.DeviceID, SKU: dev.HWSku, Channel: ch, Action: "skipped:no-release",
 			})
 			continue
 		}
@@ -266,11 +285,17 @@ func (c *Checker) Check(ctx context.Context, dryRun bool, skuFilter, deviceFilte
 	return rep, nil
 }
 
-// resolveSKU fetches, verifies and parses the latest release index for a
-// SKU. Returns (nil, SKUResult{Error}) on any failure.
-func (c *Checker) resolveSKU(ctx context.Context, sku string) (*resolved, SKUResult) {
-	sres := SKUResult{SKU: sku}
-	idx, err := c.fetchIndex(ctx, sku)
+// resolveSKU fetches, verifies and parses the release index for a (SKU,
+// channel). Returns (nil, SKUResult{Error}) on any failure. `channel` is
+// the device's effective channel ("stable" or "dev"); want collapses ""
+// to "stable" defensively.
+func (c *Checker) resolveSKU(ctx context.Context, sku, channel string) (*resolved, SKUResult) {
+	want := channel
+	if want == "" {
+		want = "stable"
+	}
+	sres := SKUResult{SKU: sku, Channel: want}
+	idx, err := c.fetchIndex(ctx, sku, channel)
 	if err != nil {
 		sres.Error = err.Error()
 		return nil, sres
@@ -312,6 +337,18 @@ func (c *Checker) resolveSKU(ctx context.Context, sku string) (*resolved, SKURes
 		sres.Error = fmt.Sprintf("index version %q != manifest version %q", idx.Version, mf.Version)
 		return nil, sres
 	}
+	// Channel must match what we asked for. Stable manifests OMIT the
+	// field (absent == stable); dev manifests carry channel:"dev". This is
+	// a sanity check on the signed authority — the device re-checks it too,
+	// and refuses a dev manifest outright on a production unit.
+	manChan := mf.Channel
+	if manChan == "" {
+		manChan = "stable"
+	}
+	if manChan != want {
+		sres.Error = fmt.Sprintf("manifest channel %q != requested %q", manChan, want)
+		return nil, sres
+	}
 	if !strings.HasPrefix(idx.BinURL, "https://") {
 		sres.Error = "bin_url must be HTTPS"
 		return nil, sres
@@ -327,7 +364,7 @@ func (c *Checker) resolveSKU(ctx context.Context, sku string) (*resolved, SKURes
 // decide computes the action for one device against a resolved release,
 // staging a pending when appropriate (unless dryRun).
 func (c *Checker) decide(dev *registry.Device, r *resolved, dryRun bool) DeviceResult {
-	out := DeviceResult{DeviceID: dev.DeviceID, SKU: dev.HWSku, To: r.mf.Version}
+	out := DeviceResult{DeviceID: dev.DeviceID, SKU: dev.HWSku, Channel: registry.EffectiveChannel(dev), To: r.mf.Version}
 	releasePacked, ok := PackSemver(r.mf.Version)
 	if !ok {
 		out.Action = "skipped:bad-version"
@@ -380,12 +417,24 @@ func (c *Checker) decide(dev *registry.Device, r *resolved, dryRun bool) DeviceR
 	return out
 }
 
-// fetchIndex GETs the update-<SKU>.json release asset. The stdlib client
-// follows GitHub's cross-host redirect chain (github.com →
-// objects.githubusercontent.com) automatically.
-func (c *Checker) fetchIndex(ctx context.Context, sku string) (Index, error) {
-	url := strings.TrimRight(c.cfg.OTA.ReleasesRepo, "/") +
-		"/releases/latest/download/update-" + sku + ".json"
+// fetchIndex GETs the update-<SKU>.json release asset for one (SKU,
+// channel). Stable rides GitHub's latest/download redirect (newest
+// non-prerelease); dev rides the rolling prerelease tag, so a dev device
+// never sees a stable build and a stable device never sees a prerelease.
+// The stdlib client follows GitHub's cross-host redirect chain
+// (github.com → objects.githubusercontent.com) automatically.
+func (c *Checker) fetchIndex(ctx context.Context, sku, channel string) (Index, error) {
+	base := strings.TrimRight(c.cfg.OTA.ReleasesRepo, "/")
+	var url string
+	if channel != "" && channel != "stable" {
+		devTag := c.cfg.OTA.DevTag
+		if devTag == "" {
+			devTag = "dev"
+		}
+		url = base + "/releases/download/" + devTag + "/update-" + sku + ".json"
+	} else {
+		url = base + "/releases/latest/download/update-" + sku + ".json"
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return Index{}, err
