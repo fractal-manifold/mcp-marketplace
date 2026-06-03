@@ -47,11 +47,14 @@ MAX_INDEX_BODY = 64 * 1024  # an update-<SKU>.json is well under 1 KiB
 
 
 def pack_semver(v: str) -> int | None:
-    """Pack MAJOR.MINOR.PATCH into the 8.8.16 u32 layout the firmware uses
-    for cwm_min_sv (major<<24 | minor<<16 | patch). Returns None on any
-    malformed or out-of-range input. Mirrors PackSemver in Go and
-    packed_semver() in tools/cwmtools/lib/manifest.py."""
-    parts = v.split(".")
+    """Pack the MAJOR.MINOR.PATCH base into the 8.8.16 u32 layout the firmware
+    uses for cwm_min_sv (major<<24 | minor<<16 | patch). An optional
+    "-dev.<ts>" development prerelease suffix is ignored (the anti-rollback
+    floor is base-level). Returns None on any malformed or out-of-range input.
+    Mirrors PackSemver in Go and packed_semver() in
+    tools/cwmtools/lib/manifest.py."""
+    base = v.split("-", 1)[0]
+    parts = base.split(".")
     if len(parts) != 3:
         return None
     nums = []
@@ -69,6 +72,65 @@ def pack_semver(v: str) -> int | None:
     if maj > 0xFF or mn > 0xFF or pat > 0xFFFF:
         return None
     return (maj << 24) | (mn << 16) | pat
+
+
+def dev_prerelease(v: str) -> int | None:
+    """Extract the numeric timestamp from a "-dev.<12 digits>" development
+    prerelease suffix (a YYYYMMDDhhmm value). Returns the timestamp when present
+    and well-formed, or None when the string carries no such suffix OR it is
+    malformed (not exactly 12 digits, trailing junk). The fixed 12-digit width
+    keeps the value identical across the Go (uint64) and JS (BigInt) brokers."""
+    marker = "-dev."
+    i = v.find(marker)
+    if i < 0:
+        return None
+    ts = v[i + len(marker):]
+    if len(ts) != 12 or any(c < "0" or c > "9" for c in ts):
+        return None
+    return int(ts)
+
+
+def valid_version(v: str) -> bool:
+    """Report whether v is a well-formed firmware version: MAJOR.MINOR.PATCH
+    (packable) with an OPTIONAL "-dev.<12 digits>" suffix and nothing else. The
+    broker gates signed manifests on this so it never stages a version the
+    firmware's stricter semver_ok() would refuse. Lock-step with Go
+    ValidVersion / JS validVersion and semver_ok() in cwm_manifest.c."""
+    if pack_semver(v) is None:
+        return False
+    i = v.find("-")
+    if i < 0:
+        return True
+    return dev_prerelease(v[i:]) is not None
+
+
+def compare_semver(a: str, b: str) -> int | None:
+    """Order two version strings under the project's SemVer subset: the
+    MAJOR.MINOR.PATCH base plus an optional "-dev.<ts>" development prerelease.
+    Returns -1/0/1 (a<b / a==b / a>b), or None if either string isn't a
+    parseable version. Ordering: a differing base wins; with equal bases a
+    final build (no suffix) is NEWER than a prerelease, and two prereleases
+    compare by their numeric <ts> (larger = newer) — the SemVer rule
+    (X.Y.Z-pre < X.Y.Z). Wire-identical to the Go/JS brokers."""
+    pa = pack_semver(a)
+    pb = pack_semver(b)
+    if pa is None or pb is None:
+        return None
+    if pa != pb:
+        return -1 if pa < pb else 1
+    ta = dev_prerelease(a)
+    tb = dev_prerelease(b)
+    if ta is None and tb is None:
+        return 0
+    if ta is None:  # a final, b prerelease -> a newer
+        return 1
+    if tb is None:  # a prerelease, b final -> a older
+        return -1
+    if ta < tb:
+        return -1
+    if ta > tb:
+        return 1
+    return 0
 
 
 def verify_manifest(pubkey: bytes, manifest: bytes, sig: bytes) -> bool:
@@ -178,8 +240,8 @@ def _resolve_sku(cfg: Config, idx: dict, sku: str, channel: str = "stable") -> t
     if not str(idx["bin_url"]).startswith("https://"):
         sres["error"] = "bin_url must be HTTPS"
         return None, sres
-    if pack_semver(str(mf.get("version", ""))) is None:
-        sres["error"] = "manifest version is not MAJOR.MINOR.PATCH"
+    if not valid_version(str(mf.get("version", ""))):
+        sres["error"] = "manifest version is not MAJOR.MINOR.PATCH[-dev.<12 digits>]"
         return None, sres
     sres["verified"] = True
     return {"idx": idx, "mf": mf}, sres
@@ -201,9 +263,12 @@ def _decide(reg: Registry, dev, resolved: dict, dry_run: bool) -> dict:
     # caught up yet. This matters during a dev unit's canary window (the
     # floor bump is deferred, so the min_secure_version comparison alone
     # would re-stage the running build every poll) and for USB-flashed
-    # images whose floor lags the installed version. Mirrors Go/JS decide.
-    running = pack_semver(str(dev.active.payload.firmware_version or ""))
-    if running is not None and release_packed <= running:
+    # images whose floor lags the installed version. Uses compare_semver (not
+    # raw packed base) so dev iteration works: two "0.6.8-dev.<ts>" builds share
+    # a base, and the newer timestamp must still stage over the older. Mirrors
+    # Go/JS decide.
+    cmp = compare_semver(str(mf.get("version", "")), str(dev.active.payload.firmware_version or ""))
+    if cmp is not None and cmp <= 0:
         out["action"] = "up_to_date"
         return out
     # Compare against the device's reported anti-rollback floor.

@@ -195,3 +195,24 @@ test("check inert when unconfigured (no keys)", async () => {
   assert.ok(rep.note);
   assert.equal(rep.devices.length, 0);
 });
+
+// --- shared cross-runtime version-ordering contract -------------------------
+const orderPath = findCompat("ota/semver_order.json");
+const ORDER = orderPath ? JSON.parse(readFileSync(orderPath, "utf8")) : null;
+
+test("packSemver + compareSemver match the shared contract", { skip: orderPath ? false : "compat/ota/semver_order.json unavailable" }, () => {
+  for (const c of ORDER.pack) {
+    const got = ota.packSemver(c.version);
+    if (c.ok) assert.equal(got, c.packed, `packSemver(${JSON.stringify(c.version)})`);
+    else assert.equal(got, null, `packSemver(${JSON.stringify(c.version)}) should be null`);
+  }
+  for (const c of ORDER.compare) {
+    assert.equal(ota.compareSemver(c.a, c.b), c.sign, `compareSemver(${c.a},${c.b})`);
+  }
+  for (const c of ORDER.compare_unparseable) {
+    assert.equal(ota.compareSemver(c.a, c.b), null, `compareSemver(${c.a},${c.b}) should be null`);
+  }
+  for (const c of ORDER.valid) {
+    assert.equal(ota.validVersion(c.version), c.valid, `validVersion(${JSON.stringify(c.version)})`);
+  }
+});

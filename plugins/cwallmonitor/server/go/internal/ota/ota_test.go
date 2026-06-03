@@ -51,6 +51,88 @@ func TestPackSemver(t *testing.T) {
 	}
 }
 
+// semverOrderVectors mirrors compat/ota/semver_order.json — the shared
+// contract for the version-packing and prerelease-ordering helpers.
+type semverOrderVectors struct {
+	Pack []struct {
+		Version string `json:"version"`
+		Packed  uint32 `json:"packed"`
+		OK      bool   `json:"ok"`
+	} `json:"pack"`
+	Compare []struct {
+		A    string `json:"a"`
+		B    string `json:"b"`
+		Sign int    `json:"sign"`
+	} `json:"compare"`
+	CompareUnparseable []struct {
+		A string `json:"a"`
+		B string `json:"b"`
+	} `json:"compare_unparseable"`
+	Valid []struct {
+		Version string `json:"version"`
+		Valid   bool   `json:"valid"`
+	} `json:"valid"`
+}
+
+// findCompatFile walks up from the test working directory looking for a file
+// under compat/. Skips (standalone checkout) if not found.
+func findCompatFile(t *testing.T, rel ...string) string {
+	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	dir := wd
+	for i := 0; i < 9; i++ {
+		candidate := filepath.Join(append([]string{dir, "compat"}, rel...)...)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	t.Skipf("compat/%s not found upward from %s (standalone checkout)", filepath.Join(rel...), wd)
+	return ""
+}
+
+// TestSemverVectors drives PackSemver + CompareSemver from the shared
+// cross-runtime contract so Go, JS and Python stay byte-for-byte aligned.
+func TestSemverVectors(t *testing.T) {
+	raw, err := os.ReadFile(findCompatFile(t, "ota", "semver_order.json"))
+	if err != nil {
+		t.Fatalf("read semver_order.json: %v", err)
+	}
+	var v semverOrderVectors
+	if err := json.Unmarshal(raw, &v); err != nil {
+		t.Fatalf("parse semver_order.json: %v", err)
+	}
+	for _, c := range v.Pack {
+		got, ok := PackSemver(c.Version)
+		if ok != c.OK || (ok && got != c.Packed) {
+			t.Errorf("PackSemver(%q) = (%d,%t), want (%d,%t)", c.Version, got, ok, c.Packed, c.OK)
+		}
+	}
+	for _, c := range v.Compare {
+		got, ok := CompareSemver(c.A, c.B)
+		if !ok || got != c.Sign {
+			t.Errorf("CompareSemver(%q,%q) = (%d,%t), want (%d,true)", c.A, c.B, got, ok, c.Sign)
+		}
+	}
+	for _, c := range v.CompareUnparseable {
+		if _, ok := CompareSemver(c.A, c.B); ok {
+			t.Errorf("CompareSemver(%q,%q) should be unparseable", c.A, c.B)
+		}
+	}
+	for _, c := range v.Valid {
+		if got := ValidVersion(c.Version); got != c.Valid {
+			t.Errorf("ValidVersion(%q) = %t, want %t", c.Version, got, c.Valid)
+		}
+	}
+}
+
 // compatVectors is the subset of compat/ed25519/vectors.json the OTA
 // verifier cares about.
 type compatVectors struct {

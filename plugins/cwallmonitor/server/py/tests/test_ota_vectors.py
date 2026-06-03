@@ -191,3 +191,21 @@ async def test_check_inert_when_unconfigured(tmp_path):
     assert rep["staged"] == 0
     assert rep["note"]
     assert rep["devices"] == []
+
+
+def test_semver_order_vectors():
+    """Drive pack_semver + compare_semver from the shared cross-runtime
+    contract so Go, JS and Python stay byte-for-byte aligned."""
+    order = json.loads(_find_compat("ota/semver_order.json").read_text())
+    for c in order["pack"]:
+        got = ota.pack_semver(c["version"])
+        if c["ok"]:
+            assert got == c["packed"], c["version"]
+        else:
+            assert got is None, c["version"]
+    for c in order["compare"]:
+        assert ota.compare_semver(c["a"], c["b"]) == c["sign"], (c["a"], c["b"])
+    for c in order["compare_unparseable"]:
+        assert ota.compare_semver(c["a"], c["b"]) is None, (c["a"], c["b"])
+    for c in order["valid"]:
+        assert ota.valid_version(c["version"]) == c["valid"], c["version"]

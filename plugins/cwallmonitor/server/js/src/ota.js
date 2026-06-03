@@ -33,12 +33,14 @@ const MAX_INDEX_BODY = 64 * 1024; // an update-<SKU>.json is well under 1 KiB
 // "raw Ed25519 public key" import path.
 const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 
-// packSemver packs MAJOR.MINOR.PATCH into the 8.8.16 u32 layout the
-// firmware uses for cwm_min_sv (major<<24 | minor<<16 | patch). Returns
-// null on any malformed or out-of-range input. Mirrors Go PackSemver and
-// packed_semver() in tools/cwmtools/lib/manifest.py.
+// packSemver packs the MAJOR.MINOR.PATCH base into the 8.8.16 u32 layout the
+// firmware uses for cwm_min_sv (major<<24 | minor<<16 | patch). An optional
+// "-dev.<ts>" development prerelease suffix is ignored (the anti-rollback
+// floor is base-level). Returns null on any malformed or out-of-range input.
+// Mirrors Go PackSemver and packed_semver() in tools/cwmtools/lib/manifest.py.
 export function packSemver(v) {
-  const parts = String(v).split(".");
+  const base = String(v).split("-", 1)[0];
+  const parts = base.split(".");
   if (parts.length !== 3) return null;
   const nums = [];
   for (const p of parts) {
@@ -51,6 +53,51 @@ export function packSemver(v) {
   if (maj > 0xff || min > 0xff || pat > 0xffff) return null;
   // >>> 0 forces an unsigned 32-bit result (255<<24 overflows int32).
   return (((maj << 24) | (min << 16) | pat) >>> 0);
+}
+
+// devPrerelease extracts the numeric timestamp from a "-dev.<12 digits>"
+// development prerelease suffix (a YYYYMMDDhhmm value). Returns the timestamp
+// (as a BigInt) when present and well-formed, or null when the string carries
+// no such suffix OR it is malformed (not exactly 12 digits, trailing junk).
+// The fixed 12-digit width keeps the value identical across the Go (uint64)
+// and Python (int) brokers.
+export function devPrerelease(v) {
+  const m = /-dev\.([0-9]{12})$/.exec(String(v));
+  return m ? BigInt(m[1]) : null;
+}
+
+// validVersion reports whether v is a well-formed firmware version:
+// MAJOR.MINOR.PATCH (packable) with an OPTIONAL "-dev.<12 digits>" suffix and
+// nothing else. The broker gates signed manifests on this so it never stages a
+// version the firmware's stricter semver_ok() would refuse. Lock-step with Go
+// ValidVersion and semver_ok() in cwm_manifest.c.
+export function validVersion(v) {
+  if (packSemver(v) === null) return false;
+  const i = String(v).indexOf("-");
+  if (i < 0) return true;
+  return devPrerelease(String(v).slice(i)) !== null;
+}
+
+// compareSemver orders two version strings under the project's SemVer subset:
+// the MAJOR.MINOR.PATCH base plus an optional "-dev.<ts>" development
+// prerelease. Returns -1/0/1 (a<b / a==b / a>b), or null if either string
+// isn't a parseable version. Ordering: a differing base wins; with equal bases
+// a final build (no suffix) is NEWER than a prerelease, and two prereleases
+// compare by their numeric <ts> (larger = newer) — the SemVer rule
+// (X.Y.Z-pre < X.Y.Z). Wire-identical to the Go/Python brokers.
+export function compareSemver(a, b) {
+  const pa = packSemver(a);
+  const pb = packSemver(b);
+  if (pa === null || pb === null) return null;
+  if (pa !== pb) return pa < pb ? -1 : 1;
+  const ta = devPrerelease(a);
+  const tb = devPrerelease(b);
+  if (ta === null && tb === null) return 0;
+  if (ta === null) return 1; // a final, b prerelease -> a newer
+  if (tb === null) return -1; // a prerelease, b final -> a older
+  if (ta < tb) return -1;
+  if (ta > tb) return 1;
+  return 0;
 }
 
 // verifyManifest reports whether sig is a valid Ed25519 signature over
@@ -144,7 +191,7 @@ function resolveSKU(cfg, idx, sku, channel = "stable") {
     return { resolved: null, skuResult: sres };
   }
   if (!String(idx.bin_url).startsWith("https://")) { sres.error = "bin_url must be HTTPS"; return { resolved: null, skuResult: sres }; }
-  if (packSemver(String(mf.version || "")) === null) { sres.error = "manifest version is not MAJOR.MINOR.PATCH"; return { resolved: null, skuResult: sres }; }
+  if (!validVersion(String(mf.version || ""))) { sres.error = "manifest version is not MAJOR.MINOR.PATCH[-dev.<12 digits>]"; return { resolved: null, skuResult: sres }; }
   sres.verified = true;
   return { resolved: { idx, mf }, skuResult: sres };
 }
@@ -162,9 +209,12 @@ function decide(reg, dev, resolved, dryRun, logger) {
   // caught up yet. This matters during a dev unit's canary window (the
   // floor bump is deferred, so the min_secure_version comparison alone
   // would re-stage the running build every poll) and for USB-flashed
-  // images whose floor lags the installed version. Mirrors Go decide.
-  const running = packSemver(String(dev.active.payload.firmware_version || ""));
-  if (running !== null && releasePacked <= running) { out.action = "up_to_date"; return out; }
+  // images whose floor lags the installed version. Uses compareSemver (not
+  // raw packed base) so dev iteration works: two "0.6.8-dev.<ts>" builds share
+  // a base, and the newer timestamp must still stage over the older. Mirrors
+  // Go decide.
+  const cmp = compareSemver(String(mf.version || ""), String(dev.active.payload.firmware_version || ""));
+  if (cmp !== null && cmp <= 0) { out.action = "up_to_date"; return out; }
   if (releasePacked <= Number(dev.active.payload.min_secure_version || 0)) { out.action = "up_to_date"; return out; }
   if (dev.pending && dev.pending.payload.firmware_version === String(mf.version || "")) { out.action = "skipped:already-pending"; return out; }
   if (dryRun) { out.action = "would_stage"; return out; }

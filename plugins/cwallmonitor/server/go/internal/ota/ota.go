@@ -81,13 +81,15 @@ type manifestFields struct {
 	Channel string `json:"channel"`
 }
 
-// PackSemver packs MAJOR.MINOR.PATCH into the 8.8.16 u32 layout the
-// firmware uses for cwm_min_sv (major<<24 | minor<<16 | patch). Returns
-// (0, false) on any malformed or out-of-range input. Mirrors
-// packed_semver() in tools/cwmtools/lib/manifest.py and
+// PackSemver packs the MAJOR.MINOR.PATCH base into the 8.8.16 u32 layout the
+// firmware uses for cwm_min_sv (major<<24 | minor<<16 | patch). An optional
+// "-dev.<ts>" development prerelease suffix is ignored (the anti-rollback
+// floor is base-level). Returns (0, false) on any malformed or out-of-range
+// input. Mirrors packed_semver() in tools/cwmtools/lib/manifest.py and
 // pack_semver_strict() in firmware/components/ota/src/cwm_ota.c.
 func PackSemver(v string) (uint32, bool) {
-	parts := strings.Split(v, ".")
+	base := strings.SplitN(v, "-", 2)[0]
+	parts := strings.Split(base, ".")
 	if len(parts) != 3 {
 		return 0, false
 	}
@@ -121,6 +123,86 @@ func allDigits(s string) bool {
 		}
 	}
 	return true
+}
+
+// devPrerelease extracts the numeric timestamp from a "-dev.<12 digits>"
+// development prerelease suffix (a YYYYMMDDhhmm value). Returns (ts, true) when
+// present and well-formed, (0, false) when the string carries no such suffix
+// OR the suffix is malformed (wrong marker, not exactly 12 digits, trailing
+// junk). The fixed 12-digit width keeps the value well within uint64 / JS
+// Number / Python int so ordering is identical across runtimes.
+func devPrerelease(v string) (uint64, bool) {
+	const marker = "-dev."
+	i := strings.Index(v, marker)
+	if i < 0 {
+		return 0, false
+	}
+	ts := v[i+len(marker):]
+	if len(ts) != 12 || !allDigits(ts) {
+		return 0, false
+	}
+	n, err := strconv.ParseUint(ts, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// ValidVersion reports whether v is a well-formed firmware version under the
+// project's grammar: MAJOR.MINOR.PATCH (packable into 8.8.16) with an OPTIONAL
+// "-dev.<12 digits>" development prerelease suffix and NOTHING else. The broker
+// gates signed manifests on this so it never stages a version the firmware's
+// stricter semver_ok() would refuse (which would churn stage -> on-device
+// reject -> re-stage). Lock-step with semver_ok() in cwm_manifest.c.
+func ValidVersion(v string) bool {
+	if _, ok := PackSemver(v); !ok {
+		return false
+	}
+	i := strings.Index(v, "-")
+	if i < 0 {
+		return true // plain MAJOR.MINOR.PATCH
+	}
+	_, ok := devPrerelease(v[i:])
+	return ok
+}
+
+// CompareSemver orders two version strings under the project's SemVer subset:
+// the MAJOR.MINOR.PATCH base plus an optional "-dev.<ts>" development
+// prerelease. Returns (sign, true) where sign is -1/0/1 (a<b / a==b / a>b), or
+// (0, false) if either string isn't a parseable version. Ordering: a differing
+// base wins; with equal bases a final build (no suffix) is NEWER than a
+// prerelease, and two prereleases compare by their numeric <ts> (larger =
+// newer). This is the SemVer rule (X.Y.Z-pre < X.Y.Z). Wire-identical to the
+// JS/Python brokers; the firmware never needs it (only the broker orders dev
+// builds — the device clears its pending by string equality + the base floor).
+func CompareSemver(a, b string) (int, bool) {
+	pa, oka := PackSemver(a)
+	pb, okb := PackSemver(b)
+	if !oka || !okb {
+		return 0, false
+	}
+	if pa != pb {
+		if pa < pb {
+			return -1, true
+		}
+		return 1, true
+	}
+	ta, hasA := devPrerelease(a)
+	tb, hasB := devPrerelease(b)
+	switch {
+	case !hasA && !hasB:
+		return 0, true
+	case !hasA: // a is final, b is prerelease -> a is newer
+		return 1, true
+	case !hasB: // b is final, a is prerelease -> a is older
+		return -1, true
+	case ta < tb:
+		return -1, true
+	case ta > tb:
+		return 1, true
+	default:
+		return 0, true
+	}
 }
 
 // VerifyManifest reports whether sig is a valid Ed25519 signature over
@@ -353,8 +435,8 @@ func (c *Checker) resolveSKU(ctx context.Context, sku, channel string) (*resolve
 		sres.Error = "bin_url must be HTTPS"
 		return nil, sres
 	}
-	if _, ok := PackSemver(mf.Version); !ok {
-		sres.Error = "manifest version is not MAJOR.MINOR.PATCH"
+	if !ValidVersion(mf.Version) {
+		sres.Error = "manifest version is not MAJOR.MINOR.PATCH[-dev.<12 digits>]"
 		return nil, sres
 	}
 	sres.Verified = true
@@ -381,7 +463,10 @@ func (c *Checker) decide(dev *registry.Device, r *resolved, dryRun bool) DeviceR
 	// rejects it as same-version every cycle. That churn is exactly what this
 	// check prevents. Skipped only when we don't yet have a parseable running
 	// version (fresh device), in which case the floor guard below decides.
-	if running, ok := PackSemver(dev.Active.FirmwareVersion); ok && releasePacked <= running {
+	// Uses CompareSemver (not raw packed base) so dev iteration works: two
+	// "0.6.8-dev.<ts>" builds share a base, and the newer timestamp must still
+	// stage over the older — base-only packing would wrongly call them equal.
+	if cmp, ok := CompareSemver(r.mf.Version, dev.Active.FirmwareVersion); ok && cmp <= 0 {
 		out.Action = "up_to_date"
 		return out
 	}
