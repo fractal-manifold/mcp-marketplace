@@ -327,8 +327,12 @@ func (c *Checker) Check(ctx context.Context, dryRun bool, skuFilter, deviceFilte
 			continue
 		}
 		wanted = append(wanted, dev)
-		ch := registry.EffectiveChannel(dev)
-		targets[dev.HWSku+" "+ch] = target{sku: dev.HWSku, channel: ch}
+		// A dev unit consumes BOTH stable and dev (CandidateChannels), so it
+		// can contribute two targets; the newest-wins choice is made per
+		// device below.
+		for _, ch := range registry.CandidateChannels(dev) {
+			targets[dev.HWSku+"/"+ch] = target{sku: dev.HWSku, channel: ch}
+		}
 	}
 
 	// Resolve each (SKU, channel) signed release once, iterating in a
@@ -350,15 +354,38 @@ func (c *Checker) Check(ctx context.Context, dryRun bool, skuFilter, deviceFilte
 
 	// Decide + (optionally) stage per device.
 	for _, dev := range wanted {
-		ch := registry.EffectiveChannel(dev)
-		r := resolvedByKey[dev.HWSku+" "+ch]
-		if r == nil {
+		// Across the device's candidate channels, pick the resolved release
+		// with the NEWEST version by SemVer: a final X.Y.Z beats a same-base
+		// X.Y.Z-dev.<ts> prerelease, and a newer dev timestamp beats an older
+		// one. A dev unit thus rides whichever of stable/dev is ahead (so a
+		// freshly cut stable graduates it off an older dev tip); a production
+		// unit only ever resolves stable. Ties prefer stable (first in
+		// CandidateChannels).
+		var best *resolved
+		bestChannel := registry.EffectiveChannel(dev)
+		for _, ch := range registry.CandidateChannels(dev) {
+			r := resolvedByKey[dev.HWSku+"/"+ch]
+			if r == nil {
+				continue
+			}
+			if best == nil {
+				best = r
+				bestChannel = ch
+				continue
+			}
+			if cmp, ok := CompareSemver(r.mf.Version, best.mf.Version); ok && cmp > 0 {
+				best = r
+				bestChannel = ch
+			}
+		}
+		if best == nil {
 			rep.Devices = append(rep.Devices, DeviceResult{
-				DeviceID: dev.DeviceID, SKU: dev.HWSku, Channel: ch, Action: "skipped:no-release",
+				DeviceID: dev.DeviceID, SKU: dev.HWSku, Channel: registry.EffectiveChannel(dev), Action: "skipped:no-release",
 			})
 			continue
 		}
-		res := c.decide(dev, r, dryRun)
+		res := c.decide(dev, best, dryRun)
+		res.Channel = bestChannel
 		if res.Action == "staged" {
 			rep.Staged++
 		}

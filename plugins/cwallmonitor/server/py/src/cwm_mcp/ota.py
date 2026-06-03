@@ -35,7 +35,12 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .config import Config
-from .registry.store import ConfigPayload, Registry, effective_channel
+from .registry.store import (
+    ConfigPayload,
+    Registry,
+    candidate_channels,
+    effective_channel,
+)
 
 log = logging.getLogger("cwm_mcp.ota")
 
@@ -357,8 +362,11 @@ async def check(
         if sku_filter and dev.hw_sku != sku_filter:
             continue
         wanted.append(dev)
-        channel = effective_channel(dev)
-        targets[f"{dev.hw_sku} {channel}"] = (dev.hw_sku, channel)
+        # A dev unit consumes BOTH stable and dev (candidate_channels), so it
+        # can contribute two targets; the newest-wins choice is made per
+        # device below.
+        for channel in candidate_channels(dev):
+            targets[f"{dev.hw_sku}/{channel}"] = (dev.hw_sku, channel)
 
     own_session = session is None
     if own_session:
@@ -381,12 +389,32 @@ async def check(
             await session.close()
 
     for dev in wanted:
-        channel = effective_channel(dev)
-        resolved = resolved_by_key.get(f"{dev.hw_sku} {channel}")
-        if resolved is None:
-            rep["devices"].append({"device_id": dev.device_id, "sku": dev.hw_sku, "channel": channel, "action": "skipped:no-release"})
+        # Across the device's candidate channels, pick the resolved release
+        # with the NEWEST version by SemVer: a final X.Y.Z beats a same-base
+        # X.Y.Z-dev.<ts> prerelease, and a newer dev timestamp beats an older
+        # one. A dev unit thus rides whichever of stable/dev is ahead (so a
+        # freshly cut stable graduates it off an older dev tip); a production
+        # unit only ever resolves stable. Ties prefer stable (first in
+        # candidate_channels).
+        best: dict | None = None
+        best_channel = effective_channel(dev)
+        for channel in candidate_channels(dev):
+            resolved = resolved_by_key.get(f"{dev.hw_sku}/{channel}")
+            if resolved is None:
+                continue
+            if best is None:
+                best = resolved
+                best_channel = channel
+                continue
+            cmp = compare_semver(str(resolved["mf"].get("version", "")), str(best["mf"].get("version", "")))
+            if cmp is not None and cmp > 0:
+                best = resolved
+                best_channel = channel
+        if best is None:
+            rep["devices"].append({"device_id": dev.device_id, "sku": dev.hw_sku, "channel": effective_channel(dev), "action": "skipped:no-release"})
             continue
-        res = _decide(reg, dev, resolved, dry_run)
+        res = _decide(reg, dev, best, dry_run)
+        res["channel"] = best_channel
         if res.get("action") == "staged":
             rep["staged"] += 1
         rep["devices"].append(_drop_empty(res, ("from", "to")))

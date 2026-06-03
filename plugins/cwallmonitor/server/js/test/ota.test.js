@@ -83,7 +83,9 @@ function registryWithDevice(sku, minSV) {
   const dir = mkdtempSync(join(tmpdir(), "cwm-otareg-"));
   const reg = new Registry(dir);
   reg.register(TEST_DEVICE, { ..._testing.emptyPayload(), broker_url: "https://broker.example", psk_hex: TEST_PSK });
-  reg.setSerial(TEST_DEVICE, "CWM-S1-DEV-2620-000001-0", sku);
+  // Production (non-DEV) serial keeps these staging tests single-channel
+  // (stable). Dual-channel dev routing has its own test.
+  reg.setSerial(TEST_DEVICE, "CWM-S1-MAD-2620-000001-0", sku);
   if (minSV > 0) reg.bumpMinSV(TEST_DEVICE, minSV);
   return reg;
 }
@@ -214,5 +216,30 @@ test("packSemver + compareSemver match the shared contract", { skip: orderPath ?
   }
   for (const c of ORDER.valid) {
     assert.equal(ota.validVersion(c.version), c.valid, `validVersion(${JSON.stringify(c.version)})`);
+  }
+});
+
+// A DEV-serial unit consumes BOTH stable and dev (candidateChannels). When
+// only the stable channel has a release (dev asset 404s), it still stages
+// stable. Exercises the per-device multi-channel gather + bestChannel pick.
+test("dev unit considers both channels (stable wins when dev absent)", { skip }, async () => {
+  const { canonical, sigB64 } = s1Vector();
+  const { server, url } = await mockReleases({ S1: index(canonical, sigB64) });
+  try {
+    const cfg = makeCfg(url);
+    const reg = registryWithDevice("S1", 0);
+    reg.setSerial(TEST_DEVICE, "CWM-S1-DEV-2620-000001-0", "S1"); // flip to DEV
+
+    const rep = await ota.check(cfg, reg, { dryRun: true });
+    const stable = rep.per_sku.find(s => s.channel === "stable");
+    const dev = rep.per_sku.find(s => s.channel === "dev");
+    assert.ok(stable && stable.verified && stable.latest_version === "0.5.1", `stable per-sku: ${JSON.stringify(stable)}`);
+    assert.ok(dev && !dev.verified && dev.error, `dev per-sku should have failed: ${JSON.stringify(dev)}`);
+    assert.equal(rep.devices.length, 1);
+    assert.equal(rep.devices[0].action, "would_stage");
+    assert.equal(rep.devices[0].channel, "stable");
+    assert.equal(rep.devices[0].to, "0.5.1");
+  } finally {
+    server.close();
   }
 });

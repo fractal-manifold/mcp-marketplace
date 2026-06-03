@@ -26,12 +26,13 @@ try {
 // X-Cwm-Serial / X-Cwm-Sku headers), pending.firmware_manifest_b64 /
 // firmware_manifest_sig_b64 (signed OTA manifest), and
 // active.min_secure_version (anti-rollback floor).
-// v3 adds: device.channel (release track: "" / "stable" vs "dev"). It's
-// a device-level attribute (like serial_number / hw_sku), NOT a config
-// payload field — the firmware never receives it; the broker uses it only
-// to pick which GitHub asset to fetch (latest vs the rolling dev tag).
-// v1/v2 files load with channel="" (== stable) and are re-serialised as
-// v3 on the next save.
+// v3 adds: device.channel (release-track override). It's a device-level
+// attribute (like serial_number / hw_sku), NOT a config payload field — the
+// firmware never receives it; the broker uses it only to pick which GitHub
+// asset to fetch. "" == AUTO: the track is derived from the serial (a dev
+// unit, FAC=="DEV", consumes stable+dev; production consumes stable). An
+// explicit "stable" / "dev" pins that track regardless of serial. v1/v2 files
+// load with channel="" (auto) and are re-serialised as v3 on the next save.
 export const SCHEMA_VERSION = 3;
 
 const DEVICE_ID_RE = /^[0-9a-f]{8}$/;
@@ -326,16 +327,51 @@ function tomlObjToPayload(d) {
   };
 }
 
-// Release channel normalisation: "" and "stable" both mean the stable
-// track (field omitted on disk); anything else is lowercased verbatim
-// (today only "dev"). Centralised so the registry, the OTA loop and the
-// tools agree on the canonical form.
+// Release channel normalisation. "" means AUTO — the track is derived from
+// the serial (dev unit → dev, production → stable). "stable" / "dev" are
+// EXPLICIT pins that override the serial. Trim + lowercase, kept verbatim so
+// a "stable" pin stays distinct from auto. Centralised so the registry, the
+// OTA loop and the tools agree on the canonical form.
 export function normalizeChannel(c) {
-  const s = String(c || "").trim().toLowerCase();
-  return s === "stable" ? "" : s;
+  return String(c || "").trim().toLowerCase();
 }
+
+// serialIsDev reports whether a factory serial denotes a DEVELOPMENT unit.
+// Mirror of the firmware's cwm_serial_is_dev(): true iff the FAC field is
+// "DEV". The canonical 24-char serial is "CWM-<SKU2>-<FAC3>-<YYWW4>-<SEQ6>-<C1>"
+// (FAC is the 3rd dash-separated field); a blank-eFuse dev unit falls back to
+// "DEV-<device_id>". Both the SIM serial and the cwm_dev_sn override bake
+// FAC="DEV", so all dev paths land here. Case-insensitive; empty/unparseable
+// → false (treated as a production/stable unit). Wire-identical across runtimes.
+export function serialIsDev(serial) {
+  const s = String(serial || "").trim().toUpperCase();
+  if (!s) return false;
+  if (s.startsWith("DEV-")) return true;
+  const parts = s.split("-");
+  return parts.length >= 3 && parts[2] === "DEV";
+}
+
+// effectiveChannel returns the device's PRIMARY release track for display
+// (list_devices, /info): an explicit channel override wins; otherwise it's
+// derived from the serial (dev unit → "dev", production → "stable"). For OTA
+// routing use candidateChannels — a dev unit consumes BOTH tracks.
 export function effectiveChannel(dev) {
-  return (dev && dev.channel) ? dev.channel : "stable";
+  if (dev && dev.channel) return dev.channel;
+  return (dev && serialIsDev(dev.serialNumber)) ? "dev" : "stable";
+}
+
+// candidateChannels returns the release tracks the OTA loop must consider for
+// a device, newest-wins across them. A dev unit (or a dev override) tracks the
+// UNION of stable + dev so it never misses a stable build that is newer than
+// the current dev tip (by SemVer, a final X.Y.Z is newer than X.Y.Z-dev.<ts>).
+// A production unit, or an explicit stable override, tracks stable only.
+export function candidateChannels(dev) {
+  const override = dev && dev.channel ? dev.channel : "";
+  if (override === "stable") return ["stable"];
+  if (override === "dev" || (dev && serialIsDev(dev.serialNumber))) {
+    return ["stable", "dev"];
+  }
+  return ["stable"];
 }
 
 function deviceToTOML(dev) {

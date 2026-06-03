@@ -440,8 +440,9 @@ def _register_device(deps: Deps, args: dict) -> dict:
     except ValueError:
         return {"error": "psk_hex is not valid hex"}
     # Release channel is a device-level attribute, NOT part of the config
-    # payload. "" / "stable" -> stable; "dev" -> dev.
-    channel = "stable"
+    # payload. "" = auto-derive the track from the serial; "stable" / "dev"
+    # pin it.
+    channel = ""
     if (raw := args.get("channel")) not in (None, ""):
         channel = _valid_channel_arg(raw)
         if channel is None:

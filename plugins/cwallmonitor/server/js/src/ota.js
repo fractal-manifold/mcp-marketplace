@@ -20,7 +20,7 @@
 
 import { createPublicKey, verify as cryptoVerify } from "node:crypto";
 
-import { effectiveChannel } from "./registry/store.js";
+import { effectiveChannel, candidateChannels } from "./registry/store.js";
 
 const DEFAULT_POLL_MINUTES = 60;
 const MIN_POLL_MINUTES = 5;
@@ -278,8 +278,11 @@ export async function check(cfg, reg, { dryRun, skuFilter = "", deviceFilter = "
     if (deviceFilter && dev.deviceID !== deviceFilter) continue;
     if (skuFilter && dev.hwSku !== skuFilter) continue;
     wanted.push(dev);
-    const channel = effectiveChannel(dev);
-    targets.set(`${dev.hwSku} ${channel}`, { sku: dev.hwSku, channel });
+    // A dev unit consumes BOTH stable and dev (candidateChannels), so it can
+    // contribute two targets; the newest-wins choice is made per device below.
+    for (const channel of candidateChannels(dev)) {
+      targets.set(`${dev.hwSku}/${channel}`, { sku: dev.hwSku, channel });
+    }
   }
 
   const resolvedByKey = new Map();
@@ -296,13 +299,27 @@ export async function check(cfg, reg, { dryRun, skuFilter = "", deviceFilter = "
   }
 
   for (const dev of wanted) {
-    const key = `${dev.hwSku} ${effectiveChannel(dev)}`;
-    const resolved = resolvedByKey.get(key);
-    if (!resolved) {
+    // Across the device's candidate channels, pick the resolved release with
+    // the NEWEST version by SemVer: a final X.Y.Z beats a same-base
+    // X.Y.Z-dev.<ts> prerelease, and a newer dev timestamp beats an older one.
+    // A dev unit thus rides whichever of stable/dev is ahead (so a freshly cut
+    // stable graduates it off an older dev tip); a production unit only ever
+    // resolves stable. Ties prefer stable (it's first in candidateChannels).
+    let best = null;
+    let bestChannel = effectiveChannel(dev);
+    for (const channel of candidateChannels(dev)) {
+      const resolved = resolvedByKey.get(`${dev.hwSku}/${channel}`);
+      if (!resolved) continue;
+      if (best === null) { best = resolved; bestChannel = channel; continue; }
+      const cmp = compareSemver(String(resolved.mf.version || ""), String(best.mf.version || ""));
+      if (cmp !== null && cmp > 0) { best = resolved; bestChannel = channel; }
+    }
+    if (best === null) {
       rep.devices.push({ device_id: dev.deviceID, sku: dev.hwSku, channel: effectiveChannel(dev), action: "skipped:no-release" });
       continue;
     }
-    const res = decide(reg, dev, resolved, dryRun, logger);
+    const res = decide(reg, dev, best, dryRun, logger);
+    res.channel = bestChannel;
     if (res.action === "staged") rep.staged++;
     rep.devices.push(dropEmpty(res, ["from", "to"]));
   }

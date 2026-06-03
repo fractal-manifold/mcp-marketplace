@@ -5,7 +5,7 @@ import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
-import { Registry, _testing } from "../src/registry/store.js";
+import { Registry, _testing, serialIsDev, candidateChannels } from "../src/registry/store.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -132,5 +132,19 @@ test("maybePromote moves pending → active", () => {
     assert.equal(dev.active.payload.city, "Z");
   } finally {
     rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// Serial-derived channel routing must match the shared cross-runtime contract.
+const channelPath = findCompat("registry/channel_routing.json");
+const chanSkip = channelPath ? false : "compat/registry/channel_routing.json unavailable (standalone checkout)";
+test("serialIsDev + candidateChannels match the shared contract", { skip: chanSkip }, () => {
+  const vectors = JSON.parse(readFileSync(channelPath, "utf8"));
+  for (const c of vectors.serial_is_dev) {
+    assert.equal(serialIsDev(c.serial), c.expected, `serialIsDev(${JSON.stringify(c.serial)})`);
+  }
+  for (const c of vectors.candidate_channels) {
+    const got = candidateChannels({ serialNumber: c.serial, channel: c.channel });
+    assert.deepEqual(got, c.expected, `candidateChannels(channel=${JSON.stringify(c.channel)}, serial=${JSON.stringify(c.serial)})`);
   }
 });

@@ -303,7 +303,9 @@ func newRegistryWithDevice(t *testing.T, deviceID, sku string, minSV uint32) *re
 	}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if err := reg.SetSerial(deviceID, "CWM-S1-DEV-2620-000001-0", sku); err != nil {
+	// A production (non-DEV) serial keeps these staging tests on a single
+	// channel (stable). Dual-channel dev routing has its own test.
+	if err := reg.SetSerial(deviceID, "CWM-S1-MAD-2620-000001-0", sku); err != nil {
 		t.Fatalf("SetSerial: %v", err)
 	}
 	if minSV > 0 {
@@ -512,5 +514,63 @@ func TestCheckInertWhenUnconfigured(t *testing.T) {
 	}
 	if len(rep.Devices) != 0 {
 		t.Fatalf("unconfigured check must not inspect devices: %+v", rep.Devices)
+	}
+}
+
+// TestCheckDevUnitConsidersBothChannels verifies that a DEV-serial unit
+// consumes BOTH stable and dev (CandidateChannels), and that when only the
+// stable channel has a release (the dev asset 404s), the device still stages
+// the stable build. Exercises the per-device multi-channel gather + bestChannel
+// selection in the OTA loop.
+func TestCheckDevUnitConsidersBothChannels(t *testing.T) {
+	v := loadVectors(t)
+	canonical, sigB64 := s1Vector(t, v)
+	idx := Index{
+		Version:      "0.5.1",
+		ManifestB64:  base64.StdEncoding.EncodeToString([]byte(canonical)),
+		SignatureB64: sigB64,
+		BinURL:       "https://downloads.example/cwm-S1-0.5.1.bin",
+	}
+	// Mock serves stable only; the dev asset is absent (404).
+	srv := mockReleases(t, map[string]Index{"S1": idx})
+	defer srv.Close()
+
+	cfg := otaConfigForVectors(t, v, srv.URL)
+	reg := newRegistryWithDevice(t, testDevice, "S1", 0)
+	// Flip to a DEV serial so the unit tracks stable + dev.
+	if err := reg.SetSerial(testDevice, "CWM-S1-DEV-2620-000001-0", "S1"); err != nil {
+		t.Fatalf("SetSerial: %v", err)
+	}
+	checker := NewChecker(cfg, reg, nil)
+
+	rep, err := checker.Check(context.Background(), true, "", "")
+	if err != nil {
+		t.Fatalf("dry-run Check: %v", err)
+	}
+	// Both channels were queried: a verified stable entry and a failed dev entry.
+	var stableSeen, devSeen bool
+	for _, s := range rep.PerSKU {
+		switch s.Channel {
+		case "stable":
+			if !s.Verified || s.LatestVersion != "0.5.1" {
+				t.Errorf("stable per-sku not verified at 0.5.1: %+v", s)
+			}
+			stableSeen = true
+		case "dev":
+			if s.Verified || s.Error == "" {
+				t.Errorf("dev per-sku should have failed (no asset): %+v", s)
+			}
+			devSeen = true
+		}
+	}
+	if !stableSeen || !devSeen {
+		t.Fatalf("expected both stable and dev per-sku entries, got %+v", rep.PerSKU)
+	}
+	// Stable wins (dev absent): the device would stage 0.5.1 on the stable track.
+	if len(rep.Devices) != 1 || rep.Devices[0].Action != "would_stage" {
+		t.Fatalf("device result: %+v, want 1 would_stage", rep.Devices)
+	}
+	if rep.Devices[0].Channel != "stable" || rep.Devices[0].To != "0.5.1" {
+		t.Errorf("device channel/to = %q/%q, want stable/0.5.1", rep.Devices[0].Channel, rep.Devices[0].To)
 	}
 }

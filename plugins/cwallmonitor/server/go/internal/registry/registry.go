@@ -162,27 +162,69 @@ type Device struct {
 }
 
 // normalizeChannel canonicalises a release-channel string: trim +
-// lowercase, with "stable" and "" both collapsing to "" (the stable
-// track, omitted on disk). Anything else is the lowercased string
-// verbatim (today only "dev"). Centralised so the registry, the OTA loop
-// and the MCP tools agree on the canonical form. Mirror of JS
-// normalizeChannel.
+// lowercase, kept verbatim. "" means AUTO (track derived from the serial);
+// "stable" / "dev" are explicit pins, distinct from auto. Centralised so the
+// registry, the OTA loop and the MCP tools agree on the canonical form.
+// Mirror of JS normalizeChannel.
 func normalizeChannel(c string) string {
-	s := strings.ToLower(strings.TrimSpace(c))
-	if s == "stable" {
-		return ""
-	}
-	return s
+	// "" means AUTO — the track is derived from the serial (dev unit → dev,
+	// production → stable). "stable" / "dev" are explicit pins that override
+	// the serial, kept verbatim so a "stable" pin stays distinct from auto.
+	return strings.ToLower(strings.TrimSpace(c))
 }
 
-// EffectiveChannel returns the device's release track as a non-empty
-// string: the stored channel, or "stable" when empty. Mirror of JS
-// effectiveChannel.
+// SerialIsDev reports whether a factory serial denotes a DEVELOPMENT unit.
+// Mirror of the firmware's cwm_serial_is_dev(): true iff the FAC field is
+// "DEV". The canonical 24-char serial is "CWM-<SKU2>-<FAC3>-<YYWW4>-<SEQ6>-<C1>"
+// (FAC is the 3rd dash-separated field); a blank-eFuse dev unit falls back to
+// "DEV-<device_id>". Both the SIM serial and the cwm_dev_sn override bake
+// FAC="DEV", so all dev paths land here. Case-insensitive; empty/unparseable
+// → false (treated as a production/stable unit). Wire-identical across runtimes.
+func SerialIsDev(serial string) bool {
+	s := strings.ToUpper(strings.TrimSpace(serial))
+	if s == "" {
+		return false
+	}
+	if strings.HasPrefix(s, "DEV-") {
+		return true
+	}
+	parts := strings.Split(s, "-")
+	return len(parts) >= 3 && parts[2] == "DEV"
+}
+
+// EffectiveChannel returns the device's PRIMARY release track for display
+// (list_devices, /info): an explicit channel override wins; otherwise it's
+// derived from the serial (dev unit → "dev", production → "stable"). For OTA
+// routing use CandidateChannels — a dev unit consumes BOTH tracks. Mirror of
+// JS effectiveChannel.
 func EffectiveChannel(dev *Device) string {
 	if dev != nil && dev.Channel != "" {
 		return dev.Channel
 	}
+	if dev != nil && SerialIsDev(dev.SerialNumber) {
+		return "dev"
+	}
 	return "stable"
+}
+
+// CandidateChannels returns the release tracks the OTA loop must consider for
+// a device, newest-wins across them. A dev unit (or a dev override) tracks the
+// UNION of stable + dev so it never misses a stable build that is newer than
+// the current dev tip (by SemVer, a final X.Y.Z is newer than X.Y.Z-dev.<ts>).
+// A production unit, or an explicit stable override, tracks stable only.
+// Mirror of JS candidateChannels.
+func CandidateChannels(dev *Device) []string {
+	override := ""
+	if dev != nil {
+		override = dev.Channel
+	}
+	if override == "stable" {
+		return []string{"stable"}
+	}
+	if override == "dev" || (dev != nil && SerialIsDev(dev.SerialNumber)) {
+		return []string{"stable", "dev"}
+	}
+	return []string{"stable"}
 }
 
 // Registry owns the on-disk store under devicesDir. Construct via New.

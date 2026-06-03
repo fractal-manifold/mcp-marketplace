@@ -36,23 +36,64 @@ def valid_device_id(device_id: str) -> bool:
 def normalize_channel(c: str | None) -> str:
     """Canonicalise a release-channel string.
 
-    Trim + lowercase; "stable" and "" both collapse to "" (the stable
-    track, omitted on disk). Anything else is the lowercased string
-    verbatim (today only "dev"). Mirror of JS normalizeChannel.
+    Trim + lowercase, kept verbatim. "" means AUTO (the track is derived from
+    the serial: dev unit -> dev, production -> stable). "stable" / "dev" are
+    explicit pins that override the serial, distinct from auto. Mirror of JS
+    normalizeChannel.
     """
-    s = str(c or "").strip().lower()
-    return "" if s == "stable" else s
+    return str(c or "").strip().lower()
+
+
+def serial_is_dev(serial: str | None) -> bool:
+    """Report whether a factory serial denotes a DEVELOPMENT unit.
+
+    Mirror of the firmware's cwm_serial_is_dev(): true iff the FAC field is
+    "DEV". The canonical 24-char serial is
+    "CWM-<SKU2>-<FAC3>-<YYWW4>-<SEQ6>-<C1>" (FAC is the 3rd dash-separated
+    field); a blank-eFuse dev unit falls back to "DEV-<device_id>". Both the
+    SIM serial and the cwm_dev_sn override bake FAC="DEV", so all dev paths
+    land here. Case-insensitive; empty/unparseable -> False (treated as a
+    production/stable unit). Wire-identical across runtimes.
+    """
+    s = str(serial or "").strip().upper()
+    if not s:
+        return False
+    if s.startswith("DEV-"):
+        return True
+    parts = s.split("-")
+    return len(parts) >= 3 and parts[2] == "DEV"
 
 
 def effective_channel(dev: "Device | None") -> str:
-    """Return the device's release track as a non-empty string.
+    """Return the device's PRIMARY release track for display.
 
-    The stored channel, or "stable" when empty. Mirror of JS
+    An explicit channel override wins; otherwise derived from the serial
+    (dev unit -> "dev", production -> "stable"). For OTA routing use
+    candidate_channels — a dev unit consumes BOTH tracks. Mirror of JS
     effectiveChannel.
     """
     if dev is not None and dev.channel:
         return dev.channel
+    if dev is not None and serial_is_dev(dev.serial_number):
+        return "dev"
     return "stable"
+
+
+def candidate_channels(dev: "Device | None") -> list[str]:
+    """Return the release tracks the OTA loop must consider for a device.
+
+    Newest-wins across them. A dev unit (or a dev override) tracks the UNION
+    of stable + dev so it never misses a stable build that is newer than the
+    current dev tip (by SemVer, a final X.Y.Z is newer than X.Y.Z-dev.<ts>).
+    A production unit, or an explicit stable override, tracks stable only.
+    Mirror of JS candidateChannels.
+    """
+    override = dev.channel if dev is not None else ""
+    if override == "stable":
+        return ["stable"]
+    if override == "dev" or (dev is not None and serial_is_dev(dev.serial_number)):
+        return ["stable", "dev"]
+    return ["stable"]
 
 
 class RegistryError(Exception):

@@ -1,9 +1,11 @@
 package registry
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -414,4 +416,63 @@ func TestSetPending_VolZero(t *testing.T) {
 
 func writeFile(dir, name, body string) error {
 	return os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644)
+}
+
+// findCompatFile walks up from the test working directory to the
+// authoritative monorepo compat/<rel>. Skips on a standalone checkout.
+func findCompatFile(t *testing.T, rel ...string) string {
+	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	dir := wd
+	for i := 0; i < 9; i++ {
+		candidate := filepath.Join(append([]string{dir, "compat"}, rel...)...)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	t.Skipf("compat/%s not found upward from %s (standalone checkout)", filepath.Join(rel...), wd)
+	return ""
+}
+
+// TestChannelRoutingVectors checks SerialIsDev + CandidateChannels against the
+// shared cross-runtime contract (compat/registry/channel_routing.json).
+func TestChannelRoutingVectors(t *testing.T) {
+	path := findCompatFile(t, "registry", "channel_routing.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var vectors struct {
+		SerialIsDev []struct {
+			Serial   string `json:"serial"`
+			Expected bool   `json:"expected"`
+		} `json:"serial_is_dev"`
+		CandidateChannels []struct {
+			Channel  string   `json:"channel"`
+			Serial   string   `json:"serial"`
+			Expected []string `json:"expected"`
+		} `json:"candidate_channels"`
+	}
+	if err := json.Unmarshal(raw, &vectors); err != nil {
+		t.Fatalf("unmarshal %s: %v", path, err)
+	}
+	for _, c := range vectors.SerialIsDev {
+		if got := SerialIsDev(c.Serial); got != c.Expected {
+			t.Errorf("SerialIsDev(%q) = %v, want %v", c.Serial, got, c.Expected)
+		}
+	}
+	for _, c := range vectors.CandidateChannels {
+		dev := &Device{SerialNumber: c.Serial, Channel: c.Channel}
+		if got := CandidateChannels(dev); !reflect.DeepEqual(got, c.Expected) {
+			t.Errorf("CandidateChannels(channel=%q, serial=%q) = %v, want %v", c.Channel, c.Serial, got, c.Expected)
+		}
+	}
 }

@@ -197,8 +197,9 @@ func handleRegisterDevice(d Deps) server.ToolHandlerFunc {
 		}
 
 		// Release channel is a device-level attribute, NOT part of the
-		// config payload. "" / "stable" → stable; "dev" → dev.
-		channel := "stable"
+		// config payload. "" = auto-derive the track from the serial;
+		// "stable" / "dev" pin it.
+		channel := ""
 		if raw := strings.TrimSpace(req.GetString("channel", "")); raw != "" {
 			ch, ok := validChannelArg(raw)
 			if !ok {

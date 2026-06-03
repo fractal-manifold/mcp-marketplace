@@ -14,7 +14,7 @@ import * as auth from "../auth.js";
 import * as creds from "../creds.js";
 import * as ota from "../ota.js";
 import * as devlog from "../devlog.js";
-import { validDeviceID } from "../registry/store.js";
+import { validDeviceID, effectiveChannel } from "../registry/store.js";
 import { firmwarePath } from "../config.js";
 
 function compatDir() {
@@ -62,7 +62,7 @@ function deviceSummary(dev) {
   const out = { device_id: dev.deviceID, active_version: dev.active.payload.version, has_pending: !!dev.pending };
   if (dev.serialNumber) out.serial_number = dev.serialNumber;
   if (dev.hwSku) out.hw_sku = dev.hwSku;
-  out.channel = dev.channel || "stable";
+  out.channel = effectiveChannel(dev);
   if (dev.active.payload.min_secure_version) out.min_secure_version = dev.active.payload.min_secure_version;
   if (dev.active.payload.broker_url) out.active_broker_url = dev.active.payload.broker_url;
   if (dev.active.payload.city) out.active_city = dev.active.payload.city;
@@ -351,7 +351,7 @@ function registerDeviceTool(deps, args) {
   if (!brokerURL) return { error: "broker_url required" };
   if (pskHex.length !== 64) return { error: "psk_hex must be exactly 64 hex chars" };
   if (!/^[0-9a-fA-F]{64}$/.test(pskHex)) return { error: "psk_hex is not valid hex" };
-  let channel = "stable";
+  let channel = ""; // "" = auto-derive the track from the serial
   if (args.channel != null && args.channel !== "") {
     channel = validChannelArg(args.channel);
     if (channel === null) return { error: "channel must be 'stable' or 'dev'" };

@@ -116,7 +116,9 @@ def _cfg_for(repo_url: str) -> Config:
 def _registry_with_device(tmp_path, sku: str, min_sv: int) -> Registry:
     reg = Registry(str(tmp_path))
     reg.register(TEST_DEVICE, ConfigPayload(psk_hex=TEST_PSK, broker_url="https://broker.example"))
-    reg.set_serial(TEST_DEVICE, "CWM-S1-DEV-2620-000001-0", sku)
+    # Production (non-DEV) serial keeps these staging tests single-channel
+    # (stable). Dual-channel dev routing has its own test.
+    reg.set_serial(TEST_DEVICE, "CWM-S1-MAD-2620-000001-0", sku)
     if min_sv > 0:
         reg.bump_min_sv(TEST_DEVICE, min_sv)
     return reg
@@ -178,6 +180,30 @@ async def test_check_rejects_tampered_signature(tmp_path):
         assert rep["staged"] == 0
         assert not rep["per_sku"][0]["verified"] and rep["per_sku"][0]["error"]
         assert rep["devices"][0]["action"] == "skipped:no-release"
+    finally:
+        await server.close()
+
+
+async def test_check_dev_unit_considers_both_channels(tmp_path):
+    """A DEV-serial unit consumes BOTH stable and dev (candidate_channels).
+    With only the stable channel served (dev asset 404s), it still stages
+    stable. Exercises the per-device multi-channel gather + best-channel pick."""
+    canonical, sig_b64 = _s1_vector()
+    server = await _mock_server({"S1": _index(canonical, sig_b64)})  # stable only
+    try:
+        cfg = _cfg_for(str(server.make_url("/")).rstrip("/"))
+        reg = _registry_with_device(tmp_path, "S1", 0)
+        reg.set_serial(TEST_DEVICE, "CWM-S1-DEV-2620-000001-0", "S1")  # flip to DEV
+
+        rep = await ota.check(cfg, reg, dry_run=True)
+        by_chan = {s["channel"]: s for s in rep["per_sku"]}
+        assert "stable" in by_chan and by_chan["stable"]["verified"]
+        assert by_chan["stable"]["latest_version"] == "0.5.1"
+        assert "dev" in by_chan and not by_chan["dev"]["verified"] and by_chan["dev"]["error"]
+        assert len(rep["devices"]) == 1
+        assert rep["devices"][0]["action"] == "would_stage"
+        assert rep["devices"][0]["channel"] == "stable"
+        assert rep["devices"][0]["to"] == "0.5.1"
     finally:
         await server.close()
 
