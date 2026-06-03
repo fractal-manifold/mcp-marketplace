@@ -87,7 +87,16 @@ Resolve only the broker URL before asking the user anything else:
 - **city** — optional, but recommended (drives ambient weather).
   Default to nothing and let the user fill it in later via
   `wall_monitor_set_device_pending` if they don't want to think about
-  it now.
+  it now. **If you do set it, it MUST geocode**: the device feeds the
+  string verbatim to Open-Meteo, whose `name=` parameter takes a single
+  place name — a comma-separated descriptor like `"Pinto, Madrid, Spain"`
+  returns zero results and the device silently uses default coordinates.
+  Pass a **bare town name** (`"Pinto"`, `"Getafe"`), and verify it
+  resolves first with
+  `curl -s "https://geocoding-api.open-meteo.com/v1/search?name=<city>&count=1&language=es&format=json"`
+  (non-empty `results[]`). See the [[settings]] skill's "City —
+  geocoding pre-check" for the full normalisation / nearest-city
+  fallback procedure.
 - **brightness / volume** — only ask if the user volunteers
   preferences. Defaults on the device are sensible.
 - **providers** — REQUIRED. The device tracks usage from one or more of

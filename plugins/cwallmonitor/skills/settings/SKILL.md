@@ -87,7 +87,7 @@ section" or "the Audio settings".
 
 | User intent                       | MCP argument               | Valid range / format               |
 | --------------------------------- | -------------------------- | ---------------------------------- |
-| City (weather / sunrise)          | `city`                     | string, 1..64 chars                |
+| City (weather / sunrise)          | `city`                     | string, 1..64 chars — **must geocode**, see pre-check below |
 | Broker URL                        | `broker_url`               | full URL (e.g. `http://10.0.0.5:8787`) |
 | Pairing passphrase / PSK rotation | `psk_hex`                  | exactly 64 lowercase hex chars     |
 
@@ -112,6 +112,56 @@ registry — do NOT queue a pending change.
 Clamp numeric values to the listed ranges and warn the user if you had
 to clamp. For `theme_mode`, normalise (`dark`→`night`, `light`→`day`,
 `automatic`/`sunset`/`sunrise`→`auto`); if still ambiguous, ask.
+
+#### City — geocoding pre-check (REQUIRED before sending `city`)
+
+The device **re-geocodes the string you push**: on the next ambient
+cycle the firmware calls Open-Meteo with that exact string. Open-Meteo's
+`name=` parameter expects a **single place name**, not a
+comma-separated descriptor — so `"Pinto, Madrid, Spain"` returns **zero
+results** and the device silently falls back to its build-time default
+coordinates (you see `geocoding: no results for '<city>'` in
+`wall_monitor_device_logs`). There is **no lat/lon field in the control
+plane today**, so the only way to fix the location is to push a string
+that geocodes. Validate and normalise it here, before queueing:
+
+1. Run the **firmware's exact query** so you see what the device will
+   see (`count=1`, `language=es`):
+
+   ```
+   curl -s "https://geocoding-api.open-meteo.com/v1/search?name=<URL-encoded>&count=1&language=es&format=json"
+   ```
+
+   A non-empty `results[]` means the string geocodes as-is → push it
+   verbatim.
+
+2. If `results` is empty, build simpler candidates **in order** and test
+   each with the same query, taking the first that resolves:
+   - the first comma-segment (`"Pinto, Madrid, Spain"` → `"Pinto"`);
+   - the bare town with no region/country words.
+
+   When a simplified form resolves, **push that form** (the device must
+   resolve the identical string), and tell the user you normalised
+   `"<original>"` → `"<resolved>"`, showing the matched
+   `name` / `admin1` / `country_code` / `latitude,longitude` for
+   confirmation.
+
+3. If **nothing** resolves (typo, or a hamlet Open-Meteo doesn't index),
+   widen the search (`count=5`, drop `language=es`) to list candidates,
+   and use `AskUserQuestion` to let the user pick — offer the closest
+   indexed town **or the nearest larger city** (e.g. Pinto → Getafe,
+   ~5 km, pop 187k). Push the chosen city's bare name. **Never queue a
+   `city` you could not geocode** — it would just re-trigger the silent
+   fallback.
+
+4. "Use coordinates instead" is **not yet possible remotely**: the
+   firmware stores `cwm_lat`/`cwm_lon` but the control-plane pending has
+   no lat/lon field, and writing `cwm_city` erases them so the device
+   re-geocodes. If the user insists on exact coordinates for an
+   unindexed spot, the only path today is the on-device captive
+   portal / Settings panel; pushing a nearby indexed city is the
+   remote-friendly answer. (A signed lat/lon pending field is a possible
+   follow-up.)
 
 If the user asks to **disable all providers**, refuse: the dashboard
 has nothing to show and the device will fall back to "no provider".
@@ -249,3 +299,9 @@ wall_monitor_set_device_pending
   fails to probe (wrong `broker_url`, wrong `psk_hex`). Check
   `wall_monitor_recent_logs` for `candidate probe failed`; the device
   will roll back automatically after 5 minutes.
+- **City accepted but weather/location is wrong** — the device log shows
+  `geocoding: no results for '<city>'` and `ambient: location: ~40,-4
+  (build-time default)`. The stored `city` is not a bare Open-Meteo
+  place name (usually a comma-separated descriptor like
+  `"Pinto, Madrid, Spain"`). Re-run with the **city geocoding pre-check**
+  (step 2) and push the normalised bare name.
