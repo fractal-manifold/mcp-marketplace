@@ -133,9 +133,12 @@ func NewMux(cfg *config.Config, cache *auth.NonceCache, st *state.State, logger 
 	mux.HandleFunc("/device/", func(w http.ResponseWriter, r *http.Request) {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		// /device/{id}/sync (GET, control plane) vs /device/{id}/logs
-		// (POST, diagnostic upload). Both authenticate the same way.
+		// (POST, diagnostic upload) vs /device/{id}/settings (POST,
+		// device-reported display settings). All authenticate the same way.
 		if strings.HasSuffix(r.URL.Path, "/logs") {
 			handleDeviceLogs(cfg, cache, logger, reg, rec, r)
+		} else if strings.HasSuffix(r.URL.Path, "/settings") {
+			handleDeviceSettings(cfg, cache, logger, reg, rec, r)
 		} else {
 			handleDeviceSync(cfg, cache, logger, reg, rec, r)
 		}
@@ -1019,6 +1022,118 @@ func handleDeviceLogs(cfg *config.Config, cache *auth.NonceCache, logger *log.Lo
 	writeJSON(w, http.StatusAccepted, struct {
 		Stored int `json:"stored"`
 	}{Stored: len(lines)})
+}
+
+// settingsReportBody is the JSON the device POSTs to /device/{id}/settings.
+// Numbers are decoded into pointers so an omitted field stays nil ("leave it").
+type settingsReportBody struct {
+	ThemeMode           *string `json:"theme_mode"`
+	BrDay               *uint8  `json:"br_day"`
+	BrNight             *uint8  `json:"br_night"`
+	Vol                 *uint8  `json:"vol"`
+	AutorotateEnabled   *bool   `json:"autorotate_enabled"`
+	AutorotateIntervalS *uint16 `json:"autorotate_interval_s"`
+}
+
+// handleDeviceSettings ingests a device-reported display-settings update and
+// mirrors it into the registry (compat/SETTINGS_REPORT.md). The device owns
+// these fields, so this converges the broker's stored config to the device's
+// state instead of pushing a change — no version bump, no reverts.
+func handleDeviceSettings(cfg *config.Config, cache *auth.NonceCache, logger *log.Logger, reg *registry.Registry, w http.ResponseWriter, r *http.Request) {
+	if reg == nil {
+		writeError(w, http.StatusNotFound, "device registry not configured")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/device/"), "/")
+	if len(parts) != 2 || parts[1] != "settings" {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	deviceID := parts[0]
+	if !registry.ValidDeviceID(deviceID) {
+		writeError(w, http.StatusBadRequest, "invalid device_id")
+		return
+	}
+
+	active, pending, perr := reg.PSKsFor(deviceID)
+	if errors.Is(perr, registry.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "unknown device")
+		return
+	} else if perr != nil {
+		logger.Printf("registry lookup %s: %v", deviceID, perr)
+		writeError(w, http.StatusInternalServerError, "registry error")
+		return
+	}
+
+	signedPath := r.URL.Path
+	if _, verr := auth.VerifyMulti(
+		[][]byte{active, pending},
+		"POST", signedPath,
+		r.Header.Get("X-Cwm-Timestamp"),
+		r.Header.Get("X-Cwm-Nonce"),
+		r.Header.Get("X-Cwm-Signature"),
+		r.Header.Get("X-Cwm-Device"),
+		r.Header.Get("X-Cwm-Config-Version"),
+		cache,
+		time.Duration(cfg.Security.MaxTimestampSkewSeconds)*time.Second,
+		time.Now(),
+	); verr != nil {
+		logger.Printf("auth rejected /device/%s/settings from %s: %v", deviceID, r.RemoteAddr, verr)
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 512)
+	raw, rerr := io.ReadAll(r.Body)
+	if rerr != nil { // includes the 512-byte cap being exceeded
+		writeError(w, http.StatusBadRequest, "bad settings body")
+		return
+	}
+	// Canonical body handling shared with the Python/JS brokers: an empty
+	// (or whitespace-only) body is a no-op; anything present must be a single
+	// JSON object with no trailing data; null / arrays / scalars are rejected.
+	var body settingsReportBody
+	if trimmed := strings.TrimSpace(string(raw)); trimmed != "" {
+		if trimmed == "null" {
+			writeError(w, http.StatusBadRequest, "bad settings body")
+			return
+		}
+		dec := json.NewDecoder(strings.NewReader(trimmed))
+		if derr := dec.Decode(&body); derr != nil {
+			writeError(w, http.StatusBadRequest, "bad settings body")
+			return
+		}
+		// Reject any trailing data after the object. dec.More() is unreliable
+		// here (it returns false on a stray '}'/']'), so decode a second value
+		// and require a clean io.EOF.
+		var trailing json.RawMessage
+		if terr := dec.Decode(&trailing); terr != io.EOF {
+			writeError(w, http.StatusBadRequest, "bad settings body")
+			return
+		}
+	}
+
+	if _, rerr := reg.ReportSettings(deviceID, registry.ReportedSettings{
+		ThemeMode:           body.ThemeMode,
+		BrDay:               body.BrDay,
+		BrNight:             body.BrNight,
+		Vol:                 body.Vol,
+		AutorotateEnabled:   body.AutorotateEnabled,
+		AutorotateIntervalS: body.AutorotateIntervalS,
+	}); errors.Is(rerr, registry.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "unknown device")
+		return
+	} else if rerr != nil {
+		logger.Printf("report settings %s: %v", deviceID, rerr)
+		writeError(w, http.StatusInternalServerError, "registry error")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func parseUint32Header(s string) (uint32, error) {

@@ -422,6 +422,39 @@ class Registry:
             self._save_locked(dev)
             return dev
 
+    def report_settings(
+        self,
+        device_id: str,
+        *,
+        theme_mode: str | None = None,
+        br_day: int | None = None,
+        br_night: int | None = None,
+        vol: int | None = None,
+        autorotate_enabled: bool | None = None,
+        autorotate_interval_s: int | None = None,
+    ) -> Device:
+        """Apply device-reported display settings to the stored config WITHOUT
+        bumping the version. The device owns these fields (the user sets them on
+        the screen), so the broker mirrors them into Active — and into a queued
+        Pending, if any, so an in-flight OTA/config change does not re-introduce
+        the stale value on promotion. See compat/SETTINGS_REPORT.md."""
+        if not valid_device_id(device_id):
+            raise RegistryError(f"registry: invalid device_id {device_id!r}")
+        with self._with_lock(device_id):
+            dev = self._load_locked(device_id)
+            changed = _apply_reported(
+                dev.active.payload, theme_mode, br_day, br_night, vol,
+                autorotate_enabled, autorotate_interval_s,
+            )
+            if dev.pending is not None:
+                changed = _apply_reported(
+                    dev.pending.payload, theme_mode, br_day, br_night, vol,
+                    autorotate_enabled, autorotate_interval_s,
+                ) or changed
+            if changed:
+                self._save_locked(dev)
+            return dev
+
     def maybe_promote(self, device_id: str, observed_version: int, used_pending_psk: bool) -> bool:
         if not valid_device_id(device_id):
             raise RegistryError(f"registry: invalid device_id {device_id!r}")
@@ -558,6 +591,55 @@ class Registry:
             except Exception:
                 continue
         return out
+
+
+def _apply_reported(
+    p: ConfigPayload,
+    theme_mode: str | None,
+    br_day: int | None,
+    br_night: int | None,
+    vol: int | None,
+    autorotate_enabled: bool | None,
+    autorotate_interval_s: int | None,
+) -> bool:
+    """Overlay reported device-owned fields onto a payload, clamping numeric
+    ranges and ignoring an unknown theme_mode. Returns True if anything changed.
+    Operator-owned fields are never touched."""
+    changed = False
+
+    def _clamp(v: int, lo: int, hi: int) -> int:
+        return lo if v < lo else hi if v > hi else v
+
+    if theme_mode in ("day", "night", "auto"):
+        if p.theme_mode != theme_mode:
+            p.theme_mode = theme_mode
+            changed = True
+    if br_day is not None:
+        v = _clamp(int(br_day), 10, 100)
+        if p.br_day != v:
+            p.br_day = v
+            changed = True
+    if br_night is not None:
+        v = _clamp(int(br_night), 5, 100)
+        if p.br_night != v:
+            p.br_night = v
+            changed = True
+    if vol is not None:
+        v = _clamp(int(vol), 0, 100)
+        if p.vol != v:
+            p.vol = v
+            changed = True
+    if autorotate_enabled is not None:
+        b = bool(autorotate_enabled)
+        if p.autorotate_enabled != b:
+            p.autorotate_enabled = b
+            changed = True
+    if autorotate_interval_s is not None:
+        v = _clamp(int(autorotate_interval_s), 1, 300)
+        if p.autorotate_interval_s != v:
+            p.autorotate_interval_s = v
+            changed = True
+    return changed
 
 
 def _merge_payload(base: ConfigPayload, upd: ConfigPayload) -> ConfigPayload:

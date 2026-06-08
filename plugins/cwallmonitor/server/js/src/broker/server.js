@@ -49,6 +49,8 @@ export function createHandler({ cfg, cache, state, fwLogs, registry, logger, usa
     if (m && req.method === "GET") return handleDeviceSync({ cfg, cache, state, registry, logger, deviceID: m[1] }, req, res);
     const lm = path.match(/^\/device\/([^/]+)\/logs$/);
     if (lm && req.method === "POST") return handleDeviceLogs({ cfg, cache, state, registry, logger, deviceID: lm[1] }, req, res);
+    const sm = path.match(/^\/device\/([^/]+)\/settings$/);
+    if (sm && req.method === "POST") return handleDeviceSettings({ cfg, cache, state, registry, logger, deviceID: sm[1] }, req, res);
     const fwm = path.match(/^\/firmware\/([^/]+)$/);
     if (fwm && (req.method === "GET" || req.method === "HEAD")) {
       return handleFirmware({ cfg, cache, registry, logger, name: fwm[1] }, req, res);
@@ -522,6 +524,109 @@ function handleDeviceLogs({ cfg, cache, state, registry, logger, deviceID }, req
     catch (e) { logger.warn(`devlog append ${deviceID}: ${e.message}`); return finishErr(500, "log store error"); }
     recordStatus = 202;
     writeJSON(res, 202, { stored: lines.length });
+  });
+}
+
+// validUint checks a JSON value is an integer in [0, max] (uint8/uint16 range),
+// mirroring Go's decode into *uint8/*uint16 which rejects floats and overflow.
+function validUint(v, max) {
+  return typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= max;
+}
+
+// handleDeviceSettings ingests a device-reported display-settings update and
+// mirrors it into the registry (compat/SETTINGS_REPORT.md). The device owns
+// these fields, so this converges the broker's stored config to the device's
+// state instead of pushing a change — no version bump, no reverts. Auth is
+// identical to /logs; the signature does not cover the body.
+function handleDeviceSettings({ cfg, cache, state, registry, logger, deviceID }, req, res) {
+  let recordStatus = 204;
+  const finishErr = (s, m) => { recordStatus = s; writeError(res, s, m); };
+  res.on("close", () => { try { state.recordRequest(req.socket.remoteAddress || "", recordStatus); } catch {} });
+
+  if (!registry) return finishErr(404, "device registry not configured");
+  if (!validDeviceID(deviceID)) return finishErr(400, "invalid device_id");
+
+  let active, pending;
+  try { ({ active, pending } = registry.psksFor(deviceID)); }
+  catch (e) {
+    if (e instanceof NotFound) return finishErr(404, "unknown device");
+    logger.warn(`registry lookup ${deviceID}: ${e.message}`); return finishErr(500, "registry error");
+  }
+  const signedPath = `/device/${deviceID}/settings`;
+  try {
+    auth.verifyMulti(
+      [active, pending],
+      "POST", signedPath,
+      req.headers["x-cwm-timestamp"] || "", req.headers["x-cwm-nonce"] || "", req.headers["x-cwm-signature"] || "",
+      req.headers["x-cwm-device"] || "", req.headers["x-cwm-config-version"] || "",
+      cache, cfg.security.max_timestamp_skew_seconds,
+    );
+  } catch (e) { logger.info(`auth rejected ${signedPath}: ${e.message}`); return finishErr(401, "unauthorized"); }
+
+  const cl = Number.parseInt(req.headers["content-length"] || "", 10);
+  if (Number.isFinite(cl) && cl > 512) return finishErr(400, "bad settings body");
+
+  const chunks = [];
+  let total = 0;
+  let aborted = false;
+  req.on("data", (c) => {
+    total += c.length;
+    // Streamed body over the 512-byte cap → 400 (matching the Go MaxBytesReader
+    // path), then tear down the read side; the response is already written.
+    if (total > 512) { if (!aborted) { aborted = true; finishErr(400, "bad settings body"); } req.destroy(); return; }
+    chunks.push(c);
+  });
+  req.on("error", () => { if (!aborted) { aborted = true; try { finishErr(400, "bad settings body"); } catch {} } });
+  req.on("end", () => {
+    if (aborted) return;
+    const raw = Buffer.concat(chunks).toString("utf8");
+    // Canonical body handling shared with the Go/Python brokers: an empty
+    // (or whitespace-only) body is a no-op; anything present must be a single
+    // JSON object; null / arrays / scalars are rejected.
+    let body;
+    try {
+      body = raw.trim() === "" ? {} : JSON.parse(raw);
+    } catch { return finishErr(400, "bad settings body"); }
+    if (body === null || typeof body !== "object" || Array.isArray(body)) return finishErr(400, "bad settings body");
+
+    // Type-validate the way Go's strongly-typed decode does: reject a wrong
+    // JSON type / overflow with 400 rather than silently coercing it. A field
+    // that is absent OR explicit null is treated as "not reported" (omission),
+    // matching Go's nil pointer and Python's dict.get() — hence `!= null`.
+    const s = {};
+    if (body.theme_mode != null) {
+      if (typeof body.theme_mode !== "string") return finishErr(400, "bad settings body");
+      s.theme_mode = body.theme_mode;  // unknown values ignored downstream
+    }
+    if (body.br_day != null) {
+      if (!validUint(body.br_day, 255)) return finishErr(400, "bad settings body");
+      s.br_day = body.br_day;
+    }
+    if (body.br_night != null) {
+      if (!validUint(body.br_night, 255)) return finishErr(400, "bad settings body");
+      s.br_night = body.br_night;
+    }
+    if (body.vol != null) {
+      if (!validUint(body.vol, 255)) return finishErr(400, "bad settings body");
+      s.vol = body.vol;
+    }
+    if (body.autorotate_enabled != null) {
+      if (typeof body.autorotate_enabled !== "boolean") return finishErr(400, "bad settings body");
+      s.autorotate_enabled = body.autorotate_enabled;
+    }
+    if (body.autorotate_interval_s != null) {
+      if (!validUint(body.autorotate_interval_s, 65535)) return finishErr(400, "bad settings body");
+      s.autorotate_interval_s = body.autorotate_interval_s;
+    }
+
+    try { registry.reportSettings(deviceID, s); }
+    catch (e) {
+      if (e instanceof NotFound) return finishErr(404, "unknown device");
+      logger.warn(`report settings ${deviceID}: ${e.message}`); return finishErr(500, "registry error");
+    }
+    recordStatus = 204;
+    res.writeHead(204);
+    res.end();
   });
 }
 

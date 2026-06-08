@@ -123,3 +123,47 @@ def test_maybe_promote(tmp_path: Path):
     assert dev.pending is None
     assert dev.active.payload.psk_hex == "bb" * 32
     assert dev.active.payload.city == "Z"
+
+
+def test_report_settings_updates_active_and_pending_no_version_bump(tmp_path: Path):
+    reg = Registry(str(tmp_path))
+    reg.register(
+        "abcdef07",
+        ConfigPayload(broker_url="http://x", psk_hex="aa" * 32, city="X", theme_mode="day"),
+    )
+    # Queue an operator config change (city) so a Pending exists.
+    reg.set_pending("abcdef07", ConfigPayload(city="Y"))
+    active_v = reg.load("abcdef07").active.payload.version
+    pending_v = reg.load("abcdef07").pending.payload.version
+
+    # Device reports its user-set display settings, with clamping + an unknown
+    # theme that must be ignored. theme_mode "rainbow" is not applied.
+    dev = reg.report_settings(
+        "abcdef07",
+        theme_mode="rainbow",
+        br_day=200,   # clamps to 100
+        br_night=45,
+        vol=255,      # clamps to 100
+    )
+    # Active updated, version unchanged, operator-owned City untouched.
+    assert dev.active.payload.version == active_v
+    assert dev.active.payload.theme_mode == "day"  # rainbow ignored
+    assert dev.active.payload.br_day == 100
+    assert dev.active.payload.br_night == 45
+    assert dev.active.payload.vol == 100
+    assert dev.active.payload.city == "X"
+    # Pending mirrored too (so promotion won't re-introduce stale values),
+    # its version unchanged, its operator-owned City untouched.
+    assert dev.pending is not None
+    assert dev.pending.payload.version == pending_v
+    assert dev.pending.payload.theme_mode == "day"
+    assert dev.pending.payload.br_day == 100
+    assert dev.pending.payload.br_night == 45
+    assert dev.pending.payload.city == "Y"
+
+    # A valid theme is applied; persists across reload.
+    reg.report_settings("abcdef07", theme_mode="night")
+    dev2 = reg.load("abcdef07")
+    assert dev2.active.payload.theme_mode == "night"
+    assert dev2.active.payload.br_day == 100
+    assert dev2.active.payload.version == active_v

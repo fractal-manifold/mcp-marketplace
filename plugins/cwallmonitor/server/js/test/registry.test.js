@@ -135,6 +135,44 @@ test("maybePromote moves pending → active", () => {
   }
 });
 
+test("reportSettings updates active and pending without bumping version", () => {
+  const tmp = mkdtempSync(join(tmpdir(), "cwm-reg-"));
+  try {
+    const reg = new Registry(tmp);
+    reg.register("abcdef07", { ..._testing.emptyPayload(), broker_url: "http://x", psk_hex: "aa".repeat(32), city: "X", theme_mode: "day" });
+    // Queue an operator config change (city) so a Pending exists.
+    reg.setPending("abcdef07", { ..._testing.emptyPayload(), city: "Y" });
+    const activeV = reg.load("abcdef07").active.payload.version;
+    const pendingV = reg.load("abcdef07").pending.payload.version;
+
+    // Device reports its user-set display settings; clamp + ignore unknown theme.
+    const dev = reg.reportSettings("abcdef07", { theme_mode: "rainbow", br_day: 200, br_night: 45, vol: 255 });
+    // Active updated, version unchanged, operator-owned city untouched.
+    assert.equal(dev.active.payload.version, activeV);
+    assert.equal(dev.active.payload.theme_mode, "day");  // rainbow ignored
+    assert.equal(dev.active.payload.br_day, 100);         // clamped
+    assert.equal(dev.active.payload.br_night, 45);
+    assert.equal(dev.active.payload.vol, 100);            // clamped
+    assert.equal(dev.active.payload.city, "X");
+    // Pending mirrored too, version unchanged, its operator-owned city untouched.
+    assert.ok(dev.pending);
+    assert.equal(dev.pending.payload.version, pendingV);
+    assert.equal(dev.pending.payload.theme_mode, "day");
+    assert.equal(dev.pending.payload.br_day, 100);
+    assert.equal(dev.pending.payload.br_night, 45);
+    assert.equal(dev.pending.payload.city, "Y");
+
+    // A valid theme is applied and persists across reload.
+    reg.reportSettings("abcdef07", { theme_mode: "night" });
+    const dev2 = reg.load("abcdef07");
+    assert.equal(dev2.active.payload.theme_mode, "night");
+    assert.equal(dev2.active.payload.br_day, 100);
+    assert.equal(dev2.active.payload.version, activeV);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 // Serial-derived channel routing must match the shared cross-runtime contract.
 const channelPath = findCompat("registry/channel_routing.json");
 const chanSkip = channelPath ? false : "compat/registry/channel_routing.json unavailable (standalone checkout)";

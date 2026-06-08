@@ -94,6 +94,74 @@ func TestRegister_ForcesVersion1(t *testing.T) {
 	}
 }
 
+func TestReportSettings_UpdatesActiveAndPendingNoVersionBump(t *testing.T) {
+	r := newReg(t)
+	if _, err := r.Register(testID, ConfigPayload{
+		PSKHex: testPSK, BrokerURL: "http://a", ThemeMode: "day",
+		BrDay: u8ptr(80), BrNight: u8ptr(20), Vol: u8ptr(60),
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	// Queue an unrelated pending (e.g. an OTA) that inherited the old theme.
+	if _, err := r.SetPending(testID, ConfigPayload{City: "Madrid"}); err != nil {
+		t.Fatalf("SetPending: %v", err)
+	}
+	dev, _ := r.Load(testID)
+	activeVer := dev.Active.Version
+	pendingVer := dev.Pending.Version
+	if dev.Pending.ThemeMode != "day" {
+		t.Fatalf("precondition: pending theme = %q, want day", dev.Pending.ThemeMode)
+	}
+
+	// Device reports the user switched to night + bumped night brightness.
+	night := "night"
+	dev, err := r.ReportSettings(testID, ReportedSettings{ThemeMode: &night, BrNight: u8ptr(45)})
+	if err != nil {
+		t.Fatalf("ReportSettings: %v", err)
+	}
+	// Active mirrors the device, version unchanged (converging, not pushing).
+	if dev.Active.ThemeMode != "night" {
+		t.Errorf("Active.ThemeMode = %q, want night", dev.Active.ThemeMode)
+	}
+	if dev.Active.BrNight == nil || *dev.Active.BrNight != 45 {
+		t.Errorf("Active.BrNight not applied: %+v", dev.Active.BrNight)
+	}
+	if dev.Active.Version != activeVer {
+		t.Errorf("Active.Version bumped %d -> %d, want unchanged", activeVer, dev.Active.Version)
+	}
+	// Queued pending also converges so its promotion won't revert the theme.
+	if dev.Pending == nil || dev.Pending.ThemeMode != "night" {
+		t.Errorf("Pending.ThemeMode not updated: %+v", dev.Pending)
+	}
+	if dev.Pending.Version != pendingVer {
+		t.Errorf("Pending.Version bumped %d -> %d, want unchanged", pendingVer, dev.Pending.Version)
+	}
+	// Operator-owned field on the pending is untouched.
+	if dev.Pending.City != "Madrid" {
+		t.Errorf("Pending.City clobbered: %q", dev.Pending.City)
+	}
+
+	// Out-of-range clamps; unknown theme ignored.
+	dev, err = r.ReportSettings(testID, ReportedSettings{ThemeMode: sptr("rainbow"), BrDay: u8ptr(200), Vol: u8ptr(255)})
+	if err != nil {
+		t.Fatalf("ReportSettings clamp: %v", err)
+	}
+	if dev.Active.ThemeMode != "night" {
+		t.Errorf("unknown theme should be ignored, got %q", dev.Active.ThemeMode)
+	}
+	if *dev.Active.BrDay != 100 || *dev.Active.Vol != 100 {
+		t.Errorf("clamp failed: BrDay=%d Vol=%d", *dev.Active.BrDay, *dev.Active.Vol)
+	}
+
+	// Survives reload from disk.
+	dev, _ = r.Load(testID)
+	if dev.Active.ThemeMode != "night" || *dev.Active.BrNight != 45 {
+		t.Errorf("not persisted: %+v", dev.Active.ConfigPayload)
+	}
+}
+
+func sptr(s string) *string { return &s }
+
 func TestSetPending_BumpsVersionAndMerges(t *testing.T) {
 	r := newReg(t)
 	if _, err := r.Register(testID, ConfigPayload{

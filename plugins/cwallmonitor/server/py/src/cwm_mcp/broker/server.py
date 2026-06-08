@@ -72,6 +72,7 @@ def make_app(
     app.router.add_get("/firmware-logs", _handle_firmware_logs)
     app.router.add_get("/device/{device_id}/sync", _handle_device_sync)
     app.router.add_post("/device/{device_id}/logs", _handle_device_logs)
+    app.router.add_post("/device/{device_id}/settings", _handle_device_settings)
     app.router.add_get("/usage/{provider}", _handle_usage)
     app.router.add_get("/spend/{provider}", _handle_spend)
     app.router.add_get("/firmware/{name}", _handle_firmware)
@@ -703,6 +704,111 @@ async def _handle_device_logs(req: web.Request) -> web.Response:
         log.warning("devlog append %s: %s", device_id, e)
         return _error(500, "log store error")
     return web.json_response({"stored": len(lines)}, status=202)
+
+
+async def _handle_device_settings(req: web.Request) -> web.Response:
+    """Apply a device-reported display-settings update to the registry
+    (compat/SETTINGS_REPORT.md). The device owns these fields, so this
+    converges the broker's stored config — no version bump, no reverts. Auth is
+    identical to /logs; the signature does not cover the body."""
+    cfg: Config = req.app["cfg"]
+    cache: auth.NonceCache = req.app["cache"]
+    registry: Registry | None = req.app["registry"]
+    if registry is None:
+        return _error(404, "device registry not configured")
+
+    device_id = req.match_info["device_id"]
+    if not valid_device_id(device_id):
+        return _error(400, "invalid device_id")
+
+    try:
+        active, pending = registry.psks_for(device_id)
+    except NotFound:
+        return _error(404, "unknown device")
+    except Exception as e:
+        log.warning("registry lookup %s: %s", device_id, e)
+        return _error(500, "registry error")
+
+    signed_path = req.path
+    try:
+        auth.verify_multi(
+            [active, pending],
+            "POST", signed_path,
+            req.headers.get("X-Cwm-Timestamp", ""),
+            req.headers.get("X-Cwm-Nonce", ""),
+            req.headers.get("X-Cwm-Signature", ""),
+            req.headers.get("X-Cwm-Device", ""),
+            req.headers.get("X-Cwm-Config-Version", ""),
+            cache,
+            cfg.security.max_timestamp_skew_seconds,
+        )
+    except auth.AuthError as e:
+        log.info("auth rejected /device/%s/settings from %s: %s", device_id, req.remote, e)
+        return _error(401, "unauthorized")
+
+    if req.content_length is not None and req.content_length > 512:
+        return _error(400, "bad settings body")
+    raw = await req.read()
+    if len(raw) > 512:
+        return _error(400, "bad settings body")
+    try:
+        text = raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return _error(400, "bad settings body")
+    # Canonical body handling shared with the Go/JS brokers: an empty
+    # (or whitespace-only) body is a no-op; anything present must be a single
+    # JSON object; null / arrays / scalars are rejected.
+    if text == "":
+        return web.Response(status=204)
+    try:
+        body = json.loads(text)
+    except ValueError:
+        return _error(400, "bad settings body")
+    if not isinstance(body, dict):
+        return _error(400, "bad settings body")
+
+    # Type-validate the way Go's strongly-typed json.Decode does: a wrong JSON
+    # type or an out-of-uint-range value is a 400, not a silent coercion.
+    def _uint(key: str, max_v: int) -> int | None:
+        v = body.get(key)
+        if v is None:
+            return None
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0 or v > max_v:
+            raise ValueError(f"bad {key}")
+        return v
+
+    try:
+        theme_mode = body.get("theme_mode")
+        if theme_mode is not None and not isinstance(theme_mode, str):
+            raise ValueError("bad theme_mode")
+        br_day = _uint("br_day", 255)
+        br_night = _uint("br_night", 255)
+        vol = _uint("vol", 255)
+        autorotate_enabled = body.get("autorotate_enabled")
+        if autorotate_enabled is not None and not isinstance(autorotate_enabled, bool):
+            raise ValueError("bad autorotate_enabled")
+        autorotate_interval_s = _uint("autorotate_interval_s", 65535)
+    except ValueError:
+        return _error(400, "bad settings body")
+
+    try:
+        registry.report_settings(
+            device_id,
+            theme_mode=theme_mode,
+            br_day=br_day,
+            br_night=br_night,
+            vol=vol,
+            autorotate_enabled=autorotate_enabled,
+            autorotate_interval_s=autorotate_interval_s,
+        )
+    except NotFound:
+        return _error(404, "unknown device")
+    except (ValueError, TypeError):
+        return _error(400, "bad settings body")
+    except Exception as e:
+        log.warning("report settings %s: %s", device_id, e)
+        return _error(500, "registry error")
+    return web.Response(status=204)
 
 
 def _parse_uint32(s: str) -> int:

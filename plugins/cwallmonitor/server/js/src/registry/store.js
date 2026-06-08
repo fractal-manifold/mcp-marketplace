@@ -142,6 +142,25 @@ export class Registry {
     });
   }
 
+  // reportSettings applies device-reported display settings (theme / brightness
+  // / volume / autorotate) to the stored config WITHOUT bumping the version.
+  // The device owns these fields (the user sets them on-screen), so the broker
+  // mirrors them into Active — and into a queued Pending, if any, so an in-flight
+  // OTA/config change does not re-introduce the stale value on promotion.
+  // See compat/SETTINGS_REPORT.md.
+  reportSettings(id, s) {
+    if (!validDeviceID(id)) throw new RegistryError(`registry: invalid device_id ${JSON.stringify(id)}`);
+    return this._withLock(id, () => {
+      const dev = this._loadLocked(id);
+      let changed = applyReported(dev.active.payload, s);
+      if (dev.pending) {
+        changed = applyReported(dev.pending.payload, s) || changed;
+      }
+      if (changed) this._saveLocked(dev);
+      return dev;
+    });
+  }
+
   maybePromote(id, observedVersion, usedPendingPSK) {
     if (!validDeviceID(id)) throw new RegistryError(`registry: invalid device_id ${JSON.stringify(id)}`);
     return this._withLock(id, () => {
@@ -406,6 +425,38 @@ function deviceFromTOML(text) {
     active,
     pending,
   };
+}
+
+// applyReported overlays device-owned fields onto a payload, clamping numeric
+// ranges and ignoring an unknown theme_mode. Returns true if anything changed.
+// Operator-owned fields (city, providers, firmware, psk, ...) are never touched.
+function applyReported(p, s) {
+  let changed = false;
+  const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+  if (s.theme_mode === "day" || s.theme_mode === "night" || s.theme_mode === "auto") {
+    if (p.theme_mode !== s.theme_mode) { p.theme_mode = s.theme_mode; changed = true; }
+  }
+  if (s.br_day != null) {
+    const v = clamp(Math.trunc(Number(s.br_day)), 10, 100);
+    if (p.br_day !== v) { p.br_day = v; changed = true; }
+  }
+  if (s.br_night != null) {
+    const v = clamp(Math.trunc(Number(s.br_night)), 5, 100);
+    if (p.br_night !== v) { p.br_night = v; changed = true; }
+  }
+  if (s.vol != null) {
+    const v = clamp(Math.trunc(Number(s.vol)), 0, 100);
+    if (p.vol !== v) { p.vol = v; changed = true; }
+  }
+  if (s.autorotate_enabled != null) {
+    const b = Boolean(s.autorotate_enabled);
+    if (p.autorotate_enabled !== b) { p.autorotate_enabled = b; changed = true; }
+  }
+  if (s.autorotate_interval_s != null) {
+    const v = clamp(Math.trunc(Number(s.autorotate_interval_s)), 1, 300);
+    if (p.autorotate_interval_s !== v) { p.autorotate_interval_s = v; changed = true; }
+  }
+  return changed;
 }
 
 function mergePayload(base, upd) {

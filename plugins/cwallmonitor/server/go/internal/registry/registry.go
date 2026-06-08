@@ -464,6 +464,111 @@ func (r *Registry) SetPending(deviceID string, update ConfigPayload) (*Device, e
 	return out, err
 }
 
+// ReportedSettings carries the device-owned display settings a device reports
+// via POST /device/{id}/settings (see compat/SETTINGS_REPORT.md). Each field
+// is a pointer so a nil means "device did not report this — leave it".
+type ReportedSettings struct {
+	ThemeMode           *string
+	BrDay               *uint8
+	BrNight             *uint8
+	Vol                 *uint8
+	AutorotateEnabled   *bool
+	AutorotateIntervalS *uint16
+}
+
+// applyReported overlays the reported device-owned fields onto a payload,
+// clamping numeric ranges and ignoring an unknown theme_mode. Returns true if
+// any field actually changed. Only display settings are touched — operator-
+// owned fields (providers, city, firmware, psk, ...) are never affected.
+func applyReported(p *ConfigPayload, s ReportedSettings) bool {
+	changed := false
+	if s.ThemeMode != nil {
+		switch *s.ThemeMode {
+		case "day", "night", "auto":
+			if p.ThemeMode != *s.ThemeMode {
+				p.ThemeMode = *s.ThemeMode
+				changed = true
+			}
+		}
+	}
+	clampSet := func(dst **uint8, v uint8, lo, hi uint8) {
+		if v < lo {
+			v = lo
+		}
+		if v > hi {
+			v = hi
+		}
+		if *dst == nil || **dst != v {
+			nv := v
+			*dst = &nv
+			changed = true
+		}
+	}
+	if s.BrDay != nil {
+		clampSet(&p.BrDay, *s.BrDay, 10, 100)
+	}
+	if s.BrNight != nil {
+		clampSet(&p.BrNight, *s.BrNight, 5, 100)
+	}
+	if s.Vol != nil {
+		clampSet(&p.Vol, *s.Vol, 0, 100)
+	}
+	if s.AutorotateEnabled != nil {
+		if p.AutorotateEnabled == nil || *p.AutorotateEnabled != *s.AutorotateEnabled {
+			v := *s.AutorotateEnabled
+			p.AutorotateEnabled = &v
+			changed = true
+		}
+	}
+	if s.AutorotateIntervalS != nil {
+		v := *s.AutorotateIntervalS
+		if v < 1 {
+			v = 1
+		}
+		if v > 300 {
+			v = 300
+		}
+		if p.AutorotateIntervalS == nil || *p.AutorotateIntervalS != v {
+			nv := v
+			p.AutorotateIntervalS = &nv
+			changed = true
+		}
+	}
+	return changed
+}
+
+// ReportSettings applies device-reported display settings to the stored config
+// WITHOUT bumping the version. The device is the authority for these fields
+// (the user sets them on the screen), so the broker mirrors them into Active —
+// and into a queued Pending, if any, so an in-flight OTA/config change does not
+// re-introduce the stale value on promotion. See compat/SETTINGS_REPORT.md.
+func (r *Registry) ReportSettings(deviceID string, s ReportedSettings) (*Device, error) {
+	if !ValidDeviceID(deviceID) {
+		return nil, fmt.Errorf("registry: invalid device_id %q", deviceID)
+	}
+	var out *Device
+	err := r.withLock(deviceID, func(p string) error {
+		dev, err := r.loadLocked(p)
+		if err != nil {
+			return err
+		}
+		changed := applyReported(&dev.Active.ConfigPayload, s)
+		if dev.Pending != nil {
+			// Keep the queued pending in sync too, but never let it collapse
+			// to "no change" here — that is MaybePromote's job.
+			changed = applyReported(&dev.Pending.ConfigPayload, s) || changed
+		}
+		if changed {
+			if err := r.saveLocked(dev, p); err != nil {
+				return err
+			}
+		}
+		out = dev
+		return nil
+	})
+	return out, err
+}
+
 // MaybePromote moves pending → active when the device proves it has
 // applied the candidate. Promotion happens when observedVersion
 // matches pending.Version AND either:
