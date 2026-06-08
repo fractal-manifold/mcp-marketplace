@@ -65,13 +65,19 @@ class PriceTable:
         r = self.rates.get(base)
         if r is not None:
             return r
-        best: Rate | None = None
-        best_len = 0
-        for key, rr in self.rates.items():
+        # Deterministic across runtimes: longest basename match, ties broken
+        # by the lexicographically smallest full key. Dict insertion order
+        # (Py), object key order (JS) and randomized map order (Go) must not
+        # influence which rate wins. See compat/SPEND_WIRE.md.
+        best_key: str | None = None
+        best_len = -1
+        for key in self.rates:
             k = _basename(key)
-            if (base.startswith(k) or k.startswith(base)) and len(k) > best_len:
-                best, best_len = rr, len(k)
-        return best
+            if not (base.startswith(k) or k.startswith(base)):
+                continue
+            if len(k) > best_len or (len(k) == best_len and (best_key is None or key < best_key)):
+                best_key, best_len = key, len(k)
+        return self.rates[best_key] if best_key is not None else None
 
     def cost_for(self, model: str, b: "Bundle") -> float:
         r = self.rate_for(model)

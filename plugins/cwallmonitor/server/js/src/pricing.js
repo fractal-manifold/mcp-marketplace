@@ -71,16 +71,22 @@ export class PriceTable {
     if (this.map[model]) return this.map[model];
     const base = model.includes("/") ? model.slice(model.lastIndexOf("/") + 1) : model;
     if (this.map[base]) return this.map[base];
-    let best = null;
-    let bestLen = 0;
+    // Deterministic across runtimes: prefer the longest basename match,
+    // breaking ties by the lexicographically smallest full key. Object key
+    // order (JS), dict insertion order (Py) and map iteration order (Go,
+    // randomized) must NOT influence which rate wins, or the per-model USD
+    // would diverge between the three impls. See compat/SPEND_WIRE.md.
+    let bestKey = null;
+    let bestLen = -1;
     for (const key of Object.keys(this.map)) {
       const k = key.includes("/") ? key.slice(key.lastIndexOf("/") + 1) : key;
-      if ((base.startsWith(k) || k.startsWith(base)) && k.length > bestLen) {
-        best = this.map[key];
+      if (!(base.startsWith(k) || k.startsWith(base))) continue;
+      if (k.length > bestLen || (k.length === bestLen && (bestKey === null || key < bestKey))) {
+        bestKey = key;
         bestLen = k.length;
       }
     }
-    return best;
+    return bestKey === null ? null : this.map[bestKey];
   }
 
   // USD cost for a token bundle. Returns 0 (not null) when the model is

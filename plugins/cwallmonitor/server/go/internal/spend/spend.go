@@ -517,6 +517,12 @@ func codexHasSubscription(authPath string) bool {
 	if json.Unmarshal(raw, &doc) != nil {
 		return false
 	}
+	// has_subscription = "quota-based view (%)" vs "pay-as-you-go ($)", NOT
+	// "paid plan". A ChatGPT OAuth login consumes against the ChatGPT plan's
+	// quota (free or paid alike) → keep showing %. A bare API key is billed
+	// per token → show $. We do not distinguish free vs paid ChatGPT: that
+	// needs a remote plan_type call, which this local-only endpoint never
+	// makes. See compat/SPEND_WIRE.md → Subscription detection.
 	for _, k := range []string{"tokens", "access_token", "OPENAI_ACCESS_TOKEN"} {
 		if _, ok := doc[k]; ok {
 			return true
@@ -570,8 +576,18 @@ func (p *providerSpend) Fetch(ctx context.Context, now time.Time) (Snapshot, err
 	snap.PricingSource = table.Source
 	snap.PricingStale = table.Stale
 
+	// Sum in sorted-key order so the float accumulation order matches the
+	// JS/Py impls. Go map iteration is randomized, and float addition is not
+	// associative, so an unordered sum could round to a different cent both
+	// run-to-run and across runtimes. See compat/SPEND_WIRE.md.
 	priceMap := func(m map[string]*Bundle) (usd float64, tokens uint64) {
-		for model, b := range m {
+		keys := make([]string, 0, len(m))
+		for model := range m {
+			keys = append(keys, model)
+		}
+		sort.Strings(keys)
+		for _, model := range keys {
+			b := m[model]
 			usd += table.CostFor(model, *b)
 			tokens += b.total()
 		}
@@ -638,6 +654,11 @@ type Cache struct {
 	mu        sync.Mutex
 	entries   map[string]cacheEntry
 	inFlights map[string]chan cacheResult
+	// results holds the outcome of the most recent in-flight fetch per
+	// provider, published just before its channel is closed. Closing a
+	// channel wakes ALL waiters (a buffered send only reaches one), so the
+	// waiters read the shared result from here instead of off the channel.
+	results map[string]cacheResult
 }
 
 type cacheEntry struct {
@@ -654,6 +675,7 @@ func NewCache(ttl time.Duration, fetchers map[string]Fetcher) *Cache {
 	return &Cache{
 		ttl: ttl, now: time.Now, fetchers: fetchers,
 		entries: map[string]cacheEntry{}, inFlights: map[string]chan cacheResult{},
+		results: map[string]cacheResult{},
 	}
 }
 
@@ -676,13 +698,16 @@ func (c *Cache) Get(ctx context.Context, provider string) (Snapshot, error) {
 	if ch, busy := c.inFlights[provider]; busy {
 		c.mu.Unlock()
 		select {
-		case res := <-ch:
+		case <-ch: // closed by the leader once results[provider] is published
+			c.mu.Lock()
+			res := c.results[provider]
+			c.mu.Unlock()
 			return res.snap, res.err
 		case <-ctx.Done():
 			return Snapshot{}, ctx.Err()
 		}
 	}
-	ch := make(chan cacheResult, 1)
+	ch := make(chan cacheResult) // used only as a broadcast signal via close
 	c.inFlights[provider] = ch
 	c.mu.Unlock()
 
@@ -690,22 +715,23 @@ func (c *Cache) Get(ctx context.Context, provider string) (Snapshot, error) {
 	now := c.now()
 	c.mu.Lock()
 	delete(c.inFlights, provider)
+	var res cacheResult
 	if err == nil {
 		snap.FetchedAtUnix = now.Unix()
 		snap.StaleSeconds = 0
 		c.entries[provider] = cacheEntry{snap: snap, fetched: now, hasValue: true}
+		res = cacheResult{snap, nil}
 	} else if e.hasValue {
 		stale := e.snap
 		stale.StaleSeconds = uint32(now.Sub(e.fetched) / time.Second)
-		c.mu.Unlock()
-		ch <- cacheResult{stale, err}
-		close(ch)
-		return stale, err
+		res = cacheResult{stale, err}
+	} else {
+		res = cacheResult{snap, err}
 	}
+	c.results[provider] = res
 	c.mu.Unlock()
-	ch <- cacheResult{snap, err}
-	close(ch)
-	return snap, err
+	close(ch) // wake every waiter; they read c.results under the lock
+	return res.snap, res.err
 }
 
 func (c *Cache) Providers() []string {
@@ -770,7 +796,10 @@ func BuildCache(c SpendConfig, logger Logger) *Cache {
 			root:      c.GeminiTmp,
 			match:     func(n string) bool { return strings.HasPrefix(n, "session-") && strings.HasSuffix(n, ".jsonl") },
 			parse:     geminiRecords,
-			hasSub:    func() bool { return false },
+			// Always $ for Gemini: free Code-Assist and a paid tier both write
+			// the same local oauth_creds.json, so they can't be told apart
+			// without a remote call. Default to computed $ rather than guess.
+			hasSub: func() bool { return false },
 			pricing:   pricing,
 			fileCache: newFileRecordCache(),
 		}

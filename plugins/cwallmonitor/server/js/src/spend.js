@@ -281,7 +281,11 @@ function claudeHasSubscription(credsPath) {
 function codexHasSubscription(authPath) {
   const doc = readJSONFile(authPath);
   if (!doc) return false;
-  // ChatGPT login (tokens present) implies a plan; a bare API key does not.
+  // has_subscription = "quota-based view (%)" vs "pay-as-you-go ($)", NOT
+  // "paid plan". A ChatGPT OAuth login consumes against the ChatGPT plan's
+  // quota (free or paid alike) → keep %. A bare API key is per-token → $.
+  // Free vs paid ChatGPT is intentionally not distinguished (needs a remote
+  // plan_type call). See compat/SPEND_WIRE.md → Subscription detection.
   if (doc.tokens || doc.access_token || doc.OPENAI_ACCESS_TOKEN) return true;
   return false;
 }
@@ -321,9 +325,14 @@ class ProviderSpend {
     snap.pricing_source = table.source;
     snap.pricing_stale = table.stale;
 
+    // Sum in sorted-key order so the float accumulation order is identical
+    // across runtimes (float addition is not associative, so an unordered
+    // sum could round to a different cent under Go's randomized map order or
+    // a differently-discovered file order). See compat/SPEND_WIRE.md.
     const priceMap = (map) => {
       let usd = 0, tokens = 0;
-      for (const [model, b] of map) {
+      for (const model of [...map.keys()].sort()) {
+        const b = map.get(model);
         usd += table.costFor(model, b);
         tokens += bundleTotal(b);
       }
@@ -348,7 +357,11 @@ class ProviderSpend {
         _tot: bundleTotal(b),
       });
     }
-    rows.sort((a, b) => (b.usd - a.usd) || (b._tot - a._tot) || a.model.localeCompare(b.model));
+    // Code-point compare for the final tie-break (NOT localeCompare, which is
+    // locale-dependent and would order rows differently than Go's `<` / Py's
+    // str compare on some hosts). Keeps row order identical across runtimes.
+    rows.sort((a, b) => (b.usd - a.usd) || (b._tot - a._tot)
+      || (a.model < b.model ? -1 : a.model > b.model ? 1 : 0));
     snap.models = foldModels(rows);
     return snap;
   }
@@ -460,7 +473,10 @@ export function buildSpendCache(cfg, { logger } = {}) {
       root: cfg.geminiTmpPathAbs(),
       fileMatch: (n) => n.startsWith("session-") && n.endsWith(".jsonl"),
       parse: geminiRecords,
-      hasSub: () => false, // paid Code-Assist needs a remote call; default $ mode
+      // Always $ for Gemini: free Code-Assist and a paid tier both write the
+      // same local oauth_creds.json, so they can't be told apart without a
+      // remote call. Default to computed $ rather than guess.
+      hasSub: () => false,
       pricing,
     });
   }

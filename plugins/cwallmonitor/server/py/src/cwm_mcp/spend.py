@@ -383,6 +383,11 @@ def claude_has_subscription(creds_path: str) -> bool:
 
 
 def codex_has_subscription(auth_path: str) -> bool:
+    # has_subscription = "quota-based view (%)" vs "pay-as-you-go ($)", NOT
+    # "paid plan". A ChatGPT OAuth login consumes against the ChatGPT plan's
+    # quota (free or paid alike) -> keep %. A bare API key is per-token -> $.
+    # Free vs paid ChatGPT is intentionally not distinguished (needs a remote
+    # plan_type call). See compat/SPEND_WIRE.md -> Subscription detection.
     doc = _read_json(auth_path)
     if not isinstance(doc, dict):
         return False
@@ -443,10 +448,15 @@ class ProviderSpend:
         snap.pricing_source = table.source
         snap.pricing_stale = table.stale
 
+        # Sum in sorted-key order so the float accumulation order matches the
+        # Go/JS impls. Float addition is not associative, so an unordered sum
+        # could round to a different cent under Go's randomized map order or a
+        # differently-discovered file order. See compat/SPEND_WIRE.md.
         def price_map(m: dict[str, Bundle]) -> tuple[float, int]:
             usd = 0.0
             tokens = 0
-            for model, b in m.items():
+            for model in sorted(m):
+                b = m[model]
                 usd += table.cost_for(model, b)
                 tokens += b.total()
             return usd, tokens
@@ -591,6 +601,9 @@ def build_cache(cfg, logger=None) -> Cache | None:
             root=cfg.gemini_tmp_path_abs(),
             match=lambda n: n.startswith("session-") and n.endswith(".jsonl"),
             parse=gemini_records,
+            # Always $ for Gemini: free Code-Assist and a paid tier both write
+            # the same local oauth_creds.json, so they can't be told apart
+            # without a remote call. Default to computed $ rather than guess.
             has_sub=lambda: False,
             pricing=pricing,
         )

@@ -73,16 +73,27 @@ func (t *PriceTable) RateFor(model string) (Rate, bool) {
 	if r, ok := t.rates[base]; ok {
 		return r, true
 	}
-	var best Rate
-	bestLen := 0
+	// Deterministic across runtimes: longest basename match, ties broken by
+	// the lexicographically smallest full key. Go map iteration is randomized,
+	// so without an explicit tie-break the chosen rate (and thus the per-model
+	// USD) would differ run-to-run and from the JS/Py impls. See
+	// compat/SPEND_WIRE.md.
+	bestKey := ""
+	bestLen := -1
 	found := false
-	for key, r := range t.rates {
+	for key := range t.rates {
 		k := basename(key)
-		if (strings.HasPrefix(base, k) || strings.HasPrefix(k, base)) && len(k) > bestLen {
-			best, bestLen, found = r, len(k), true
+		if !(strings.HasPrefix(base, k) || strings.HasPrefix(k, base)) {
+			continue
+		}
+		if len(k) > bestLen || (len(k) == bestLen && (!found || key < bestKey)) {
+			bestKey, bestLen, found = key, len(k), true
 		}
 	}
-	return best, found
+	if found {
+		return t.rates[bestKey], true
+	}
+	return Rate{}, false
 }
 
 // CostFor returns USD for a token bundle; 0 when the model is unpriced
