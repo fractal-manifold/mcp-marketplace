@@ -69,9 +69,19 @@ section" or "the Audio settings".
 
 | User intent                       | MCP argument               | Valid range / format               |
 | --------------------------------- | -------------------------- | ---------------------------------- |
-| Enable Claude provider            | `provider_claude`          | bool                               |
-| Enable Codex provider             | `provider_codex`           | bool                               |
-| Enable Gemini provider            | `provider_gemini`          | bool                               |
+| Set Claude provider mode          | `provider_mode_claude`     | `auto` \| `disabled` \| `subscription` \| `api_key` |
+| Set Codex provider mode           | `provider_mode_codex`      | `auto` \| `disabled` \| `subscription` \| `api_key` |
+| Set Gemini provider mode          | `provider_mode_gemini`     | `auto` \| `disabled` \| `subscription` \| `api_key` |
+| Enable/disable Claude (coarse)    | `provider_claude`          | bool (legacy: true→auto, false→disabled) |
+| Enable/disable Codex (coarse)     | `provider_codex`           | bool (legacy: true→auto, false→disabled) |
+| Enable/disable Gemini (coarse)    | `provider_gemini`          | bool (legacy: true→auto, false→disabled) |
+
+Mode meanings: `disabled` hides the provider; `auto` trusts the broker's
+credential detection (subscription vs pay-as-you-go); `subscription` forces
+the dashboard's quota-% view; `api_key` forces the $-spend view. The
+`provider_mode_*` arg wins over `provider_*` when both are given. "Disable
+Codex" → `provider_mode_codex=disabled`; "show Claude as API spend" →
+`provider_mode_claude=api_key`.
 
 #### Display
 

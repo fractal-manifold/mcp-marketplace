@@ -50,14 +50,87 @@ import (
 // as v3 on the next save.
 const SchemaVersion = 3
 
-// ProviderSet mirrors the firmware's per-provider NVS toggles (NVS keys
-// prov_claude, prov_codex, prov_gemini). Stored as plain bools so an
-// omitted field unambiguously means "no change requested" when used in
-// a partial update (see SetPending).
+// ProviderSet is the LEGACY per-provider enable bool (NVS keys prov_*).
+// It survives only so old on-disk device TOMLs ([active.providers] with
+// bool values) and the bool provision/MCP args still decode; loadLocked
+// migrates it into ProviderModes and never writes it again. New code must
+// use ProviderModes.
 type ProviderSet struct {
 	Claude bool `toml:"claude"`
 	Codex  bool `toml:"codex"`
 	Gemini bool `toml:"gemini"`
+}
+
+// ProviderMode is the per-provider mode that replaced the enable bool. The
+// firmware persists the same four values as an NVS u8 (0..3); the broker
+// keeps them as strings so the wire and TOML stay human-readable. "auto"
+// trusts the broker's credential detection; "subscription" / "api_key" are
+// device-side display overrides; "disabled" hides the provider.
+type ProviderMode string
+
+const (
+	ProviderModeDisabled     ProviderMode = "disabled"
+	ProviderModeAuto         ProviderMode = "auto"
+	ProviderModeSubscription ProviderMode = "subscription"
+	ProviderModeAPIKey       ProviderMode = "api_key"
+)
+
+// Enabled reports whether a provider in this mode is polled / shown. An
+// empty string is treated as disabled (it only arises from a half-built
+// set, which we never emit).
+func (m ProviderMode) Enabled() bool {
+	return m != "" && m != ProviderModeDisabled
+}
+
+// ValidProviderMode reports whether s is one of the four canonical modes.
+func ValidProviderMode(s string) bool {
+	switch ProviderMode(s) {
+	case ProviderModeDisabled, ProviderModeAuto, ProviderModeSubscription, ProviderModeAPIKey:
+		return true
+	}
+	return false
+}
+
+// ProviderModeFromBool maps a legacy enable bool onto a mode: true → auto,
+// false → disabled. Used when migrating old records and when an operator
+// uses the coarse bool provision/MCP args.
+func ProviderModeFromBool(b bool) ProviderMode {
+	if b {
+		return ProviderModeAuto
+	}
+	return ProviderModeDisabled
+}
+
+// ProviderModeSet is the per-provider mode triple stored under the TOML
+// table [<section>.provider_modes] and emitted on the /sync wire as the
+// "provider_modes" object (alongside a derived legacy "providers" bool map).
+type ProviderModeSet struct {
+	Claude ProviderMode `toml:"claude"`
+	Codex  ProviderMode `toml:"codex"`
+	Gemini ProviderMode `toml:"gemini"`
+}
+
+// providerSetToModes lifts a legacy bool set into a mode set (nil-safe).
+func providerSetToModes(p *ProviderSet) *ProviderModeSet {
+	if p == nil {
+		return nil
+	}
+	return &ProviderModeSet{
+		Claude: ProviderModeFromBool(p.Claude),
+		Codex:  ProviderModeFromBool(p.Codex),
+		Gemini: ProviderModeFromBool(p.Gemini),
+	}
+}
+
+// migrateProviderModes makes ProviderModes the single source of truth: a
+// legacy Providers bool set (from an old TOML file or a bool arg path) is
+// lifted into ProviderModes when the latter is absent, then dropped so it
+// is never re-serialised.
+func migrateProviderModes(p *ConfigPayload) {
+	if p.ProviderModes == nil && p.Providers != nil {
+		p.ProviderModes = providerSetToModes(p.Providers)
+	}
+	p.Providers = nil
 }
 
 // ConfigPayload is the set of values a config_sync delivery can carry.
@@ -73,7 +146,11 @@ type ConfigPayload struct {
 	BrDay                *uint8       `toml:"br_day,omitempty"`
 	BrNight              *uint8       `toml:"br_night,omitempty"`
 	Vol                  *uint8       `toml:"vol,omitempty"`
-	Providers            *ProviderSet `toml:"providers,omitempty"`
+	// Providers is the legacy bool set — read for migration only, never
+	// written (loadLocked folds it into ProviderModes). ProviderModes is
+	// the live per-provider mode triple.
+	Providers            *ProviderSet     `toml:"providers,omitempty"`
+	ProviderModes        *ProviderModeSet `toml:"provider_modes,omitempty"`
 	AutorotateEnabled    *bool        `toml:"autorotate_enabled,omitempty"`
 	AutorotateIntervalS  *uint16      `toml:"autorotate_interval_s,omitempty"`
 	// ThemeMode is the on-device palette mode: "day", "night", or "auto"
@@ -306,6 +383,12 @@ func (r *Registry) loadLocked(dataPath string) (*Device, error) {
 	// Canonicalise the channel so a hand-edited "STABLE"/"Dev" loads the
 	// same as the broker would have written it.
 	dev.Channel = normalizeChannel(dev.Channel)
+	// Fold any legacy [providers] bool table into provider_modes so the
+	// rest of the broker only ever sees the mode triple.
+	migrateProviderModes(&dev.Active.ConfigPayload)
+	if dev.Pending != nil {
+		migrateProviderModes(&dev.Pending.ConfigPayload)
+	}
 	return &dev, nil
 }
 
@@ -839,9 +922,15 @@ func mergePayload(base, upd ConfigPayload) ConfigPayload {
 		v := *upd.Vol
 		out.Vol = &v
 	}
-	if upd.Providers != nil {
-		ps := *upd.Providers
-		out.Providers = &ps
+	// Providers (legacy bool) and ProviderModes are merged via the mode
+	// set; a bool-only update is lifted so the canonical field wins.
+	if upd.ProviderModes != nil {
+		pm := *upd.ProviderModes
+		out.ProviderModes = &pm
+		out.Providers = nil
+	} else if upd.Providers != nil {
+		out.ProviderModes = providerSetToModes(upd.Providers)
+		out.Providers = nil
 	}
 	if upd.AutorotateEnabled != nil {
 		v := *upd.AutorotateEnabled
@@ -917,10 +1006,10 @@ func payloadEquivalent(a, b ConfigPayload) bool {
 	if !ptrU8Equal(a.Vol, b.Vol) {
 		return false
 	}
-	if (a.Providers == nil) != (b.Providers == nil) {
+	if (a.ProviderModes == nil) != (b.ProviderModes == nil) {
 		return false
 	}
-	if a.Providers != nil && *a.Providers != *b.Providers {
+	if a.ProviderModes != nil && *a.ProviderModes != *b.ProviderModes {
 		return false
 	}
 	if !ptrBoolEqual(a.AutorotateEnabled, b.AutorotateEnabled) {

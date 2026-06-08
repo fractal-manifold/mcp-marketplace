@@ -841,8 +841,18 @@ def _pending_payload_json(p) -> str:
         wire["br_night"] = int(p.br_night)
     if p.vol is not None:
         wire["vol"] = int(p.vol)
-    if p.providers is not None:
-        wire["providers"] = {"claude": p.providers.claude, "codex": p.providers.codex, "gemini": p.providers.gemini}
+    # Emit the rich provider_modes enum AND a derived legacy providers bool
+    # map. New firmware reads provider_modes; pre-mode-split firmware only
+    # understands the bool map. Both derive from the same source so they
+    # never disagree (enabled == mode is neither "" nor "disabled").
+    if p.provider_modes is not None:
+        pm = p.provider_modes
+        wire["provider_modes"] = {"claude": pm.claude, "codex": pm.codex, "gemini": pm.gemini}
+
+        def _en(m: str) -> bool:
+            return m not in ("", "disabled")
+
+        wire["providers"] = {"claude": _en(pm.claude), "codex": _en(pm.codex), "gemini": _en(pm.gemini)}
     if p.autorotate_enabled is not None:
         wire["autorotate_enabled"] = bool(p.autorotate_enabled)
     if p.autorotate_interval_s is not None:

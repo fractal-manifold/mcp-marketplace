@@ -106,6 +106,10 @@ class NotFound(RegistryError):
 
 @dataclass
 class ProviderSet:
+    """Legacy per-provider enable bool. Read for migration only — folded
+    into ProviderModeSet on load and never written again. Mirror of the Go
+    ProviderSet."""
+
     claude: bool = False
     codex: bool = False
     gemini: bool = False
@@ -120,6 +124,50 @@ class ProviderSet:
         return cls(claude=bool(d.get("claude")), codex=bool(d.get("codex")), gemini=bool(d.get("gemini")))
 
 
+# Per-provider mode that replaced the enable bool. "auto" trusts the
+# broker's credential detection; "subscription" / "api_key" are device-side
+# display overrides; "disabled" hides the provider. Mirror of Go.
+PROVIDER_MODES = ("disabled", "auto", "subscription", "api_key")
+
+
+def provider_mode_enabled(m: str | None) -> bool:
+    return m is not None and m != "" and m != "disabled"
+
+
+def valid_provider_mode(s: str) -> bool:
+    return s in PROVIDER_MODES
+
+
+def provider_mode_from_bool(b: bool) -> str:
+    return "auto" if b else "disabled"
+
+
+@dataclass
+class ProviderModeSet:
+    claude: str = "disabled"
+    codex: str = "disabled"
+    gemini: str = "disabled"
+
+    def to_dict(self) -> dict:
+        return {"claude": self.claude, "codex": self.codex, "gemini": self.gemini}
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "ProviderModeSet | None":
+        if d is None:
+            return None
+        return cls(claude=str(d.get("claude", "")), codex=str(d.get("codex", "")), gemini=str(d.get("gemini", "")))
+
+    @classmethod
+    def from_provider_set(cls, p: "ProviderSet | None") -> "ProviderModeSet | None":
+        if p is None:
+            return None
+        return cls(
+            claude=provider_mode_from_bool(p.claude),
+            codex=provider_mode_from_bool(p.codex),
+            gemini=provider_mode_from_bool(p.gemini),
+        )
+
+
 @dataclass
 class ConfigPayload:
     version: int = 0
@@ -129,7 +177,11 @@ class ConfigPayload:
     br_day: int | None = None
     br_night: int | None = None
     vol: int | None = None
+    # providers is the legacy bool set — read for migration only, never
+    # written (from_toml_dict folds it into provider_modes). provider_modes
+    # is the live per-provider mode triple.
     providers: ProviderSet | None = None
+    provider_modes: ProviderModeSet | None = None
     autorotate_enabled: bool | None = None
     autorotate_interval_s: int | None = None
     theme_mode: str = ""
@@ -171,8 +223,10 @@ class ConfigPayload:
             d["br_night"] = int(self.br_night)
         if self.vol is not None:
             d["vol"] = int(self.vol)
-        if self.providers is not None:
-            d["providers"] = self.providers.to_dict()
+        # provider_modes is canonical; the legacy providers bool table is
+        # never written (load migrates it).
+        if self.provider_modes is not None:
+            d["provider_modes"] = self.provider_modes.to_dict()
         if self.autorotate_enabled is not None:
             d["autorotate_enabled"] = bool(self.autorotate_enabled)
         if self.autorotate_interval_s is not None:
@@ -208,7 +262,14 @@ class ConfigPayload:
             br_day=int(d["br_day"]) if "br_day" in d else None,
             br_night=int(d["br_night"]) if "br_night" in d else None,
             vol=int(d["vol"]) if "vol" in d else None,
-            providers=ProviderSet.from_dict(d.get("providers")),
+            # Canonical field is provider_modes; fold any legacy providers
+            # bool table into it and drop the bool so it is never re-emitted.
+            providers=None,
+            provider_modes=(
+                ProviderModeSet.from_dict(d.get("provider_modes"))
+                if d.get("provider_modes") is not None
+                else ProviderModeSet.from_provider_set(ProviderSet.from_dict(d.get("providers")))
+            ),
             autorotate_enabled=d["autorotate_enabled"] if "autorotate_enabled" in d else None,
             autorotate_interval_s=int(d["autorotate_interval_s"]) if "autorotate_interval_s" in d else None,
             theme_mode=str(d.get("theme_mode", "")),
@@ -651,7 +712,12 @@ def _merge_payload(base: ConfigPayload, upd: ConfigPayload) -> ConfigPayload:
         br_day=upd.br_day if upd.br_day is not None and upd.br_day != 0 else base.br_day,
         br_night=upd.br_night if upd.br_night is not None and upd.br_night != 0 else base.br_night,
         vol=upd.vol if upd.vol is not None else base.vol,
-        providers=upd.providers if upd.providers is not None else base.providers,
+        providers=None,
+        provider_modes=(
+            upd.provider_modes
+            if upd.provider_modes is not None
+            else (ProviderModeSet.from_provider_set(upd.providers) if upd.providers is not None else base.provider_modes)
+        ),
         autorotate_enabled=upd.autorotate_enabled if upd.autorotate_enabled is not None else base.autorotate_enabled,
         autorotate_interval_s=upd.autorotate_interval_s if upd.autorotate_interval_s is not None else base.autorotate_interval_s,
         theme_mode=upd.theme_mode or base.theme_mode,
@@ -678,10 +744,12 @@ def _payload_equivalent(a: ConfigPayload, b: ConfigPayload) -> bool:
         or a.vol != b.vol
     ):
         return False
-    if (a.providers is None) != (b.providers is None):
+    if (a.provider_modes is None) != (b.provider_modes is None):
         return False
-    if a.providers is not None and (
-        a.providers.claude != b.providers.claude or a.providers.codex != b.providers.codex or a.providers.gemini != b.providers.gemini
+    if a.provider_modes is not None and (
+        a.provider_modes.claude != b.provider_modes.claude
+        or a.provider_modes.codex != b.provider_modes.codex
+        or a.provider_modes.gemini != b.provider_modes.gemini
     ):
         return False
     if (a.autorotate_enabled is None) != (b.autorotate_enabled is None):

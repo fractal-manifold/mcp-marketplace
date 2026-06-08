@@ -744,11 +744,20 @@ func pendingPayloadJSON(p registry.ConfigPayload) ([]byte, error) {
 		// must be able to receive; only nil means "no change".
 		wire["vol"] = *p.Vol
 	}
-	if p.Providers != nil {
+	// Providers: emit the rich provider_modes enum AND a derived legacy
+	// providers bool map. New firmware consumes provider_modes; firmware
+	// from before the mode split only understands the bool map. Both are
+	// derived from the same ProviderModes source so they never disagree.
+	if pm := p.ProviderModes; pm != nil {
+		wire["provider_modes"] = map[string]string{
+			"claude": string(pm.Claude),
+			"codex":  string(pm.Codex),
+			"gemini": string(pm.Gemini),
+		}
 		wire["providers"] = map[string]bool{
-			"claude": p.Providers.Claude,
-			"codex":  p.Providers.Codex,
-			"gemini": p.Providers.Gemini,
+			"claude": pm.Claude.Enabled(),
+			"codex":  pm.Codex.Enabled(),
+			"gemini": pm.Gemini.Enabled(),
 		}
 	}
 	if p.AutorotateEnabled != nil {

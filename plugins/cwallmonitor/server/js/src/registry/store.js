@@ -272,11 +272,29 @@ export class Registry {
   }
 }
 
+// Per-provider mode helpers — mirror of the Go registry. "auto" trusts the
+// broker's credential detection; "subscription"/"api_key" are device-side
+// display overrides; "disabled" hides the provider. The legacy bool set
+// (providers) is read for migration only and lifted into provider_modes.
+export function providerModeEnabled(m) { return m != null && m !== "" && m !== "disabled"; }
+export function validProviderMode(s) {
+  return s === "disabled" || s === "auto" || s === "subscription" || s === "api_key";
+}
+export function providerModeFromBool(b) { return b ? "auto" : "disabled"; }
+function providersToModes(p) {
+  if (p == null) return null;
+  return {
+    claude: providerModeFromBool(!!p.claude),
+    codex: providerModeFromBool(!!p.codex),
+    gemini: providerModeFromBool(!!p.gemini),
+  };
+}
+
 function emptyPayload() {
   return {
     version: 0, broker_url: "", psk_hex: "", city: "",
     br_day: 0, br_night: 0, vol: 0,
-    providers: null, autorotate_enabled: null, autorotate_interval_s: null,
+    providers: null, provider_modes: null, autorotate_enabled: null, autorotate_interval_s: null,
     theme_mode: "",
     // null = "no opinion" (use global default); [] = clear override.
     gemini_models: null,
@@ -302,8 +320,14 @@ function payloadToTomlObj(p) {
   if (p.br_day) d.br_day = Number(p.br_day);
   if (p.br_night) d.br_night = Number(p.br_night);
   if (p.vol) d.vol = Number(p.vol);
-  if (p.providers != null) {
-    d.providers = { claude: !!p.providers.claude, codex: !!p.providers.codex, gemini: !!p.providers.gemini };
+  // provider_modes is the canonical field; the legacy providers bool table
+  // is never written (loadLocked migrates it on read).
+  if (p.provider_modes != null) {
+    d.provider_modes = {
+      claude: String(p.provider_modes.claude || ""),
+      codex: String(p.provider_modes.codex || ""),
+      gemini: String(p.provider_modes.gemini || ""),
+    };
   }
   if (p.autorotate_enabled != null) d.autorotate_enabled = !!p.autorotate_enabled;
   if (p.autorotate_interval_s != null) d.autorotate_interval_s = Number(p.autorotate_interval_s);
@@ -331,7 +355,12 @@ function tomlObjToPayload(d) {
     br_day: Number(d.br_day || 0),
     br_night: Number(d.br_night || 0),
     vol: Number(d.vol || 0),
-    providers: d.providers ? { claude: !!d.providers.claude, codex: !!d.providers.codex, gemini: !!d.providers.gemini } : null,
+    // Canonical field is provider_modes; fold any legacy providers bool
+    // table into it and drop the bool so it is never re-emitted.
+    providers: null,
+    provider_modes: d.provider_modes
+      ? { claude: String(d.provider_modes.claude || ""), codex: String(d.provider_modes.codex || ""), gemini: String(d.provider_modes.gemini || "") }
+      : providersToModes(d.providers),
     autorotate_enabled: typeof d.autorotate_enabled === "boolean" ? d.autorotate_enabled : null,
     autorotate_interval_s: typeof d.autorotate_interval_s === "number" ? d.autorotate_interval_s : null,
     theme_mode: String(d.theme_mode || ""),
@@ -468,7 +497,10 @@ function mergePayload(base, upd) {
     br_day: (upd.br_day !== undefined && upd.br_day !== null && upd.br_day !== 0) ? upd.br_day : base.br_day,
     br_night: (upd.br_night !== undefined && upd.br_night !== null && upd.br_night !== 0) ? upd.br_night : base.br_night,
     vol: (upd.vol !== undefined && upd.vol !== null) ? upd.vol : base.vol,
-    providers: upd.providers != null ? upd.providers : base.providers,
+    providers: null,
+    provider_modes: upd.provider_modes != null
+      ? upd.provider_modes
+      : (upd.providers != null ? providersToModes(upd.providers) : (base.provider_modes ?? null)),
     autorotate_enabled: upd.autorotate_enabled != null ? upd.autorotate_enabled : base.autorotate_enabled,
     autorotate_interval_s: upd.autorotate_interval_s != null ? upd.autorotate_interval_s : base.autorotate_interval_s,
     theme_mode: upd.theme_mode || base.theme_mode,
@@ -489,8 +521,8 @@ function mergePayload(base, upd) {
 function payloadEquivalent(a, b) {
   if (a.broker_url !== b.broker_url || a.psk_hex !== b.psk_hex || a.city !== b.city) return false;
   if (a.br_day !== b.br_day || a.br_night !== b.br_night || a.vol !== b.vol) return false;
-  if ((a.providers == null) !== (b.providers == null)) return false;
-  if (a.providers != null && (a.providers.claude !== b.providers.claude || a.providers.codex !== b.providers.codex || a.providers.gemini !== b.providers.gemini)) return false;
+  if ((a.provider_modes == null) !== (b.provider_modes == null)) return false;
+  if (a.provider_modes != null && (a.provider_modes.claude !== b.provider_modes.claude || a.provider_modes.codex !== b.provider_modes.codex || a.provider_modes.gemini !== b.provider_modes.gemini)) return false;
   if ((a.autorotate_enabled == null) !== (b.autorotate_enabled == null)) return false;
   if (a.autorotate_enabled != null && a.autorotate_enabled !== b.autorotate_enabled) return false;
   if ((a.autorotate_interval_s == null) !== (b.autorotate_interval_s == null)) return false;

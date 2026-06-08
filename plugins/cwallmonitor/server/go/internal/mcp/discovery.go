@@ -327,10 +327,12 @@ func handleProvision(d Deps) server.ToolHandlerFunc {
 				reg.Vol = &v
 			}
 			if payload.Providers != nil {
-				reg.Providers = &registry.ProviderSet{
-					Claude: payload.Providers["claude"],
-					Codex:  payload.Providers["codex"],
-					Gemini: payload.Providers["gemini"],
+				// Provisioning carries the coarse bool set; lift it into
+				// the canonical mode triple (true→auto, false→disabled).
+				reg.ProviderModes = &registry.ProviderModeSet{
+					Claude: registry.ProviderModeFromBool(payload.Providers["claude"]),
+					Codex:  registry.ProviderModeFromBool(payload.Providers["codex"]),
+					Gemini: registry.ProviderModeFromBool(payload.Providers["gemini"]),
 				}
 			}
 			_, err := d.Registry.Register(deviceID, reg)

@@ -20,7 +20,17 @@ from typing import Any
 from .. import auth, creds, devlog
 from ..config import Config
 from ..logbuf import Buffer
-from ..registry.store import NotFound, Registry, valid_device_id, ConfigPayload, ProviderSet, effective_channel
+from ..registry.store import (
+    NotFound,
+    Registry,
+    valid_device_id,
+    ConfigPayload,
+    ProviderModeSet,
+    provider_mode_enabled,
+    provider_mode_from_bool,
+    valid_provider_mode,
+    effective_channel,
+)
 from ..state import State
 
 log = logging.getLogger("cwm_mcp.mcp")
@@ -70,15 +80,15 @@ def _config_info(cfg: Config) -> dict:
     }
 
 
-def _provider_names(p: ProviderSet | None) -> list[str]:
+def _provider_names(p: ProviderModeSet | None) -> list[str]:
     if p is None:
         return []
     out = []
-    if p.claude:
+    if provider_mode_enabled(p.claude):
         out.append("claude")
-    if p.codex:
+    if provider_mode_enabled(p.codex):
         out.append("codex")
-    if p.gemini:
+    if provider_mode_enabled(p.gemini):
         out.append("gemini")
     return out
 
@@ -100,7 +110,7 @@ def _device_summary(dev) -> dict:
         out["active_broker_url"] = dev.active.payload.broker_url
     if dev.active.payload.city:
         out["active_city"] = dev.active.payload.city
-    names = _provider_names(dev.active.payload.providers)
+    names = _provider_names(dev.active.payload.provider_modes)
     if names:
         out["active_providers"] = names
     if dev.active.last_seen:
@@ -126,7 +136,7 @@ def _pending_changes(active: ConfigPayload, pending: ConfigPayload) -> list[str]
         diffs.append("br_night")
     if pending.vol and pending.vol != active.vol:
         diffs.append("vol")
-    if pending.providers is not None and (active.providers is None or pending.providers != active.providers):
+    if pending.provider_modes is not None and (active.provider_modes is None or pending.provider_modes != active.provider_modes):
         diffs.append("providers")
     if pending.autorotate_enabled is not None and (active.autorotate_enabled is None or pending.autorotate_enabled != active.autorotate_enabled):
         diffs.append("autorotate_enabled")
@@ -508,24 +518,35 @@ def _set_device_pending(deps: Deps, args: dict) -> dict:
                 setattr(update, k, _clamp(int(raw), lo, hi))
             except (TypeError, ValueError):
                 pass
-    has_provider = any(k in args for k in ("provider_claude", "provider_codex", "provider_gemini"))
-    if has_provider:
+    # Providers: accept the rich provider_mode_<p> string enum
+    # (auto/disabled/subscription/api_key) and/or the legacy provider_<p>
+    # bool (true→auto, false→disabled). The string arg wins over the bool.
+    prov_keys = (
+        "provider_claude", "provider_codex", "provider_gemini",
+        "provider_mode_claude", "provider_mode_codex", "provider_mode_gemini",
+    )
+    if any(k in args for k in prov_keys):
         try:
             cur = deps.registry.load(device_id)
         except Exception as e:
             return {"error": str(e)}
-        base = ProviderSet(claude=True)
-        if cur.pending is not None and cur.pending.payload.providers is not None:
-            base = ProviderSet(**vars(cur.pending.payload.providers))
-        elif cur.active.payload.providers is not None:
-            base = ProviderSet(**vars(cur.active.payload.providers))
-        if "provider_claude" in args:
-            base.claude = bool(args["provider_claude"])
-        if "provider_codex" in args:
-            base.codex = bool(args["provider_codex"])
-        if "provider_gemini" in args:
-            base.gemini = bool(args["provider_gemini"])
-        update.providers = base
+        if cur.pending is not None and cur.pending.payload.provider_modes is not None:
+            base = ProviderModeSet(**vars(cur.pending.payload.provider_modes))
+        elif cur.active.payload.provider_modes is not None:
+            base = ProviderModeSet(**vars(cur.active.payload.provider_modes))
+        else:
+            base = ProviderModeSet(claude="auto", codex="disabled", gemini="disabled")
+        for name in ("claude", "codex", "gemini"):
+            mode_key = f"provider_mode_{name}"
+            bool_key = f"provider_{name}"
+            if mode_key in args:
+                s = str(args[mode_key])
+                if not valid_provider_mode(s):
+                    return {"error": f"{mode_key} must be one of auto/disabled/subscription/api_key"}
+                setattr(base, name, s)
+            elif bool_key in args:
+                setattr(base, name, provider_mode_from_bool(bool(args[bool_key])))
+        update.provider_modes = base
     if "autorotate_enabled" in args:
         update.autorotate_enabled = bool(args["autorotate_enabled"])
     if "autorotate_interval_s" in args:
@@ -864,7 +885,13 @@ async def _provision(deps: Deps, args: dict) -> dict:
             if k in payload:
                 setattr(reg_payload, k, payload[k])
         if providers:
-            reg_payload.providers = ProviderSet(claude=providers.get("claude", False), codex=providers.get("codex", False), gemini=providers.get("gemini", False))
+            # Provisioning carries the coarse bool set; lift it into the
+            # canonical mode triple (true→auto, false→disabled).
+            reg_payload.provider_modes = ProviderModeSet(
+                claude=provider_mode_from_bool(providers.get("claude", False)),
+                codex=provider_mode_from_bool(providers.get("codex", False)),
+                gemini=provider_mode_from_bool(providers.get("gemini", False)),
+            )
         try:
             deps.registry.register(device_id, reg_payload)
             out["registered"] = True

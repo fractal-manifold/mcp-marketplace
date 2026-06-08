@@ -37,11 +37,17 @@ test("golden round-trips via JS reader/writer", { skip }, () => {
   assert.equal(dev2.active.payload.city, dev.active.payload.city);
   assert.equal(dev2.active.payload.br_day, dev.active.payload.br_day);
   assert.equal(dev2.active.payload.theme_mode, dev.active.payload.theme_mode);
+  // The legacy [active.providers] bool table migrates to provider_modes
+  // (true→auto, false→disabled) and survives the round-trip.
+  assert.equal(dev.active.payload.providers, null); // dropped after migration
+  assert.deepEqual(dev.active.payload.provider_modes, { claude: "auto", codex: "disabled", gemini: "disabled" });
+  assert.deepEqual(dev2.active.payload.provider_modes, dev.active.payload.provider_modes);
   assert.equal(!!dev2.pending, !!dev.pending);
   if (dev.pending) {
     assert.equal(dev2.pending.payload.version, dev.pending.payload.version);
     assert.equal(dev2.pending.payload.psk_hex, dev.pending.payload.psk_hex);
     assert.equal(dev2.pending.payload.theme_mode, dev.pending.payload.theme_mode);
+    assert.deepEqual(dev.pending.payload.provider_modes, { claude: "auto", codex: "auto", gemini: "disabled" });
   }
 });
 

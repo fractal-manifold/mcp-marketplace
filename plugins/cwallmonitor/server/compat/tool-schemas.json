@@ -173,17 +173,32 @@
             "type": "number",
             "description": "Alert volume 0..100."
           },
+          "provider_mode_claude": {
+            "type": "string",
+            "enum": ["auto", "disabled", "subscription", "api_key"],
+            "description": "Claude provider mode. 'disabled' hides it; 'auto' trusts the broker's credential detection; 'subscription' forces quota-% display; 'api_key' forces $-spend display. Wins over provider_claude when both are given."
+          },
+          "provider_mode_codex": {
+            "type": "string",
+            "enum": ["auto", "disabled", "subscription", "api_key"],
+            "description": "Codex provider mode (see provider_mode_claude). Wins over provider_codex when both are given."
+          },
+          "provider_mode_gemini": {
+            "type": "string",
+            "enum": ["auto", "disabled", "subscription", "api_key"],
+            "description": "Gemini provider mode (see provider_mode_claude). Wins over provider_gemini when both are given."
+          },
           "provider_claude": {
             "type": "boolean",
-            "description": "Enable the Claude provider on the device."
+            "description": "Legacy coarse toggle: enable (true→auto) or disable (false) the Claude provider. Prefer provider_mode_claude for subscription/api_key control."
           },
           "provider_codex": {
             "type": "boolean",
-            "description": "Enable the Codex provider on the device."
+            "description": "Legacy coarse toggle: enable (true→auto) or disable (false) the Codex provider. Prefer provider_mode_codex."
           },
           "provider_gemini": {
             "type": "boolean",
-            "description": "Enable the Gemini provider on the device."
+            "description": "Legacy coarse toggle: enable (true→auto) or disable (false) the Gemini provider. Prefer provider_mode_gemini."
           },
           "autorotate_enabled": {
             "type": "boolean",

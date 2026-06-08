@@ -28,6 +28,59 @@ func newReg(t *testing.T) *Registry {
 
 func u8ptr(v uint8) *uint8 { return &v }
 
+// findGolden walks up to the repo's compat/registry/golden fixture shared
+// across the three runtimes. Returns "" when run from a standalone checkout
+// without the compat tree (the caller skips).
+func findGolden(t *testing.T, name string) string {
+	t.Helper()
+	dir, _ := os.Getwd()
+	for i := 0; i < 8; i++ {
+		cand := filepath.Join(dir, "compat", "registry", "golden", name)
+		if _, err := os.Stat(cand); err == nil {
+			return cand
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return ""
+}
+
+// TestGolden_LegacyProvidersMigrateToModes loads the shared golden fixture
+// (which still uses the legacy [providers] bool table) and asserts the Go
+// reader migrates it to provider_modes identically to the JS/Python readers.
+func TestGolden_LegacyProvidersMigrateToModes(t *testing.T) {
+	src := findGolden(t, "ab12cd34.toml")
+	if src == "" {
+		t.Skip("compat/registry/golden unavailable (standalone checkout)")
+	}
+	raw, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatalf("read golden: %v", err)
+	}
+	r := newReg(t)
+	if err := os.WriteFile(filepath.Join(r.dir, "ab12cd34.toml"), raw, 0o644); err != nil {
+		t.Fatalf("seed golden: %v", err)
+	}
+	dev, err := r.Load("ab12cd34")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if dev.Active.Providers != nil {
+		t.Fatalf("legacy Providers should be dropped after migration, got %+v", dev.Active.Providers)
+	}
+	wantActive := ProviderModeSet{Claude: "auto", Codex: "disabled", Gemini: "disabled"}
+	if dev.Active.ProviderModes == nil || *dev.Active.ProviderModes != wantActive {
+		t.Fatalf("active provider_modes = %+v, want %+v", dev.Active.ProviderModes, wantActive)
+	}
+	wantPending := ProviderModeSet{Claude: "auto", Codex: "auto", Gemini: "disabled"}
+	if dev.Pending == nil || dev.Pending.ProviderModes == nil || *dev.Pending.ProviderModes != wantPending {
+		t.Fatalf("pending provider_modes = %+v, want %+v", dev.Pending, wantPending)
+	}
+}
+
 func TestValidDeviceID(t *testing.T) {
 	cases := map[string]bool{
 		"ab12cd34": true,

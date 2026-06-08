@@ -46,9 +46,11 @@ def test_golden_round_trips_via_python_writer():
     assert dev2.active.payload.br_day == dev.active.payload.br_day
     assert dev2.active.payload.br_night == dev.active.payload.br_night
     assert dev2.active.payload.vol == dev.active.payload.vol
-    assert (dev2.active.payload.providers is None) == (dev.active.payload.providers is None)
-    if dev.active.payload.providers is not None:
-        assert vars(dev2.active.payload.providers) == vars(dev.active.payload.providers)
+    # The legacy [active.providers] bool table migrates to provider_modes
+    # (true→auto, false→disabled) and survives the round-trip.
+    assert dev.active.payload.providers is None  # dropped after migration
+    assert vars(dev.active.payload.provider_modes) == {"claude": "auto", "codex": "disabled", "gemini": "disabled"}
+    assert vars(dev2.active.payload.provider_modes) == vars(dev.active.payload.provider_modes)
     assert dev2.active.payload.theme_mode == dev.active.payload.theme_mode
     assert (dev2.pending is None) == (dev.pending is None)
     if dev.pending is not None:
@@ -56,6 +58,7 @@ def test_golden_round_trips_via_python_writer():
         assert dev2.pending.payload.broker_url == dev.pending.payload.broker_url
         assert dev2.pending.payload.psk_hex == dev.pending.payload.psk_hex
         assert dev2.pending.payload.theme_mode == dev.pending.payload.theme_mode
+        assert vars(dev.pending.payload.provider_modes) == {"claude": "auto", "codex": "auto", "gemini": "disabled"}
 
 
 def test_register_and_set_pending(tmp_path: Path):

@@ -642,7 +642,16 @@ function pendingPayloadJSON(p) {
   if (p.br_day) wire.br_day = p.br_day;
   if (p.br_night) wire.br_night = p.br_night;
   if (p.vol != null) wire.vol = p.vol;
-  if (p.providers) wire.providers = { claude: p.providers.claude, codex: p.providers.codex, gemini: p.providers.gemini };
+  // Emit the rich provider_modes enum AND a derived legacy providers bool
+  // map. New firmware reads provider_modes; pre-mode-split firmware only
+  // understands the bool map. Both derive from the same source so they
+  // never disagree. (enabled == mode is neither "" nor "disabled".)
+  if (p.provider_modes) {
+    const pm = p.provider_modes;
+    wire.provider_modes = { claude: pm.claude, codex: pm.codex, gemini: pm.gemini };
+    const en = (m) => m != null && m !== "" && m !== "disabled";
+    wire.providers = { claude: en(pm.claude), codex: en(pm.codex), gemini: en(pm.gemini) };
+  }
   if (p.autorotate_enabled != null) wire.autorotate_enabled = p.autorotate_enabled;
   if (p.autorotate_interval_s != null) wire.autorotate_interval_s = p.autorotate_interval_s;
   // firmware/config_sync.c reads "theme_mode" from the decrypted blob

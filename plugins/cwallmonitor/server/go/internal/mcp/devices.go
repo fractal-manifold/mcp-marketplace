@@ -40,20 +40,20 @@ type deviceSummary struct {
 	PendingCreatedAt time.Time `json:"pending_created_at,omitempty"`
 }
 
-// providerNames flattens a ProviderSet into the slice of enabled names so
-// the JSON stays compact and human-readable.
-func providerNames(p *registry.ProviderSet) []string {
+// providerNames flattens a ProviderModeSet into the slice of enabled
+// (non-disabled) provider names so the JSON stays compact and human-readable.
+func providerNames(p *registry.ProviderModeSet) []string {
 	if p == nil {
 		return nil
 	}
 	var out []string
-	if p.Claude {
+	if p.Claude.Enabled() {
 		out = append(out, "claude")
 	}
-	if p.Codex {
+	if p.Codex.Enabled() {
 		out = append(out, "codex")
 	}
-	if p.Gemini {
+	if p.Gemini.Enabled() {
 		out = append(out, "gemini")
 	}
 	return out
@@ -82,8 +82,8 @@ func pendingChanges(active, pending registry.ConfigPayload) []string {
 	if pending.Vol != nil && (active.Vol == nil || *pending.Vol != *active.Vol) {
 		diffs = append(diffs, "vol")
 	}
-	if pending.Providers != nil &&
-		(active.Providers == nil || *pending.Providers != *active.Providers) {
+	if pending.ProviderModes != nil &&
+		(active.ProviderModes == nil || *pending.ProviderModes != *active.ProviderModes) {
 		diffs = append(diffs, "providers")
 	}
 	if pending.AutorotateEnabled != nil {
@@ -134,7 +134,7 @@ func summarise(dev *registry.Device) deviceSummary {
 		ActiveVersion:    dev.Active.Version,
 		ActiveBrokerURL:  dev.Active.BrokerURL,
 		ActiveCity:       dev.Active.City,
-		ActiveProviders:  providerNames(dev.Active.Providers),
+		ActiveProviders:  providerNames(dev.Active.ProviderModes),
 		MinSecureVersion: dev.Active.MinSecureVersion,
 		LastSeen:         dev.Active.LastSeen,
 	}
@@ -292,35 +292,61 @@ func handleSetDevicePending(d Deps) server.ToolHandlerFunc {
 			update.Vol = &u8
 		}
 
-		// Providers: only build the struct if any of the three flags
-		// was supplied. We need *all three* in NVS to be deterministic,
-		// so we read existing values from the device's current view
-		// (active or pending) and override only what changed.
+		// Providers: build the mode triple if any per-provider arg was
+		// supplied — either the rich provider_mode_<p> string enum
+		// (auto/disabled/subscription/api_key) or the legacy provider_<p>
+		// bool (true→auto, false→disabled). We need *all three* in NVS to
+		// be deterministic, so we read the device's current view (pending,
+		// else active) and override only what changed. The string arg wins
+		// over the bool arg when both are present for a provider.
 		anyProv := req.GetArguments()
-		_, hasClaude := anyProv["provider_claude"]
-		_, hasCodex := anyProv["provider_codex"]
-		_, hasGemini := anyProv["provider_gemini"]
-		if hasClaude || hasCodex || hasGemini {
+		base := registry.ProviderModeSet{
+			Claude: registry.ProviderModeAuto,
+			Codex:  registry.ProviderModeDisabled,
+			Gemini: registry.ProviderModeDisabled,
+		}
+		anySupplied := false
+		for _, k := range []string{
+			"provider_claude", "provider_codex", "provider_gemini",
+			"provider_mode_claude", "provider_mode_codex", "provider_mode_gemini",
+		} {
+			if _, ok := anyProv[k]; ok {
+				anySupplied = true
+				break
+			}
+		}
+		if anySupplied {
 			cur, err := d.Registry.Load(deviceID)
 			if err != nil {
 				return mcp.NewToolResultErrorFromErr("load", err), nil
 			}
-			base := registry.ProviderSet{Claude: true} // sensible default for legacy
-			if cur.Pending != nil && cur.Pending.Providers != nil {
-				base = *cur.Pending.Providers
-			} else if cur.Active.Providers != nil {
-				base = *cur.Active.Providers
+			if cur.Pending != nil && cur.Pending.ProviderModes != nil {
+				base = *cur.Pending.ProviderModes
+			} else if cur.Active.ProviderModes != nil {
+				base = *cur.Active.ProviderModes
 			}
-			if hasClaude {
-				base.Claude = req.GetBool("provider_claude", base.Claude)
+			apply := func(field *registry.ProviderMode, boolKey, modeKey string) error {
+				if _, ok := anyProv[modeKey]; ok {
+					s := req.GetString(modeKey, string(*field))
+					if !registry.ValidProviderMode(s) {
+						return fmt.Errorf("%s: invalid mode %q (want auto/disabled/subscription/api_key)", modeKey, s)
+					}
+					*field = registry.ProviderMode(s)
+				} else if _, ok := anyProv[boolKey]; ok {
+					*field = registry.ProviderModeFromBool(req.GetBool(boolKey, field.Enabled()))
+				}
+				return nil
 			}
-			if hasCodex {
-				base.Codex = req.GetBool("provider_codex", base.Codex)
+			if err := apply(&base.Claude, "provider_claude", "provider_mode_claude"); err != nil {
+				return mcp.NewToolResultErrorFromErr("providers", err), nil
 			}
-			if hasGemini {
-				base.Gemini = req.GetBool("provider_gemini", base.Gemini)
+			if err := apply(&base.Codex, "provider_codex", "provider_mode_codex"); err != nil {
+				return mcp.NewToolResultErrorFromErr("providers", err), nil
 			}
-			update.Providers = &base
+			if err := apply(&base.Gemini, "provider_gemini", "provider_mode_gemini"); err != nil {
+				return mcp.NewToolResultErrorFromErr("providers", err), nil
+			}
+			update.ProviderModes = &base
 		}
 
 		if _, ok := anyProv["autorotate_enabled"]; ok {
