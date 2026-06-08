@@ -157,15 +157,33 @@ test("check stages update, dry-run previews, idempotent", { skip }, async () => 
   }
 });
 
-test("check up_to_date when device floor >= release", { skip }, async () => {
+test("check up_to_date when device floor is ABOVE release", { skip }, async () => {
+  const { canonical, sigB64 } = s1Vector();
+  const { server, url } = await mockReleases({ S1: index(canonical, sigB64) });
+  try {
+    const cfg = makeCfg(url);
+    // Floor strictly above the 0.5.1 release → device would refuse it
+    // (packed < floor), so the broker must not stage.
+    const reg = registryWithDevice("S1", ota.packSemver("0.5.2"));
+    const rep = await ota.check(cfg, reg, { dryRun: false });
+    assert.equal(rep.staged, 0);
+    assert.equal(rep.devices[0].action, "up_to_date");
+  } finally {
+    server.close();
+  }
+});
+
+test("check stages when release packed EQUALS the floor", { skip }, async () => {
+  // The device refuses only packed < floor, so a release whose base == floor
+  // is installable and must be staged (mirrors a newer same-base dev canary
+  // after the floor matured). Fresh device, floor == release base.
   const { canonical, sigB64 } = s1Vector();
   const { server, url } = await mockReleases({ S1: index(canonical, sigB64) });
   try {
     const cfg = makeCfg(url);
     const reg = registryWithDevice("S1", ota.packSemver("0.5.1"));
-    const rep = await ota.check(cfg, reg, { dryRun: false });
-    assert.equal(rep.staged, 0);
-    assert.equal(rep.devices[0].action, "up_to_date");
+    const rep = await ota.check(cfg, reg, { dryRun: true });
+    assert.equal(rep.devices[0].action, "would_stage");
   } finally {
     server.close();
   }

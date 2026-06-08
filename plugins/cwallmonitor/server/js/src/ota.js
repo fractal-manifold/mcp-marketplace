@@ -215,7 +215,11 @@ function decide(reg, dev, resolved, dryRun, logger) {
   // Go decide.
   const cmp = compareSemver(String(mf.version || ""), String(dev.active.payload.firmware_version || ""));
   if (cmp !== null && cmp <= 0) { out.action = "up_to_date"; return out; }
-  if (releasePacked <= Number(dev.active.payload.min_secure_version || 0)) { out.action = "up_to_date"; return out; }
+  // Floor guard: device refuses only packed(version) STRICTLY BELOW the floor
+  // (cwm_ota.c: `mf_packed < floor`), so mirror with `<` — NOT `<=`. A release
+  // packing EQUAL to the floor is installable; `<=` would wrongly skip a newer
+  // same-base dev canary that the device accepts.
+  if (releasePacked < Number(dev.active.payload.min_secure_version || 0)) { out.action = "up_to_date"; return out; }
   if (dev.pending && dev.pending.payload.firmware_version === String(mf.version || "")) { out.action = "skipped:already-pending"; return out; }
   if (dryRun) { out.action = "would_stage"; return out; }
   const update = {

@@ -498,8 +498,12 @@ func (c *Checker) decide(dev *registry.Device, r *resolved, dryRun bool) DeviceR
 		return out
 	}
 	// Secondary guard (defense in depth): respect the reported anti-rollback
-	// floor. A release at or below it would be refused on-device anyway.
-	if releasePacked <= dev.Active.MinSecureVersion {
+	// floor. The device refuses only packed(version) STRICTLY BELOW the floor
+	// (cwm_ota.c: `mf_packed < floor`), so mirror that with `<` — NOT `<=`.
+	// A release packing EQUAL to the floor is installable on-device; with `<=`
+	// the broker would wrongly skip a newer same-base dev canary (X.Y.Z-dev.<ts2>
+	// packs to the same base as a matured X.Y.Z floor) that the device accepts.
+	if releasePacked < dev.Active.MinSecureVersion {
 		out.Action = "up_to_date"
 		return out
 	}

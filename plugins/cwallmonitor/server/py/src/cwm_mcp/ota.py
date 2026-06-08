@@ -276,8 +276,13 @@ def _decide(reg: Registry, dev, resolved: dict, dry_run: bool) -> dict:
     if cmp is not None and cmp <= 0:
         out["action"] = "up_to_date"
         return out
-    # Compare against the device's reported anti-rollback floor.
-    if release_packed <= dev.active.payload.min_secure_version:
+    # Compare against the device's reported anti-rollback floor. The device
+    # refuses only packed(version) STRICTLY BELOW the floor (cwm_ota.c:
+    # `mf_packed < floor`), so mirror that with `<` — NOT `<=`. A release
+    # packing EQUAL to the floor is installable on-device; `<=` would wrongly
+    # skip a newer same-base dev canary (X.Y.Z-dev.<ts2> packs to the same base
+    # as a matured X.Y.Z floor) that the device accepts.
+    if release_packed < dev.active.payload.min_secure_version:
         out["action"] = "up_to_date"
         return out
     # Avoid churning the config version: if a pending already carries this

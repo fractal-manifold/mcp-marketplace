@@ -162,9 +162,27 @@ async def test_check_up_to_date(tmp_path):
     server = await _mock_server({"S1": _index(canonical, sig_b64)})
     try:
         cfg = _cfg_for(str(server.make_url("/")).rstrip("/"))
-        reg = _registry_with_device(tmp_path, "S1", ota.pack_semver("0.5.1"))
+        # Floor strictly ABOVE the 0.5.1 release → device would refuse it
+        # (packed < floor), so the broker must not stage. (Floor == release is
+        # installable and covered by test_check_stages_when_release_at_floor.)
+        reg = _registry_with_device(tmp_path, "S1", ota.pack_semver("0.5.2"))
         rep = await ota.check(cfg, reg, dry_run=False)
         assert rep["staged"] == 0 and rep["devices"][0]["action"] == "up_to_date"
+    finally:
+        await server.close()
+
+
+async def test_check_stages_when_release_at_floor(tmp_path):
+    # The device refuses only packed < floor (cwm_ota.c), so a release whose
+    # base EQUALS the floor is installable and must be staged — not treated as
+    # up_to_date. Mirrors a newer same-base dev canary after the floor matured.
+    canonical, sig_b64 = _s1_vector()
+    server = await _mock_server({"S1": _index(canonical, sig_b64)})
+    try:
+        cfg = _cfg_for(str(server.make_url("/")).rstrip("/"))
+        reg = _registry_with_device(tmp_path, "S1", ota.pack_semver("0.5.1"))
+        rep = await ota.check(cfg, reg, dry_run=True)
+        assert rep["devices"][0]["action"] == "would_stage"
     finally:
         await server.close()
 

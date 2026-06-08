@@ -394,8 +394,11 @@ func TestCheckUpToDate(t *testing.T) {
 	defer srv.Close()
 
 	cfg := otaConfigForVectors(t, v, srv.URL)
-	// Device already at or above packed(0.5.1) → no staging.
-	packed, _ := PackSemver("0.5.1")
+	// Device floor is STRICTLY ABOVE packed(0.5.1) → the device would refuse
+	// this release (packed < floor), so the broker must not stage it. (Floor
+	// EQUAL to the release is installable on-device and is covered by
+	// TestCheckStagesWhenReleaseAtFloor.)
+	packed, _ := PackSemver("0.5.2")
 	reg := newRegistryWithDevice(t, testDevice, "S1", packed)
 	checker := NewChecker(cfg, reg, nil)
 
@@ -405,6 +408,40 @@ func TestCheckUpToDate(t *testing.T) {
 	}
 	if rep.Staged != 0 || rep.Devices[0].Action != "up_to_date" {
 		t.Fatalf("got staged=%d action=%s, want up_to_date", rep.Staged, rep.Devices[0].Action)
+	}
+}
+
+// TestCheckStagesWhenReleaseAtFloor locks the floor-comparison fix: a release
+// whose packed version EQUALS the device's anti-rollback floor is INSTALLABLE
+// on-device (cwm_ota.c refuses only packed < floor), so the broker must mirror
+// that with `<` and stage it — not treat floor==release as up_to_date. The
+// real-world case is a dev canary: after the 24 h floor matures to base X.Y.Z,
+// a newer X.Y.Z-dev.<ts> packs to the same base (== floor) and must still
+// stage. Here we use a fresh device (no running version) at floor==release.
+func TestCheckStagesWhenReleaseAtFloor(t *testing.T) {
+	v := loadVectors(t)
+	canonical, sigB64 := s1Vector(t, v)
+	idx := Index{
+		Version:      "0.5.1",
+		ManifestB64:  base64.StdEncoding.EncodeToString([]byte(canonical)),
+		SignatureB64: sigB64,
+		BinURL:       "https://downloads.example/cwm-S1-0.5.1.bin",
+	}
+	srv := mockReleases(t, map[string]Index{"S1": idx})
+	defer srv.Close()
+
+	cfg := otaConfigForVectors(t, v, srv.URL)
+	floor, _ := PackSemver("0.5.1") // floor EQUALS the release base
+	reg := newRegistryWithDevice(t, testDevice, "S1", floor)
+	checker := NewChecker(cfg, reg, nil)
+
+	rep, err := checker.Check(context.Background(), true /*dryRun*/, "", "")
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if rep.Devices[0].Action != "would_stage" {
+		t.Fatalf("got action=%s, want would_stage (release packed == floor is installable)",
+			rep.Devices[0].Action)
 	}
 }
 
