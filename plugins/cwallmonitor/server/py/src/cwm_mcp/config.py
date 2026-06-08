@@ -72,6 +72,31 @@ class Usage:
 
 
 @dataclass
+class Spend:
+    """Locally-computed token cost from the CLI logs on this host (see
+    compat/SPEND_WIRE.md). No admin key. Longer TTL than Usage because
+    spend changes slowly and parsing is heavier."""
+
+    enabled: bool = True
+    cache_ttl_seconds: int = 300
+    claude_projects_path: str = "~/.claude/projects"
+    claude_stats_cache_path: str = "~/.claude/stats-cache.json"
+    codex_sessions_path: str = "~/.codex/sessions"
+    gemini_tmp_path: str = "~/.gemini/tmp"
+
+
+@dataclass
+class Pricing:
+    """Model price table used to turn tokens into USD. Source of truth is
+    LiteLLM's machine-readable table; cached on disk with an embedded
+    fallback so $ works offline."""
+
+    url: str = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+    cache_path: str = "~/.config/claude-wall-monitor/pricing-cache.json"
+    ttl_hours: int = 24
+
+
+@dataclass
 class Security:
     max_timestamp_skew_seconds: int = 60
     nonce_cache_ttl_seconds: int = 300
@@ -142,6 +167,8 @@ class Config:
     codex: Codex = field(default_factory=Codex)
     gemini: Gemini = field(default_factory=Gemini)
     usage: Usage = field(default_factory=Usage)
+    spend: Spend = field(default_factory=Spend)
+    pricing: Pricing = field(default_factory=Pricing)
     security: Security = field(default_factory=Security)
     logging: Logging = field(default_factory=Logging)
     serial: Serial = field(default_factory=Serial)
@@ -162,6 +189,21 @@ class Config:
 
     def gemini_projects_path_abs(self) -> str:
         return str(Path(self.gemini.projects_path).expanduser())
+
+    def claude_projects_path_abs(self) -> str:
+        return str(Path(self.spend.claude_projects_path).expanduser())
+
+    def claude_stats_cache_path_abs(self) -> str:
+        return str(Path(self.spend.claude_stats_cache_path).expanduser())
+
+    def codex_sessions_path_abs(self) -> str:
+        return str(Path(self.spend.codex_sessions_path).expanduser())
+
+    def gemini_tmp_path_abs(self) -> str:
+        return str(Path(self.spend.gemini_tmp_path).expanduser())
+
+    def pricing_cache_path_abs(self) -> str:
+        return str(Path(self.pricing.cache_path).expanduser())
 
     def gemini_models(self) -> list[str]:
         """Return the configured model list, clamped to MAX_GEMINI_MODELS.
@@ -198,6 +240,8 @@ def load(path: str | None = None) -> Config:
     _section(raw, "codex", cfg.codex)
     _section(raw, "gemini", cfg.gemini)
     _section(raw, "usage", cfg.usage)
+    _section(raw, "spend", cfg.spend)
+    _section(raw, "pricing", cfg.pricing)
     _section(raw, "security", cfg.security)
     _section(raw, "logging", cfg.logging)
     _section(raw, "serial", cfg.serial)

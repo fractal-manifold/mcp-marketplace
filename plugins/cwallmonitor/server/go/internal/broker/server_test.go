@@ -91,7 +91,7 @@ func newCodexTestServer(t *testing.T, codexPath string, enabled bool) (*httptest
 	cfg := newTestConfigWithCodex(t, writeCredsFile(t, time.Now().Add(time.Hour).UnixMilli()), enabled, codexPath)
 	cache := auth.NewNonceCache(time.Duration(cfg.Security.NonceCacheTTLSeconds) * time.Second)
 	logger := log.New(io.Discard, "", 0)
-	ts := httptest.NewServer(NewMux(cfg, cache, state.New(), logger, nil, nil, nil))
+	ts := httptest.NewServer(NewMux(cfg, cache, state.New(), logger, nil, nil, nil, nil))
 	t.Cleanup(ts.Close)
 	return ts, cfg
 }
@@ -101,7 +101,7 @@ func newTestServer(t *testing.T, credsPath string) (*httptest.Server, *config.Co
 	cfg := newTestConfig(t, credsPath)
 	cache := auth.NewNonceCache(time.Duration(cfg.Security.NonceCacheTTLSeconds) * time.Second)
 	logger := log.New(io.Discard, "", 0)
-	ts := httptest.NewServer(NewMux(cfg, cache, state.New(), logger, nil, nil, nil))
+	ts := httptest.NewServer(NewMux(cfg, cache, state.New(), logger, nil, nil, nil, nil))
 	t.Cleanup(ts.Close)
 	return ts, cfg
 }

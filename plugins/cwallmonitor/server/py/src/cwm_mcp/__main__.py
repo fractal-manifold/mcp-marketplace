@@ -15,6 +15,7 @@ from aiohttp import web
 from . import RUNTIME, __version__
 from . import auth, creds
 from . import ota
+from . import spend
 from . import usage
 from .broker.server import make_app
 from .config import devices_path, load
@@ -103,7 +104,8 @@ async def _run_daemon(cfg, logs: Buffer, logger: logging.Logger) -> int:
         return {"connected": tailer.connected() if tailer else False, "total_available": len(fw_buf), "lines": fw_buf.tail(limit)}
 
     usage_cache = usage.build_cache(cfg)
-    app = make_app(cfg, cache, state, fw_logs, registry, usage_cache)
+    spend_cache = spend.build_cache(cfg, logger)
+    app = make_app(cfg, cache, state, fw_logs, registry, usage_cache, spend_cache)
     sock = try_bind(cfg.server.bind, cfg.server.port)
     if sock is None:
         logger.error("listen %s:%d: address in use", cfg.server.bind, cfg.server.port)
@@ -154,7 +156,8 @@ async def _run_mcp(cfg, logs: Buffer, logger: logging.Logger) -> int:
             tailer = Tailer(cfg.serial.device, fw_buf, baud=cfg.serial.baud)
             tailer.start()
         usage_cache = usage.build_cache(cfg)
-        app = make_app(cfg, cache, state, fw_logs, registry, usage_cache)
+        spend_cache = spend.build_cache(cfg, logger)
+        app = make_app(cfg, cache, state, fw_logs, registry, usage_cache, spend_cache)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.SockSite(runner, sock)

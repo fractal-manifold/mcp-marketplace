@@ -21,7 +21,7 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 from aiohttp import web
 
-from .. import auth, creds, devlog, usage
+from .. import auth, creds, devlog, spend, usage
 from ..config import Config, firmware_path
 from ..registry import crypto as reg_crypto
 from ..registry import store as registry  # alias kept for parity with Go broker
@@ -43,6 +43,7 @@ def make_app(
     fw_logs: FirmwareLogSource | None,
     registry: Registry | None,
     usage_cache: usage.Cache | None = None,
+    spend_cache: spend.Cache | None = None,
 ) -> web.Application:
     app = web.Application()
     app["cfg"] = cfg
@@ -51,6 +52,7 @@ def make_app(
     app["fw_logs"] = fw_logs
     app["registry"] = registry
     app["usage_cache"] = usage_cache
+    app["spend_cache"] = spend_cache
     # One shared aiohttp.ClientSession so connections to upstream APIs
     # (Anthropic/ChatGPT/Google) are pooled across requests. Created on
     # startup so we don't pay TLS handshake on every /usage hit.
@@ -71,6 +73,7 @@ def make_app(
     app.router.add_get("/device/{device_id}/sync", _handle_device_sync)
     app.router.add_post("/device/{device_id}/logs", _handle_device_logs)
     app.router.add_get("/usage/{provider}", _handle_usage)
+    app.router.add_get("/spend/{provider}", _handle_spend)
     app.router.add_get("/firmware/{name}", _handle_firmware)
     app.router.add_head("/firmware/{name}", _handle_firmware)
     app.router.add_route("*", "/{tail:.*}", lambda r: _error(404, "not found"))
@@ -468,6 +471,45 @@ async def _handle_usage(req: web.Request) -> web.Response:
             return _error(502, f"upstream error: {e}")
         body = asdict(snap)
         resp = web.json_response(body)
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    finally:
+        try:
+            state.record_request(req.remote or "", status_to_record)
+        except Exception:
+            pass
+
+
+async def _handle_spend(req: web.Request) -> web.Response:
+    """Serve locally-computed token cost at /spend/{provider}.
+
+    Same HMAC envelope as /usage. The payload is parsed from the CLI logs
+    on this host (no admin key). See compat/SPEND_WIRE.md.
+    """
+    state = req.app["state"]
+    spend_cache: spend.Cache | None = req.app["spend_cache"]
+    provider = req.match_info["provider"]
+    status_to_record = 200
+    try:
+        ok, err_resp = await _verify_for_path(req, f"/spend/{provider}")
+        if not ok:
+            status_to_record = err_resp.status
+            return err_resp
+        if provider not in (spend.PROVIDER_CLAUDE, spend.PROVIDER_CODEX, spend.PROVIDER_GEMINI):
+            status_to_record = 404
+            return _error(404, "unknown spend provider")
+        if spend_cache is None:
+            status_to_record = 501
+            return _error(501, "spend disabled")
+        try:
+            snap = await spend_cache.get(provider)
+        except spend.NotImplementedProvider:
+            status_to_record = 501
+            return _error(501, "provider not enabled")
+        except spend.SpendUnavailable:
+            status_to_record = 503
+            return _error(503, "spend unavailable")
+        resp = web.json_response(asdict(snap))
         resp.headers["Cache-Control"] = "no-store"
         return resp
     finally:

@@ -52,6 +52,7 @@ import (
 	"github.com/fractal-manifold/cwm-mcp/internal/ota"
 	"github.com/fractal-manifold/cwm-mcp/internal/registry"
 	"github.com/fractal-manifold/cwm-mcp/internal/serial"
+	"github.com/fractal-manifold/cwm-mcp/internal/spend"
 	"github.com/fractal-manifold/cwm-mcp/internal/state"
 	"github.com/fractal-manifold/cwm-mcp/internal/usage"
 )
@@ -163,7 +164,8 @@ func runDaemon(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int 
 	// the leader). Self-exits immediately when [ota] is not configured.
 	go ota.Run(ctx, cfg, reg, logger)
 	usageCache := buildUsageCache(cfg, logger)
-	if err := broker.Serve(ctx, ln, cfg, st, logger, fwLogs, reg, usageCache); err != nil {
+	spendCache := buildSpendCache(cfg, logger)
+	if err := broker.Serve(ctx, ln, cfg, st, logger, fwLogs, reg, usageCache, spendCache); err != nil {
 		logger.Printf("broker: %v", err)
 		return 1
 	}
@@ -211,6 +213,27 @@ func buildUsageCache(cfg *config.Config, logger *log.Logger) *usage.Cache {
 	}
 	logger.Printf("usage: providers=%v cache_ttl=%s", keysOf(fetchers), ttl)
 	return usage.NewCache(ttl, fetchers)
+}
+
+// buildSpendCache wires the per-provider local-log spend fetchers into a
+// *spend.Cache. Claude is always wired; Codex/Gemini follow their
+// [provider].enabled flag, matching buildUsageCache. Returns nil when
+// [spend].enabled is false, which makes /spend/* answer 501.
+func buildSpendCache(cfg *config.Config, logger *log.Logger) *spend.Cache {
+	return spend.BuildCache(spend.SpendConfig{
+		Enabled:          cfg.Spend.Enabled,
+		CacheTTLSeconds:  cfg.Spend.CacheTTLSeconds,
+		ClaudeProjects:   cfg.ClaudeProjectsPath(),
+		CodexSessions:    cfg.CodexSessionsPath(),
+		GeminiTmp:        cfg.GeminiTmpPath(),
+		ClaudeCredsPath:  cfg.OAuthPath(),
+		CodexAuthPath:    cfg.CodexAuthPath(),
+		CodexEnabled:     cfg.Codex.Enabled,
+		GeminiEnabled:    cfg.Gemini.Enabled,
+		PricingURL:       cfg.Pricing.URL,
+		PricingCachePath: cfg.PricingCachePath(),
+		PricingTTLHours:  cfg.Pricing.TTLHours,
+	}, logger)
 }
 
 func keysOf(m map[string]usage.Fetcher) []string {
@@ -297,7 +320,8 @@ func runMCP(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int {
 			// loses leadership (ctx c is cancelled).
 			go ota.Run(c, cfg, reg, logger)
 			usageCache := buildUsageCache(cfg, logger)
-			return broker.Serve(c, ln, cfg, st, logger, fwLogs, reg, usageCache)
+			spendCache := buildSpendCache(cfg, logger)
+			return broker.Serve(c, ln, cfg, st, logger, fwLogs, reg, usageCache, spendCache)
 		})
 		if err != nil && !errors.Is(err, context.Canceled) {
 			logger.Printf("leader: %v", err)

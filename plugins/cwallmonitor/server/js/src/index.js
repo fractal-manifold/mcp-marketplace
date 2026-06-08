@@ -10,6 +10,7 @@ import * as auth from "./auth.js";
 import * as creds from "./creds.js";
 import * as ota from "./ota.js";
 import * as usage from "./usage.js";
+import * as spend from "./spend.js";
 import { load as loadConfig, devicesPath } from "./config.js";
 import { Buffer as LogBuffer } from "./logbuf.js";
 import { State, Role } from "./state.js";
@@ -114,7 +115,8 @@ async function runDaemon(cfg, logs, logger) {
   if (cfg.serial.device) { tailer = new Tailer(cfg.serial.device, fwBuf, { baud: cfg.serial.baud }); tailer.start(); }
   const fwLogs = (limit) => ({ connected: tailer ? tailer.connected() : false, total_available: fwBuf.length, lines: fwBuf.tail(limit) });
   const usageCache = usage.buildCache(cfg, { credsModule: creds, logger });
-  const handler = createHandler({ cfg, cache, state, fwLogs, registry, logger, usageCache });
+  const spendCache = spend.buildSpendCache(cfg, { logger });
+  const handler = createHandler({ cfg, cache, state, fwLogs, registry, logger, usageCache, spendCache });
   const server = await tryListen(() => createServer(handler), cfg.server.bind, cfg.server.port);
   if (!server) { logger.error(`listen ${cfg.server.bind}:${cfg.server.port}: address in use`); return 1; }
   logger.info(`broker: serving on ${cfg.server.bind}:${cfg.server.port}`);
@@ -153,7 +155,8 @@ async function runMCP(cfg, logs, logger) {
       tailer.start();
     }
     const usageCache = usage.buildCache(cfg, { credsModule: creds, logger });
-  const handler = createHandler({ cfg, cache, state, fwLogs, registry, logger, usageCache });
+    const spendCache = spend.buildSpendCache(cfg, { logger });
+    const handler = createHandler({ cfg, cache, state, fwLogs, registry, logger, usageCache, spendCache });
     return createServer(handler);
   };
 

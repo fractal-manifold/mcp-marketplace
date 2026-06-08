@@ -44,6 +44,8 @@ type Config struct {
 	Codex       Codex       `toml:"codex"`
 	Gemini      Gemini      `toml:"gemini"`
 	Usage       Usage       `toml:"usage"`
+	Spend       Spend       `toml:"spend"`
+	Pricing     Pricing     `toml:"pricing"`
 	Security    Security    `toml:"security"`
 	Logging     Logging     `toml:"logging"`
 	Serial      Serial      `toml:"serial"`
@@ -114,6 +116,27 @@ func (c *Config) GeminiModels() []string {
 // every 60 s with default TTL hits each upstream at most once per minute.
 type Usage struct {
 	CacheTTLSeconds int `toml:"cache_ttl_seconds"`
+}
+
+// Spend controls /spend/{provider}: locally-computed token cost from the
+// CLI logs on this host (see compat/SPEND_WIRE.md). No admin key. TTL is
+// longer than Usage because spend changes slowly and parsing is heavier.
+type Spend struct {
+	Enabled              bool   `toml:"enabled"`
+	CacheTTLSeconds      int    `toml:"cache_ttl_seconds"`
+	ClaudeProjectsPath   string `toml:"claude_projects_path"`
+	ClaudeStatsCachePath string `toml:"claude_stats_cache_path"`
+	CodexSessionsPath    string `toml:"codex_sessions_path"`
+	GeminiTmpPath        string `toml:"gemini_tmp_path"`
+}
+
+// Pricing is the model price table used to turn tokens into USD. Source of
+// truth is LiteLLM's machine-readable table; cached on disk with an
+// embedded fallback so $ works offline.
+type Pricing struct {
+	URL       string `toml:"url"`
+	CachePath string `toml:"cache_path"`
+	TTLHours  int    `toml:"ttl_hours"`
 }
 
 type Security struct {
@@ -206,6 +229,12 @@ func (c *Config) GeminiProjectsPath() string {
 	return expandUser(c.Gemini.ProjectsPath)
 }
 
+func (c *Config) ClaudeProjectsPath() string   { return expandUser(c.Spend.ClaudeProjectsPath) }
+func (c *Config) ClaudeStatsCachePath() string { return expandUser(c.Spend.ClaudeStatsCachePath) }
+func (c *Config) CodexSessionsPath() string    { return expandUser(c.Spend.CodexSessionsPath) }
+func (c *Config) GeminiTmpPath() string        { return expandUser(c.Spend.GeminiTmpPath) }
+func (c *Config) PricingCachePath() string     { return expandUser(c.Pricing.CachePath) }
+
 func expandUser(p string) string {
 	if strings.HasPrefix(p, "~/") {
 		if home, err := os.UserHomeDir(); err == nil {
@@ -287,6 +316,19 @@ func defaults() *Config {
 		},
 		Usage: Usage{
 			CacheTTLSeconds: 30,
+		},
+		Spend: Spend{
+			Enabled:              true,
+			CacheTTLSeconds:      300,
+			ClaudeProjectsPath:   "~/.claude/projects",
+			ClaudeStatsCachePath: "~/.claude/stats-cache.json",
+			CodexSessionsPath:    "~/.codex/sessions",
+			GeminiTmpPath:        "~/.gemini/tmp",
+		},
+		Pricing: Pricing{
+			URL:       "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
+			CachePath: "~/.config/claude-wall-monitor/pricing-cache.json",
+			TTLHours:  24,
 		},
 		Security: Security{
 			MaxTimestampSkewSeconds: 60,

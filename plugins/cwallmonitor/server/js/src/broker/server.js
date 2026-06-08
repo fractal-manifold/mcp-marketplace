@@ -5,6 +5,7 @@
 import * as auth from "../auth.js";
 import * as creds from "../creds.js";
 import * as usage from "../usage.js";
+import * as spend from "../spend.js";
 import * as devlog from "../devlog.js";
 import { encryptPending } from "../registry/crypto.js";
 import { NotFound, validDeviceID } from "../registry/store.js";
@@ -29,7 +30,7 @@ function parseUint32(s) {
   return Number.isFinite(n) && n >= 0 && n <= 0xffffffff ? n : 0;
 }
 
-export function createHandler({ cfg, cache, state, fwLogs, registry, logger, usageCache }) {
+export function createHandler({ cfg, cache, state, fwLogs, registry, logger, usageCache, spendCache }) {
   return (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     const path = url.pathname;
@@ -39,6 +40,10 @@ export function createHandler({ cfg, cache, state, fwLogs, registry, logger, usa
     const usageMatch = path.match(/^\/usage\/([^/]+)$/);
     if (usageMatch && req.method === "GET") {
       return handleUsage({ cfg, cache, state, registry, logger, usageCache, provider: usageMatch[1] }, req, res);
+    }
+    const spendMatch = path.match(/^\/spend\/([^/]+)$/);
+    if (spendMatch && req.method === "GET") {
+      return handleSpend({ cfg, cache, state, registry, logger, spendCache, provider: spendMatch[1] }, req, res);
     }
     const m = path.match(/^\/device\/([^/]+)\/sync$/);
     if (m && req.method === "GET") return handleDeviceSync({ cfg, cache, state, registry, logger, deviceID: m[1] }, req, res);
@@ -297,6 +302,34 @@ async function handleUsage({ cfg, cache, state, registry, logger, usageCache, pr
     }
     if (e instanceof usage.UsageError) { rs.s = 502; return writeError(res, 502, `upstream error: ${e.message}`); }
     logger.error(`usage handler crashed: ${e.stack || e.message}`);
+    rs.s = 500; return writeError(res, 500, "internal");
+  }
+}
+
+// handleSpend serves GET /spend/{provider}. Same HMAC envelope as
+// /usage; the payload is locally-computed token spend. See
+// compat/SPEND_WIRE.md.
+async function handleSpend({ cfg, cache, state, registry, logger, spendCache, provider }, req, res) {
+  const rs = { s: 200 };
+  res.on("close", () => { try { state.recordRequest(req.socket.remoteAddress || "", rs.s); } catch {} });
+  if (!verifyForPath({ cfg, cache, registry, logger }, req, res, `/spend/${provider}`, rs)) return;
+  if (provider !== "claude" && provider !== "codex" && provider !== "gemini") {
+    rs.s = 404; return writeError(res, 404, "unknown spend provider");
+  }
+  if (!spendCache) { rs.s = 501; return writeError(res, 501, "spend disabled"); }
+  try {
+    const snap = await spendCache.get(provider);
+    rs.s = 200;
+    return writeJSON(res, 200, snap);
+  } catch (e) {
+    if (e.staleSnapshot) {
+      rs.s = 200;
+      res.setHeader("X-Cwm-Stale-Reason", e.message);
+      return writeJSON(res, 200, e.staleSnapshot);
+    }
+    if (e instanceof spend.NotImplementedProvider) { rs.s = 501; return writeError(res, 501, "provider not enabled"); }
+    if (e instanceof spend.SpendUnavailable) { rs.s = 503; return writeError(res, 503, "spend unavailable"); }
+    logger.error(`spend handler crashed: ${e.stack || e.message}`);
     rs.s = 500; return writeError(res, 500, "internal");
   }
 }

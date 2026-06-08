@@ -45,6 +45,25 @@ function defaults() {
       models: [],
     },
     usage: { cache_ttl_seconds: 30 },
+    // Locally-computed token spend (see compat/SPEND_WIRE.md). Parses the
+    // CLI logs on this host; no admin key. Enabled by default — it only
+    // reads files that already exist for whichever CLIs are signed in.
+    spend: {
+      enabled: true,
+      cache_ttl_seconds: 300,
+      claude_projects_path: "~/.claude/projects",
+      claude_stats_cache_path: "~/.claude/stats-cache.json",
+      codex_sessions_path: "~/.codex/sessions",
+      gemini_tmp_path: "~/.gemini/tmp",
+    },
+    // Model price table used to turn tokens into USD. Source of truth is
+    // LiteLLM's machine-readable table (same data ccusage uses); cached on
+    // disk with an embedded fallback so $ works offline.
+    pricing: {
+      url: "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
+      cache_path: "~/.config/claude-wall-monitor/pricing-cache.json",
+      ttl_hours: 24,
+    },
     security: { max_timestamp_skew_seconds: 60, nonce_cache_ttl_seconds: 300 },
     logging: { level: "INFO" },
     serial: { device: "", baud: 115200, lines: 2000 },
@@ -84,7 +103,7 @@ export function load(path) {
   const raw = readFileSync(resolved, "utf8");
   const parsed = TOML.parse(raw);
   const cfg = defaults();
-  for (const k of ["server", "auth", "credentials", "codex", "gemini", "usage", "security", "logging", "serial", "ota"]) {
+  for (const k of ["server", "auth", "credentials", "codex", "gemini", "usage", "spend", "pricing", "security", "logging", "serial", "ota"]) {
     mergeSection(cfg, parsed, k);
   }
   // @iarna/toml parses [[ota.keys]] into an array of {key_id, pubkey_b64}
@@ -112,6 +131,11 @@ export function load(path) {
   cfg.codexAuthPathAbs = () => expandUser(cfg.codex.auth_path);
   cfg.geminiCredsPathAbs = () => expandUser(cfg.gemini.creds_path);
   cfg.geminiProjectsPathAbs = () => expandUser(cfg.gemini.projects_path);
+  cfg.claudeProjectsPathAbs = () => expandUser(cfg.spend.claude_projects_path);
+  cfg.claudeStatsCachePathAbs = () => expandUser(cfg.spend.claude_stats_cache_path);
+  cfg.codexSessionsPathAbs = () => expandUser(cfg.spend.codex_sessions_path);
+  cfg.geminiTmpPathAbs = () => expandUser(cfg.spend.gemini_tmp_path);
+  cfg.pricingCachePathAbs = () => expandUser(cfg.pricing.cache_path);
   cfg.geminiModels = () => {
     const src = (cfg.gemini.models && cfg.gemini.models.length > 0)
       ? cfg.gemini.models

@@ -32,6 +32,7 @@ import (
 	"github.com/fractal-manifold/cwm-mcp/internal/devlog"
 	"github.com/fractal-manifold/cwm-mcp/internal/logbuf"
 	"github.com/fractal-manifold/cwm-mcp/internal/registry"
+	"github.com/fractal-manifold/cwm-mcp/internal/spend"
 	"github.com/fractal-manifold/cwm-mcp/internal/state"
 	"github.com/fractal-manifold/cwm-mcp/internal/usage"
 )
@@ -107,7 +108,7 @@ func (r *statusRecorder) Unwrap() http.ResponseWriter {
 // null source that answers 200 with an empty list. `reg` may be nil
 // — when missing, /credentials falls back to the global PSK in cfg
 // (legacy mode) and /device/* answers 404.
-func NewMux(cfg *config.Config, cache *auth.NonceCache, st *state.State, logger *log.Logger, fwLogs FirmwareLogSource, reg *registry.Registry, usageCache *usage.Cache) *http.ServeMux {
+func NewMux(cfg *config.Config, cache *auth.NonceCache, st *state.State, logger *log.Logger, fwLogs FirmwareLogSource, reg *registry.Registry, usageCache *usage.Cache, spendCache *spend.Cache) *http.ServeMux {
 	if fwLogs == nil {
 		fwLogs = nullFirmwareLogs{}
 	}
@@ -145,6 +146,13 @@ func NewMux(cfg *config.Config, cache *auth.NonceCache, st *state.State, logger 
 	mux.HandleFunc("/usage/", func(w http.ResponseWriter, r *http.Request) {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		handleUsage(cfg, cache, logger, reg, usageCache, rec, r)
+		if st != nil {
+			st.RecordRequest(r.RemoteAddr, rec.status, time.Now())
+		}
+	})
+	mux.HandleFunc("/spend/", func(w http.ResponseWriter, r *http.Request) {
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		handleSpend(cfg, cache, logger, reg, spendCache, rec, r)
 		if st != nil {
 			st.RecordRequest(r.RemoteAddr, rec.status, time.Now())
 		}
@@ -613,6 +621,52 @@ func deviceGeminiModels(reg *registry.Registry, deviceID string) []string {
 	return nil
 }
 
+// handleSpend serves GET /spend/{provider}: locally-computed token cost.
+// Same HMAC envelope as /usage. See compat/SPEND_WIRE.md.
+func handleSpend(cfg *config.Config, nonceCache *auth.NonceCache, logger *log.Logger, reg *registry.Registry, spendCache *spend.Cache, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	provider := strings.TrimPrefix(r.URL.Path, "/spend/")
+	if provider == "" || strings.ContainsRune(provider, '/') {
+		writeError(w, http.StatusNotFound, "unknown spend provider")
+		return
+	}
+	if !verifyCredentialRequest(cfg, nonceCache, logger, reg, w, r, "/spend/"+provider) {
+		return
+	}
+	if provider != spend.ProviderClaude && provider != spend.ProviderCodex && provider != spend.ProviderGemini {
+		writeError(w, http.StatusNotFound, "unknown spend provider")
+		return
+	}
+	if spendCache == nil {
+		writeError(w, http.StatusNotImplemented, "spend disabled")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	snap, err := spendCache.Get(ctx, provider)
+	if err != nil {
+		if snap.FetchedAtUnix > 0 {
+			w.Header().Set("X-Cwm-Stale-Reason", err.Error())
+			writeJSON(w, http.StatusOK, snap)
+			return
+		}
+		switch {
+		case errors.Is(err, spend.ErrNotImpl):
+			writeError(w, http.StatusNotImplemented, "provider not enabled")
+		case errors.Is(err, spend.ErrUnavailable):
+			writeError(w, http.StatusServiceUnavailable, "spend unavailable")
+		default:
+			logger.Printf("spend handler error: %v", err)
+			writeError(w, http.StatusInternalServerError, "internal")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, snap)
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	body, _ := json.Marshal(v)
 	w.Header().Set("Content-Type", "application/json")
@@ -994,10 +1048,10 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 // `fwLogs` is the read-side of the serial tailer; pass nil to keep
 // /firmware-logs answering 200 with an empty list. `reg` may be nil
 // to disable the per-device control plane (legacy global-PSK mode).
-func Serve(ctx context.Context, ln net.Listener, cfg *config.Config, st *state.State, logger *log.Logger, fwLogs FirmwareLogSource, reg *registry.Registry, usageCache *usage.Cache) error {
+func Serve(ctx context.Context, ln net.Listener, cfg *config.Config, st *state.State, logger *log.Logger, fwLogs FirmwareLogSource, reg *registry.Registry, usageCache *usage.Cache, spendCache *spend.Cache) error {
 	cache := auth.NewNonceCache(time.Duration(cfg.Security.NonceCacheTTLSeconds) * time.Second)
 	srv := &http.Server{
-		Handler:           NewMux(cfg, cache, st, logger, fwLogs, reg, usageCache),
+		Handler:           NewMux(cfg, cache, st, logger, fwLogs, reg, usageCache, spendCache),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
