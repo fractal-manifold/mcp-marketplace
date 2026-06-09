@@ -60,7 +60,7 @@ type discoveredDevice struct {
 func registerDiscoveryTools(s *server.MCPServer, d Deps) {
 	s.AddTool(
 		mcp.NewTool("wall_monitor_discover_devices",
-			mcp.WithDescription("Scan the local network via mDNS for Claude Wall Monitor devices that have just connected to WiFi and are waiting for an initial config (`_cwm._tcp.local.`). Returns one entry per device with its device_id, firmware version, hostname, IPv4 address(es) and the URL to POST a /provision payload to. The pairing code is NOT returned — the user must read it from the device's screen. Default scan window is 4 seconds."),
+			mcp.WithDescription("Scan the local network via mDNS for C Wall Monitor devices that have just connected to WiFi and are waiting for an initial config (`_cwm._tcp.local.`). Returns one entry per device with its device_id, firmware version, hostname, IPv4 address(es) and the URL to POST a /provision payload to. The pairing code is NOT returned — the user must read it from the device's screen. Default scan window is 4 seconds."),
 			mcp.WithNumber("timeout_seconds",
 				mcp.Description("Browse window in seconds (1..15). Defaults to 4."),
 			),
