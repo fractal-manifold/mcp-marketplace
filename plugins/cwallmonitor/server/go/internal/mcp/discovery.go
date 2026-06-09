@@ -85,6 +85,11 @@ func registerDiscoveryTools(s *server.MCPServer, d Deps) {
 			mcp.WithNumber("br_day",   mcp.Description("Daytime brightness 10..100.")),
 			mcp.WithNumber("br_night", mcp.Description("Nighttime brightness 5..100.")),
 			mcp.WithNumber("vol",      mcp.Description("Alert volume 0..100.")),
+			mcp.WithString("theme_mode",
+				mcp.Description("Display theme applied on the device: 'day' (light palette), 'night' (dark palette) or 'auto' (follows sunrise/sunset). Default on the device is auto. Same setting and wire convention as wall_monitor_set_device_pending's theme_mode."),
+				mcp.Enum("day", "night", "auto"),
+			),
+			mcp.WithBoolean("pet_enabled", mcp.Description("Show the on-device virtual pet (default true). Device-owned like the display settings; pass false to hide it. Same setting as wall_monitor_set_device_pending's pet_enabled.")),
 			mcp.WithBoolean("provider_claude", mcp.Description("Enable Claude provider.")),
 			mcp.WithBoolean("provider_codex",  mcp.Description("Enable Codex provider.")),
 			mcp.WithBoolean("provider_gemini", mcp.Description("Enable Gemini provider.")),
@@ -188,6 +193,8 @@ type provisionPayload struct {
 	BrDay       *uint8                 `json:"br_day,omitempty"`
 	BrNight     *uint8                 `json:"br_night,omitempty"`
 	Vol         *uint8                 `json:"vol,omitempty"`
+	ThemeMode   string                 `json:"theme_mode,omitempty"`
+	PetEnabled  *bool                  `json:"pet_enabled,omitempty"`
 	Providers   map[string]bool        `json:"providers,omitempty"`
 }
 
@@ -250,8 +257,19 @@ func handleProvision(d Deps) server.ToolHandlerFunc {
 			b := clamp8(uint8(v), 0, 100)
 			payload.Vol = &b
 		}
+		if v := strings.TrimSpace(req.GetString("theme_mode", "")); v != "" {
+			tm := strings.ToLower(v)
+			if tm != "day" && tm != "night" && tm != "auto" {
+				return mcp.NewToolResultError("theme_mode must be one of: day, night, auto"), nil
+			}
+			payload.ThemeMode = tm
+		}
 
 		args := req.GetArguments()
+		if _, ok := args["pet_enabled"]; ok {
+			pe := req.GetBool("pet_enabled", true)
+			payload.PetEnabled = &pe
+		}
 		_, hasClaude := args["provider_claude"]
 		_, hasCodex := args["provider_codex"]
 		_, hasGemini := args["provider_gemini"]
@@ -325,6 +343,11 @@ func handleProvision(d Deps) server.ToolHandlerFunc {
 			if payload.Vol != nil {
 				v := *payload.Vol
 				reg.Vol = &v
+			}
+			reg.ThemeMode = payload.ThemeMode
+			if payload.PetEnabled != nil {
+				v := *payload.PetEnabled
+				reg.PetEnabled = &v
 			}
 			if payload.Providers != nil {
 				// Provisioning carries the coarse bool set; lift it into

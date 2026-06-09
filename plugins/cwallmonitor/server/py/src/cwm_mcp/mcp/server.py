@@ -872,6 +872,14 @@ async def _provision(deps: Deps, args: dict) -> dict:
                 payload[k] = _clamp(int(raw), lo, hi)
             except (TypeError, ValueError):
                 pass
+    raw_theme = args.get("theme_mode")
+    if raw_theme is not None and str(raw_theme).strip() != "":
+        tm = str(raw_theme).strip().lower()
+        if tm not in ("day", "night", "auto"):
+            return {"error": "theme_mode must be one of: day, night, auto"}
+        payload["theme_mode"] = tm
+    if "pet_enabled" in args:
+        payload["pet_enabled"] = bool(args["pet_enabled"])
     providers: dict[str, bool] = {}
     for name in ("claude", "codex", "gemini"):
         key = f"provider_{name}"
@@ -901,6 +909,10 @@ async def _provision(deps: Deps, args: dict) -> dict:
         for k in ("br_day", "br_night", "vol"):
             if k in payload:
                 setattr(reg_payload, k, payload[k])
+        if payload.get("theme_mode"):
+            reg_payload.theme_mode = payload["theme_mode"]
+        if "pet_enabled" in payload:
+            reg_payload.pet_enabled = payload["pet_enabled"]
         if providers:
             # Provisioning carries the coarse bool set; lift it into the
             # canonical mode triple (true→auto, false→disabled).
