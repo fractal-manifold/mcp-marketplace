@@ -660,6 +660,12 @@ async function provisionTool(deps, args) {
       if (Number.isFinite(n)) payload[k] = clamp(n, lo, hi);
     }
   }
+  if (args.theme_mode != null && args.theme_mode !== "") {
+    const tm = String(args.theme_mode).trim().toLowerCase();
+    if (!["day", "night", "auto"].includes(tm)) return { error: "theme_mode must be one of: day, night, auto" };
+    payload.theme_mode = tm;
+  }
+  if ("pet_enabled" in args) payload.pet_enabled = !!args.pet_enabled;
   const providers = {};
   for (const name of ["claude", "codex", "gemini"]) {
     const key = `provider_${name}`;
@@ -699,7 +705,7 @@ async function provisionTool(deps, args) {
     const regModes = payload.providers
       ? { claude: providerModeFromBool(!!payload.providers.claude), codex: providerModeFromBool(!!payload.providers.codex), gemini: providerModeFromBool(!!payload.providers.gemini) }
       : null;
-    const regPayload = { version: 0, broker_url: brokerURL, psk_hex: pskHex, city: payload.city || "", br_day: payload.br_day || 0, br_night: payload.br_night || 0, vol: payload.vol || 0, providers: null, provider_modes: regModes, autorotate_enabled: null, autorotate_interval_s: null };
+    const regPayload = { version: 0, broker_url: brokerURL, psk_hex: pskHex, city: payload.city || "", br_day: payload.br_day || 0, br_night: payload.br_night || 0, vol: payload.vol || 0, providers: null, provider_modes: regModes, autorotate_enabled: null, autorotate_interval_s: null, theme_mode: payload.theme_mode || "", pet_enabled: ("pet_enabled" in payload) ? payload.pet_enabled : null };
     try { deps.registry.register(deviceID, regPayload); out.registered = true; }
     catch (e) {
       if (/already exists/.test(e.message)) {

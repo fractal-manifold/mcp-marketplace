@@ -408,6 +408,15 @@
             "type": "number",
             "description": "Alert volume 0..100."
           },
+          "theme_mode": {
+            "type": "string",
+            "enum": ["day", "night", "auto"],
+            "description": "Display theme applied on the device: 'day' (light palette), 'night' (dark palette) or 'auto' (follows sunrise/sunset). Default on the device is auto. Same setting and wire convention as wall_monitor_set_device_pending's theme_mode."
+          },
+          "pet_enabled": {
+            "type": "boolean",
+            "description": "Show the on-device virtual pet (default true). Device-owned like the display settings; pass false to hide it. Same setting as wall_monitor_set_device_pending's pet_enabled."
+          },
           "provider_claude": {
             "type": "boolean",
             "description": "Enable Claude provider."

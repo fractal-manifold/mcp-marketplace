@@ -99,6 +99,16 @@ Resolve only the broker URL before asking the user anything else:
   fallback procedure.
 - **brightness / volume** — only ask if the user volunteers
   preferences. Defaults on the device are sensible.
+- **theme / pet** — optional display preferences, also changeable later
+  from the device's on-screen Settings menu (and via
+  `wall_monitor_set_device_pending`, which uses these same field names).
+  Only ask if the user volunteers a preference; otherwise omit and let
+  the sensible defaults stand.
+    - `theme_mode` — `"day"` (light palette), `"night"` (dark palette) or
+      `"auto"` (follows sunrise/sunset). Device default is `"auto"`.
+    - `pet_enabled` — `true` shows the virtual ASCII pet on the
+      dashboard, `false` hides it. Device default is `true` (shown). Pass
+      `false` only if the user explicitly doesn't want it.
 - **providers** — REQUIRED. The device tracks usage from one or more of
   Claude, Codex and Gemini; only the ones enabled here are polled and
   shown on the dashboard. Default selection rules:
@@ -138,7 +148,9 @@ Resolve only the broker URL before asking the user anything else:
 Call `wall_monitor_provision` with the values from steps 1–3 (do not
 pass `psk_hex` — let the broker generate it; do pass each selected
 provider as `provider_claude=true` / `provider_codex=true` /
-`provider_gemini=true`). Expected return on success:
+`provider_gemini=true`; pass `theme_mode` / `pet_enabled` only if the
+user expressed a preference, otherwise omit them so the device defaults
+stand). Expected return on success:
 
 ```json
 {
