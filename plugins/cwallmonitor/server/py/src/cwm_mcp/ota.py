@@ -6,9 +6,11 @@ pending firmware update for matching registered devices.
 Flow per check:
 
   1. Collect the distinct hardware SKUs of all registered devices.
-  2. For each SKU, GET <repo>/releases/latest/download/update-<SKU>.json.
-     GitHub 302-redirects this to the newest non-prerelease release's
-     asset; aiohttp follows the redirect chain.
+  2. STABLE: GET <repo>/releases/latest/download/update-<SKU>.json; GitHub
+     302-redirects to the newest non-prerelease asset (zero API). DEV: no
+     "latest prerelease" redirect exists, so list releases via the GitHub
+     API once per check and pick the newest vX.Y.Z-dev.<ts> prerelease
+     carrying that SKU.
   3. Decode the index's manifest_b64 + signature_b64 and verify the
      Ed25519 signature against the configured keyring. Defense in depth —
      the device verifies the same signature again before it installs.
@@ -29,6 +31,7 @@ import base64
 import binascii
 import json
 import logging
+import os
 from datetime import datetime, timezone
 
 from cryptography.exceptions import InvalidSignature
@@ -49,6 +52,14 @@ MIN_POLL_MINUTES = 5
 INITIAL_DELAY_SECONDS = 30
 HTTP_TIMEOUT_SECONDS = 10
 MAX_INDEX_BODY = 64 * 1024  # an update-<SKU>.json is well under 1 KiB
+# MAX_RELEASES_BODY caps the GitHub releases-list JSON read to resolve the
+# newest dev prerelease; RELEASES_PER_PAGE requests the newest N in one page
+# (GitHub returns releases newest-first, so the newest dev tag is always on
+# page 1 — we never paginate). Bound caveat: a SKU whose newest dev build is
+# >N releases back would be missed — irrelevant in practice, since a dev
+# publish ships every SKU together at an hourly cadence.
+MAX_RELEASES_BODY = 4 * 1024 * 1024
+RELEASES_PER_PAGE = 100
 
 
 def pack_semver(v: str) -> int | None:
@@ -160,24 +171,150 @@ class _SkuError(Exception):
     pass
 
 
-async def _fetch_index(session, repo: str, sku: str, channel: str = "stable", dev_tag: str = "dev") -> dict:
+async def _read_capped(resp, limit: int) -> bytes:
+    """Read the response body fully, up to `limit` bytes — mirrors Go's
+    io.LimitReader(resp.Body, limit). aiohttp's StreamReader.read(n) can
+    UNDER-read a body that spans multiple network reads (it returns whatever is
+    buffered), so a single .read(limit) would silently truncate a larger
+    listing; loop to EOF instead."""
+    chunks: list[bytes] = []
+    total = 0
+    while total <= limit:
+        chunk = await resp.content.read(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)[:limit]
+
+
+def _github_token() -> str:
+    """Optional API token from the environment to lift the unauthenticated
+    rate limit; empty is fine for a public repo."""
+    return (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+
+
+def _is_github_repo(repo: str) -> bool:
+    return repo.rstrip("/").startswith("https://github.com/")
+
+
+def api_releases_url(repo: str) -> str:
+    """Map the public releases repo URL to the GitHub Releases API listing
+    endpoint. A github.com repo rewrites to api.github.com/repos/.../releases;
+    any other host (self-hosted mirror / test server) gets /releases appended
+    so a test can intercept the same path shape. Mirror of Go apiReleasesURL."""
+    base = repo.rstrip("/")
+    gh = "https://github.com/"
+    q = f"?per_page={RELEASES_PER_PAGE}"
+    if base.startswith(gh):
+        return f"https://api.github.com/repos/{base[len(gh):]}/releases{q}"
+    return base + "/releases" + q
+
+
+def pick_dev_asset(rels: list, sku: str) -> tuple[str, str] | None:
+    """Select, among the dev prereleases, the NEWEST one (by compare_semver on
+    the tag's version) that carries an update-<SKU>.json asset, returning
+    (version, tag) or None. A release qualifies only if it is flagged
+    prerelease (and NOT draft) and its tag is a valid X.Y.Z-dev.<ts> version.
+    Per-SKU (not "the newest dev release"): a dev publish shipping only S1 must
+    not hide an older S2 dev build. Returns the TAG (not the listing's
+    browser_download_url) so the caller builds the asset URL from the TRUSTED
+    repo base — the listing is untrusted metadata. Mirror of Go pickDevAsset."""
+    want = f"update-{sku}.json"
+    best: tuple[str, str] | None = None
+    for r in rels or []:
+        if not isinstance(r, dict) or r.get("prerelease") is not True or r.get("draft") is True:
+            continue
+        tag = str(r.get("tag_name", ""))
+        ver = tag[1:] if tag.startswith("v") else tag
+        dash = ver.find("-")
+        if dash < 0:  # a final X.Y.Z is never a dev build
+            continue
+        if dev_prerelease(ver[dash:]) is None or not valid_version(ver):
+            continue
+        has = False
+        for a in r.get("assets", []) or []:
+            if isinstance(a, dict) and a.get("name") == want:
+                has = True
+                break
+        if not has:
+            continue
+        if best is None:
+            best = (ver, tag)
+            continue
+        cmp = compare_semver(ver, best[0])
+        if cmp is not None and cmp > 0:
+            best = (ver, tag)
+    return best
+
+
+async def _list_dev_releases(session, repo: str) -> list:
+    """Fetch the newest page of releases (newest-first, as GitHub orders them).
+    Called only when a dev device is in scope; stable resolution never hits the
+    API. Mirror of Go listDevReleases."""
+    import aiohttp
+    url = api_releases_url(repo)
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "cwm-mcp-ota",
+    }
+    # Only ever send a GitHub credential to GitHub itself — never leak it to a
+    # self-hosted mirror configured as releases_repo.
+    tok = _github_token() if _is_github_repo(repo) else ""
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    try:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                raise _SkuError(f"list releases {url}: HTTP {resp.status}")
+            body = await _read_capped(resp, MAX_RELEASES_BODY)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        # Transport failure → a per-check dev error (Go/JS record it and keep
+        # resolving stable), not an exception that aborts the whole check.
+        raise _SkuError(f"list releases {url}: {e}") from e
+    try:
+        rels = json.loads(body)
+    except json.JSONDecodeError as e:
+        raise _SkuError(f"decode releases {url}: {e}") from e
+    if not isinstance(rels, list):
+        raise _SkuError(f"{url}: not a JSON array")
+    return rels
+
+
+async def _fetch_index(session, repo: str, sku: str, channel: str = "stable", dev_rels: list | None = None) -> dict:
     """GET the update-<SKU>.json release asset for one (SKU, channel).
 
-    Stable rides GitHub's latest/download redirect (newest non-prerelease);
-    dev rides the rolling prerelease tag, so a dev device never sees a
-    stable build and a stable device never sees a prerelease. aiohttp
-    follows GitHub's cross-host redirect chain
-    (github.com -> objects.githubusercontent.com) automatically."""
+    Stable rides GitHub's latest/download redirect (newest non-prerelease,
+    zero API). Dev resolves the newest immutable vX.Y.Z-dev.<ts> prerelease
+    carrying this SKU from the pre-fetched `dev_rels` listing, then GETs that
+    release's asset — so a dev device never sees a stable build and a stable
+    device never sees a prerelease. aiohttp follows GitHub's cross-host
+    redirect chain (github.com -> objects.githubusercontent.com)
+    automatically."""
+    import aiohttp
     base = repo.rstrip("/")
     if channel and channel != "stable":
-        url = base + f"/releases/download/{dev_tag or 'dev'}/update-{sku}.json"
+        picked = pick_dev_asset(dev_rels or [], sku)
+        if picked is None:
+            raise _SkuError(
+                f"no dev prerelease carrying update-{sku}.json among "
+                f"{len(dev_rels or [])} release(s)")
+        # Build the asset URL from the TRUSTED repo base + tag (same shape as
+        # the stable latest/download path), not from the listing's
+        # browser_download_url — never let untrusted listing metadata point the
+        # fetch at an arbitrary host.
+        url = base + f"/releases/download/{picked[1]}/update-{sku}.json"
     else:
         url = base + f"/releases/latest/download/update-{sku}.json"
     headers = {"Accept": "application/json", "User-Agent": "cwm-mcp-ota"}
-    async with session.get(url, headers=headers) as resp:
-        if resp.status != 200:
-            raise _SkuError(f"fetch {url}: HTTP {resp.status}")
-        body = await resp.content.read(MAX_INDEX_BODY)
+    try:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                raise _SkuError(f"fetch {url}: HTTP {resp.status}")
+            body = await _read_capped(resp, MAX_INDEX_BODY)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        raise _SkuError(f"fetch {url}: {e}") from e
     try:
         idx = json.loads(body)
     except json.JSONDecodeError as e:
@@ -377,11 +514,26 @@ async def check(
     if own_session:
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS))
     try:
+        # Dev resolution needs the GitHub releases listing (no "latest
+        # prerelease" redirect exists). Fetch it ONCE per check, and only if a
+        # dev target is in scope — a stable-only fleet makes zero API calls. A
+        # listing failure is surfaced per dev SKU below.
+        dev_rels: list | None = None
+        dev_err: _SkuError | None = None
+        if any(ch and ch != "stable" for _, ch in targets.values()):
+            try:
+                dev_rels = await _list_dev_releases(session, o.releases_repo)
+            except _SkuError as e:
+                dev_err = e
+
         resolved_by_key: dict[str, dict] = {}
         for key in sorted(targets):
             sku, channel = targets[key]
+            if channel and channel != "stable" and dev_err is not None:
+                rep["per_sku"].append({"sku": sku, "channel": "dev", "verified": False, "error": str(dev_err)})
+                continue
             try:
-                idx = await _fetch_index(session, o.releases_repo, sku, channel, o.dev_tag)
+                idx = await _fetch_index(session, o.releases_repo, sku, channel, dev_rels)
                 resolved, sres = _resolve_sku(cfg, idx, sku, channel)
             except _SkuError as e:
                 rep["per_sku"].append({"sku": sku, "channel": channel, "verified": False, "error": str(e)})

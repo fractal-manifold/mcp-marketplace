@@ -5,9 +5,11 @@
 //
 // Flow per check:
 //   1. Collect the distinct hardware SKUs of all registered devices.
-//   2. For each SKU, GET <repo>/releases/latest/download/update-<SKU>.json.
-//      GitHub 302-redirects this to the newest non-prerelease release's
-//      asset; global fetch follows the redirect chain.
+//   2. STABLE: GET <repo>/releases/latest/download/update-<SKU>.json; GitHub
+//      302-redirects to the newest non-prerelease asset (zero API). DEV: no
+//      "latest prerelease" redirect exists, so list releases via the GitHub
+//      API once per check and pick the newest vX.Y.Z-dev.<ts> prerelease
+//      carrying that SKU.
 //   3. Decode the index's manifest_b64 + signature_b64 and verify the
 //      Ed25519 signature against the configured keyring. Defense in depth —
 //      the device verifies the same signature again before it installs.
@@ -27,6 +29,14 @@ const MIN_POLL_MINUTES = 5;
 const INITIAL_DELAY_MS = 30_000;
 const HTTP_TIMEOUT_MS = 10_000;
 const MAX_INDEX_BODY = 64 * 1024; // an update-<SKU>.json is well under 1 KiB
+// MAX_RELEASES_BODY caps the GitHub releases-list JSON read to resolve the
+// newest dev prerelease; RELEASES_PER_PAGE requests the newest N in one page
+// (GitHub returns releases newest-first, so the newest dev tag is always on
+// page 1 — we never paginate). Bound caveat: a SKU whose newest dev build is
+// >N releases back would be missed — irrelevant in practice, since a dev
+// publish ships every SKU together at an hourly cadence.
+const MAX_RELEASES_BODY = 4 * 1024 * 1024;
+const RELEASES_PER_PAGE = 100;
 
 // 12-byte SPKI/DER prefix for an Ed25519 public key (RFC 8410). Prepended
 // to the 32-byte raw key so node:crypto can ingest it — node has no direct
@@ -117,15 +127,116 @@ function nowISO() {
   return new Date().toISOString();
 }
 
+// apiReleasesURL maps the public releases repo URL to the GitHub Releases API
+// listing endpoint. A github.com repo rewrites to api.github.com/repos/.../
+// releases; any other host (self-hosted mirror / test server) gets /releases
+// appended so a test can intercept the same path shape. Mirror of Go
+// apiReleasesURL.
+function isGitHubRepo(repo) {
+  return String(repo).replace(/\/+$/, "").startsWith("https://github.com/");
+}
+
+export function apiReleasesURL(repo) {
+  const base = String(repo).replace(/\/+$/, "");
+  const gh = "https://github.com/";
+  const q = `?per_page=${RELEASES_PER_PAGE}`;
+  if (base.startsWith(gh)) {
+    return `https://api.github.com/repos/${base.slice(gh.length)}/releases${q}`;
+  }
+  return `${base}/releases${q}`;
+}
+
+// githubToken returns an optional API token from the environment to lift the
+// unauthenticated rate limit; empty is fine for a public repo.
+function githubToken() {
+  return (process.env.GITHUB_TOKEN || process.env.GH_TOKEN || "").trim();
+}
+
+// listDevReleases fetches the newest page of releases (newest-first, as
+// GitHub orders them). Called only when a dev device is in scope; stable
+// resolution never hits the API. Mirror of Go listDevReleases.
+async function listDevReleases(cfg) {
+  const url = apiReleasesURL(cfg.ota.releases_repo);
+  const headers = {
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "User-Agent": "cwm-mcp-ota",
+  };
+  // Only ever send a GitHub credential to GitHub itself — never leak it to a
+  // self-hosted mirror configured as releases_repo.
+  const tok = isGitHubRepo(cfg.ota.releases_repo) ? githubToken() : "";
+  if (tok) headers.Authorization = `Bearer ${tok}`;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), HTTP_TIMEOUT_MS);
+  let resp;
+  try {
+    resp = await fetch(url, { headers, redirect: "follow", signal: ac.signal });
+  } catch (e) {
+    throw new Error(`list releases ${url}: ${e.message}`);
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!resp.ok) throw new Error(`list releases ${url}: HTTP ${resp.status}`);
+  const text = (await resp.text()).slice(0, MAX_RELEASES_BODY);
+  let rels;
+  try { rels = JSON.parse(text); }
+  catch (e) { throw new Error(`decode releases ${url}: ${e.message}`); }
+  if (!Array.isArray(rels)) throw new Error(`${url}: not a JSON array`);
+  return rels;
+}
+
+// pickDevAsset selects, among the dev prereleases, the NEWEST one (by
+// compareSemver on the tag's version) that carries an update-<SKU>.json
+// asset, returning { version, tag } or null. A release qualifies only if it
+// is flagged prerelease (and NOT draft) and its tag is a valid X.Y.Z-dev.<ts>
+// version. Per-SKU (not "the newest dev release"): a dev publish shipping only
+// S1 must not hide an older S2 dev build. Returns the TAG (not the listing's
+// browser_download_url) so the caller builds the asset URL from the TRUSTED
+// repo base — the listing is untrusted metadata. Mirror of Go pickDevAsset.
+export function pickDevAsset(rels, sku) {
+  const want = `update-${sku}.json`;
+  let best = null;
+  for (const r of rels || []) {
+    if (!r || r.prerelease !== true || r.draft === true) continue;
+    const tag = String(r.tag_name || "");
+    const ver = tag.replace(/^v/, "");
+    const dash = ver.indexOf("-");
+    if (dash < 0) continue; // a final X.Y.Z is never a dev build
+    if (devPrerelease(ver.slice(dash)) === null || !validVersion(ver)) continue;
+    let has = false;
+    for (const a of r.assets || []) {
+      if (a && a.name === want) { has = true; break; }
+    }
+    if (!has) continue;
+    if (best === null) { best = { version: ver, tag }; continue; }
+    const cmp = compareSemver(ver, best.version);
+    if (cmp !== null && cmp > 0) best = { version: ver, tag };
+  }
+  return best;
+}
+
 // fetchIndex GETs the per-SKU index for one (sku, channel). Stable rides
-// GitHub's latest/download redirect (newest non-prerelease); dev rides the
-// rolling prerelease tag, so a dev device never sees a stable build and a
-// stable device never sees a prerelease.
-async function fetchIndex(cfg, sku, channel = "stable") {
+// GitHub's latest/download redirect (newest non-prerelease, zero API). Dev
+// resolves the newest immutable vX.Y.Z-dev.<ts> prerelease carrying this SKU
+// from the pre-fetched `devRels` listing, then GETs that release's asset — so
+// a dev device never sees a stable build and a stable device never sees a
+// prerelease.
+async function fetchIndex(cfg, sku, channel = "stable", devRels = null) {
   const base = cfg.ota.releases_repo.replace(/\/+$/, "");
-  const url = (channel && channel !== "stable")
-    ? `${base}/releases/download/${cfg.ota.dev_tag || "dev"}/update-${sku}.json`
-    : `${base}/releases/latest/download/update-${sku}.json`;
+  let url;
+  if (channel && channel !== "stable") {
+    const picked = pickDevAsset(devRels, sku);
+    if (!picked) {
+      throw new Error(`no dev prerelease carrying update-${sku}.json among ${(devRels || []).length} release(s)`);
+    }
+    // Build the asset URL from the TRUSTED repo base + tag (same shape as the
+    // stable latest/download path), not from the listing's
+    // browser_download_url — never let untrusted listing metadata point the
+    // fetch at an arbitrary host.
+    url = `${base}/releases/download/${picked.tag}/update-${sku}.json`;
+  } else {
+    url = `${base}/releases/latest/download/update-${sku}.json`;
+  }
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), HTTP_TIMEOUT_MS);
   let resp;
@@ -289,11 +400,30 @@ export async function check(cfg, reg, { dryRun, skuFilter = "", deviceFilter = "
     }
   }
 
+  // Dev resolution needs the GitHub releases listing (no "latest prerelease"
+  // redirect exists). Fetch it ONCE per check, and only if a dev target is in
+  // scope — a stable-only fleet makes zero API calls. A listing failure is
+  // surfaced per dev SKU below.
+  let devRels = null;
+  let devErr = null;
+  for (const { channel } of targets.values()) {
+    if (channel && channel !== "stable") {
+      try { devRels = await listDevReleases(cfg); }
+      catch (e) { devErr = e; }
+      break;
+    }
+  }
+
   const resolvedByKey = new Map();
   for (const key of Array.from(targets.keys()).sort()) {
     const { sku, channel } = targets.get(key);
+    const isDev = channel && channel !== "stable";
+    if (isDev && devErr) {
+      rep.per_sku.push({ sku, channel: "dev", verified: false, error: devErr.message });
+      continue;
+    }
     try {
-      const idx = await fetchIndex(cfg, sku, channel);
+      const idx = await fetchIndex(cfg, sku, channel, devRels);
       const { resolved, skuResult } = resolveSKU(cfg, idx, sku, channel);
       rep.per_sku.push(dropEmpty(skuResult, ["latest_version", "error"]));
       if (resolved) resolvedByKey.set(key, resolved);

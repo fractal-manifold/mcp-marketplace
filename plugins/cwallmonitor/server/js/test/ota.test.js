@@ -261,3 +261,112 @@ test("dev unit considers both channels (stable wins when dev absent)", { skip },
     server.close();
   }
 });
+
+test("apiReleasesURL maps github.com to the API and passes through test hosts", () => {
+  assert.equal(
+    ota.apiReleasesURL("https://github.com/fractal-manifold/cwm-ota-releases"),
+    "https://api.github.com/repos/fractal-manifold/cwm-ota-releases/releases?per_page=100");
+  assert.equal(
+    ota.apiReleasesURL("https://github.com/fractal-manifold/cwm-ota-releases/"),
+    "https://api.github.com/repos/fractal-manifold/cwm-ota-releases/releases?per_page=100");
+  assert.equal(ota.apiReleasesURL("http://127.0.0.1:5000"), "http://127.0.0.1:5000/releases?per_page=100");
+});
+
+test("pickDevAsset selects newest dev prerelease carrying the SKU asset", () => {
+  const a = (sku) => ({ name: `update-${sku}.json`, browser_download_url: `u/${sku}` });
+  const rels = [
+    { tag_name: "v0.6.8-dev.202606022100", prerelease: true, assets: [a("S1")] },
+    { tag_name: "v0.9.0-dev.202609090000", prerelease: true, draft: true, assets: [a("S1")] }, // draft → ignored
+    { tag_name: "v0.7.0", prerelease: false, assets: [a("S1")] }, // not prerelease → ignored
+    { tag_name: "v0.6.8-dev.202606021930", prerelease: true, assets: [a("S1"), a("S2")] },
+    { tag_name: "v0.6.7", prerelease: true, assets: [a("S1")] }, // plain version → ignored
+  ];
+  assert.deepEqual(ota.pickDevAsset(rels, "S1"), { version: "0.6.8-dev.202606022100", tag: "v0.6.8-dev.202606022100" });
+  assert.deepEqual(ota.pickDevAsset(rels, "S2"), { version: "0.6.8-dev.202606021930", tag: "v0.6.8-dev.202606021930" });
+  assert.equal(ota.pickDevAsset(rels, "S9"), null);
+  assert.equal(ota.pickDevAsset(null, "S1"), null);
+});
+
+const devSelPath = findCompat("ota/dev_release_select.json");
+test("pickDevAsset matches the shared dev-select contract",
+  { skip: devSelPath ? false : "compat/ota/dev_release_select.json unavailable" }, () => {
+    const fx = JSON.parse(readFileSync(devSelPath, "utf8"));
+    assert.ok(fx.cases.length > 0, "fixture carries no cases");
+    for (const c of fx.cases) {
+      for (const q of c.queries) {
+        const got = ota.pickDevAsset(c.releases, q.sku);
+        if (q.expect === null) assert.equal(got, null, `${c.name}/${q.sku}`);
+        else assert.deepEqual(got, { version: q.expect.version, tag: q.expect.tag }, `${c.name}/${q.sku}`);
+      }
+    }
+  });
+
+function devVector(name) {
+  const m = VEC.manifests.find((x) => x.name === name);
+  assert.ok(m, `no manifest vector named ${name}`);
+  return { canonical: m.canonical_string, sigB64: m.signature_b64 };
+}
+
+// Start a mock that serves the stable redirect AND the dev surface: the
+// releases-list API at /releases plus each dev release's per-SKU asset at
+// /releases/download/v<version>/update-<SKU>.json. devs: [{version, idx:{SKU}}].
+function mockReleasesFull(stableBySKU, devs) {
+  return new Promise((resolve) => {
+    const server = createServer((req, res) => {
+      const host = req.headers.host;
+      const json = (obj) => { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(obj)); };
+      if (req.url === "/releases?per_page=100" || req.url === "/releases") {
+        return json(devs.map((d) => ({
+          tag_name: `v${d.version}`,
+          prerelease: true,
+          assets: Object.keys(d.idx).map((sku) => ({
+            name: `update-${sku}.json`,
+            browser_download_url: `http://${host}/releases/download/v${d.version}/update-${sku}.json`,
+          })),
+        })));
+      }
+      let m = /^\/releases\/download\/v(.+)\/update-(.+)\.json$/.exec(req.url);
+      if (m) {
+        const d = devs.find((x) => x.version === m[1]);
+        const idx = d && d.idx[m[2]];
+        if (!idx) { res.writeHead(404); res.end(); return; }
+        return json(idx);
+      }
+      m = /^\/releases\/latest\/download\/update-(.+)\.json$/.exec(req.url);
+      if (m) {
+        const idx = stableBySKU[m[1]];
+        if (!idx) { res.writeHead(404); res.end(); return; }
+        return json(idx);
+      }
+      res.writeHead(404); res.end();
+    });
+    server.listen(0, "127.0.0.1", () => resolve({ server, url: `http://127.0.0.1:${server.address().port}` }));
+  });
+}
+
+// Full dev path: a DEV unit, the API listing advertises an immutable
+// vX.Y.Z-dev.<ts> prerelease, and the broker resolves + verifies its signed
+// manifest and stages it on the dev channel.
+test("dev unit stages an immutable dev prerelease via the API", { skip }, async () => {
+  const DEV_VER = "0.6.8-dev.202606021930";
+  const { canonical, sigB64 } = devVector(`ota-S1-dev-v${DEV_VER}`);
+  const devIdx = index(canonical, sigB64, { version: DEV_VER, binURL: `https://dl.example/cwm-S1-${DEV_VER}.bin` });
+  const { server, url } = await mockReleasesFull({}, [{ version: DEV_VER, idx: { S1: devIdx } }]);
+  try {
+    const cfg = makeCfg(url);
+    // The dev manifest is signed under key_id "ed25519-dev" (same test key).
+    cfg.ota.keys.push({ key_id: "ed25519-dev", pubkey_b64: cfg.ota.keys[0].pubkey_b64 });
+    const reg = registryWithDevice("S1", 0);
+    reg.setSerial(TEST_DEVICE, "CWM-S1-DEV-2620-000001-0", "S1"); // flip to DEV
+
+    const rep = await ota.check(cfg, reg, { dryRun: true });
+    const dev = rep.per_sku.find(s => s.channel === "dev");
+    assert.ok(dev && dev.verified && dev.latest_version === DEV_VER, `dev per-sku: ${JSON.stringify(dev)}`);
+    assert.equal(rep.devices.length, 1);
+    assert.equal(rep.devices[0].action, "would_stage");
+    assert.equal(rep.devices[0].channel, "dev");
+    assert.equal(rep.devices[0].to, DEV_VER);
+  } finally {
+    server.close();
+  }
+});

@@ -173,9 +173,10 @@ type OTAConfig struct {
 	Enabled             bool     `toml:"enabled"`
 	ReleasesRepo        string   `toml:"releases_repo"`
 	PollIntervalMinutes int      `toml:"poll_interval_minutes"`
-	// DevTag is the rolling GitHub release tag the broker fetches the
-	// per-SKU asset from for devices on the "dev" channel. Stable devices
-	// ride the latest/download redirect instead. Defaults to "dev".
+	// DevTag is DEPRECATED and ignored. Dev builds now publish immutable
+	// per-version prerelease tags (vX.Y.Z-dev.<ts>); the broker resolves the
+	// newest one via the GitHub Releases API rather than a single rolling
+	// tag. The field is still parsed so an old cwm.toml doesn't error.
 	DevTag string   `toml:"dev_tag"`
 	Keys   []OTAKey `toml:"keys"`
 }

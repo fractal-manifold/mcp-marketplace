@@ -611,3 +611,228 @@ func TestCheckDevUnitConsidersBothChannels(t *testing.T) {
 		t.Errorf("device channel/to = %q/%q, want stable/0.5.1", rep.Devices[0].Channel, rep.Devices[0].To)
 	}
 }
+
+// TestApiReleasesURL pins the repo-URL → GitHub-API mapping (and the
+// test-server passthrough used by mockReleasesFull).
+func TestApiReleasesURL(t *testing.T) {
+	cases := []struct{ repo, want string }{
+		{"https://github.com/fractal-manifold/cwm-ota-releases",
+			"https://api.github.com/repos/fractal-manifold/cwm-ota-releases/releases?per_page=100"},
+		{"https://github.com/fractal-manifold/cwm-ota-releases/",
+			"https://api.github.com/repos/fractal-manifold/cwm-ota-releases/releases?per_page=100"},
+		{"http://127.0.0.1:5000", "http://127.0.0.1:5000/releases?per_page=100"},
+	}
+	for _, c := range cases {
+		if got := apiReleasesURL(c.repo); got != c.want {
+			t.Errorf("apiReleasesURL(%q) = %q, want %q", c.repo, got, c.want)
+		}
+	}
+}
+
+// TestPickDevAsset exercises the newest-prerelease-with-asset selection: a
+// newer -dev.<ts> wins; non-prerelease, plain-version and draft tags are
+// ignored; and the choice is per-SKU (a release missing the SKU asset is
+// skipped). It returns the release TAG (the caller builds the URL).
+func TestPickDevAsset(t *testing.T) {
+	a := func(sku string) ghAsset { return ghAsset{Name: "update-" + sku + ".json", URL: "u/" + sku} }
+	rels := []ghRelease{
+		// Newest first (as GitHub returns), but selection must not rely on order.
+		{TagName: "v0.6.8-dev.202606022100", Prerelease: true, Assets: []ghAsset{a("S1")}},
+		{TagName: "v0.9.0-dev.202609090000", Prerelease: true, Draft: true, Assets: []ghAsset{a("S1")}}, // draft → ignored
+		{TagName: "v0.7.0", Prerelease: false, Assets: []ghAsset{a("S1")}},                              // not prerelease → ignored
+		{TagName: "v0.6.8-dev.202606021930", Prerelease: true, Assets: []ghAsset{a("S1"), a("S2")}},
+		{TagName: "v0.6.7", Prerelease: true, Assets: []ghAsset{a("S1")}}, // plain version → not a dev build → ignored
+	}
+	if ver, tag, ok := pickDevAsset(rels, "S1"); !ok || ver != "0.6.8-dev.202606022100" || tag != "v0.6.8-dev.202606022100" {
+		t.Errorf("S1 pick = (%q,%q,%t), want newest dev ts (draft excluded)", ver, tag, ok)
+	}
+	// S2 only appears on the older dev release → that one is chosen for S2.
+	if ver, tag, ok := pickDevAsset(rels, "S2"); !ok || ver != "0.6.8-dev.202606021930" || tag != "v0.6.8-dev.202606021930" {
+		t.Errorf("S2 pick = (%q,%q,%t), want v0.6.8-dev.202606021930", ver, tag, ok)
+	}
+	// A SKU with no dev asset anywhere → not found.
+	if _, _, ok := pickDevAsset(rels, "S9"); ok {
+		t.Errorf("S9 should not be found")
+	}
+	if _, _, ok := pickDevAsset(nil, "S1"); ok {
+		t.Errorf("empty listing should not be found")
+	}
+}
+
+// devVector returns the named dev manifest vector (channel:"dev").
+func devVector(t *testing.T, v compatVectors, name string) (canonical, sigB64 string) {
+	t.Helper()
+	for _, m := range v.Manifests {
+		if m.Name == name {
+			return m.CanonicalString, m.SignatureB64
+		}
+	}
+	t.Fatalf("no manifest vector named %q", name)
+	return "", ""
+}
+
+// devReleaseFixture is one immutable dev prerelease the mock advertises via
+// the GitHub releases API, with its per-SKU index assets.
+type devReleaseFixture struct {
+	version string
+	idx     map[string]Index
+}
+
+// mockReleasesFull serves the stable latest/download redirect AND the dev
+// surface: the GitHub releases-list API at /releases plus each dev release's
+// per-SKU asset at /releases/download/v<version>/update-<SKU>.json. Asset
+// URLs are absolute and point back at this same server.
+func mockReleasesFull(t *testing.T, stable map[string]Index, devs []devReleaseFixture) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		base := "http://" + r.Host
+		switch {
+		case path == "/releases":
+			out := make([]map[string]any, 0, len(devs))
+			for _, d := range devs {
+				assets := make([]map[string]string, 0, len(d.idx))
+				for sku := range d.idx {
+					assets = append(assets, map[string]string{
+						"name":                 "update-" + sku + ".json",
+						"browser_download_url": base + "/releases/download/v" + d.version + "/update-" + sku + ".json",
+					})
+				}
+				out = append(out, map[string]any{
+					"tag_name":   "v" + d.version,
+					"prerelease": true,
+					"assets":     assets,
+				})
+			}
+			_ = json.NewEncoder(w).Encode(out)
+		case strings.HasPrefix(path, "/releases/download/v") && strings.HasSuffix(path, ".json"):
+			rest := strings.TrimPrefix(path, "/releases/download/v")
+			slash := strings.Index(rest, "/")
+			if slash < 0 {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			version := rest[:slash]
+			sku := strings.TrimSuffix(strings.TrimPrefix(rest[slash+1:], "update-"), ".json")
+			for _, d := range devs {
+				if d.version == version {
+					if idx, ok := d.idx[sku]; ok {
+						_ = json.NewEncoder(w).Encode(idx)
+						return
+					}
+				}
+			}
+			w.WriteHeader(http.StatusNotFound)
+		case strings.HasPrefix(path, "/releases/latest/download/update-") && strings.HasSuffix(path, ".json"):
+			sku := strings.TrimSuffix(strings.TrimPrefix(path, "/releases/latest/download/update-"), ".json")
+			if idx, ok := stable[sku]; ok {
+				_ = json.NewEncoder(w).Encode(idx)
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+}
+
+// TestCheckDevUnitStagesDevPrerelease drives the full dev path: a DEV unit,
+// the API listing advertises an immutable vX.Y.Z-dev.<ts> prerelease, and the
+// broker resolves + verifies its signed manifest and stages it on the dev
+// channel.
+func TestCheckDevUnitStagesDevPrerelease(t *testing.T) {
+	v := loadVectors(t)
+	const devVer = "0.6.8-dev.202606021930"
+	canonical, sigB64 := devVector(t, v, "ota-S1-dev-v"+devVer)
+	devIdx := Index{
+		Version:      devVer,
+		ManifestB64:  base64.StdEncoding.EncodeToString([]byte(canonical)),
+		SignatureB64: sigB64,
+		BinURL:       "https://downloads.example/cwm-S1-" + devVer + ".bin",
+	}
+	srv := mockReleasesFull(t, nil, []devReleaseFixture{
+		{version: devVer, idx: map[string]Index{"S1": devIdx}},
+	})
+	defer srv.Close()
+
+	cfg := otaConfigForVectors(t, v, srv.URL)
+	// The dev manifest is signed under key_id "ed25519-dev" (same test key).
+	cfg.OTA.Keys = append(cfg.OTA.Keys, config.OTAKey{
+		KeyID:     "ed25519-dev",
+		PubkeyB64: cfg.OTA.Keys[0].PubkeyB64,
+	})
+	reg := newRegistryWithDevice(t, testDevice, "S1", 0)
+	if err := reg.SetSerial(testDevice, "CWM-S1-DEV-2620-000001-0", "S1"); err != nil {
+		t.Fatalf("SetSerial: %v", err)
+	}
+	checker := NewChecker(cfg, reg, nil)
+
+	rep, err := checker.Check(context.Background(), true, "", "")
+	if err != nil {
+		t.Fatalf("dry-run Check: %v", err)
+	}
+	var devVerified bool
+	for _, s := range rep.PerSKU {
+		if s.Channel == "dev" {
+			if !s.Verified || s.LatestVersion != devVer {
+				t.Errorf("dev per-sku not verified at %s: %+v", devVer, s)
+			}
+			devVerified = true
+		}
+	}
+	if !devVerified {
+		t.Fatalf("expected a verified dev per-sku entry, got %+v", rep.PerSKU)
+	}
+	if len(rep.Devices) != 1 || rep.Devices[0].Action != "would_stage" ||
+		rep.Devices[0].Channel != "dev" || rep.Devices[0].To != devVer {
+		t.Fatalf("device result = %+v, want 1 would_stage dev %s", rep.Devices, devVer)
+	}
+}
+
+// devSelectFixture mirrors compat/ota/dev_release_select.json — the shared
+// contract for pickDevAsset. The releases use the real GitHub API field
+// names, so they unmarshal straight into []ghRelease.
+type devSelectFixture struct {
+	Cases []struct {
+		Name     string      `json:"name"`
+		Releases []ghRelease `json:"releases"`
+		Queries  []struct {
+			SKU    string `json:"sku"`
+			Expect *struct {
+				Version string `json:"version"`
+				Tag     string `json:"tag"`
+			} `json:"expect"`
+		} `json:"queries"`
+	} `json:"cases"`
+}
+
+// TestDevReleaseSelectVectors drives pickDevAsset from the shared
+// cross-runtime contract so Go, JS and Python pick the identical dev release.
+func TestDevReleaseSelectVectors(t *testing.T) {
+	raw, err := os.ReadFile(findCompatFile(t, "ota", "dev_release_select.json"))
+	if err != nil {
+		t.Fatalf("read dev_release_select.json: %v", err)
+	}
+	var fx devSelectFixture
+	if err := json.Unmarshal(raw, &fx); err != nil {
+		t.Fatalf("parse dev_release_select.json: %v", err)
+	}
+	if len(fx.Cases) == 0 {
+		t.Fatal("fixture carries no cases")
+	}
+	for _, c := range fx.Cases {
+		for _, q := range c.Queries {
+			ver, tag, ok := pickDevAsset(c.Releases, q.SKU)
+			if q.Expect == nil {
+				if ok {
+					t.Errorf("%s/%s: expected no pick, got (%q,%q)", c.Name, q.SKU, ver, tag)
+				}
+				continue
+			}
+			if !ok || ver != q.Expect.Version || tag != q.Expect.Tag {
+				t.Errorf("%s/%s: pick = (%q,%q,%t), want (%q,%q)",
+					c.Name, q.SKU, ver, tag, ok, q.Expect.Version, q.Expect.Tag)
+			}
+		}
+	}
+}

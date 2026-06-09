@@ -5,9 +5,13 @@
 // Flow per check:
 //
 //  1. Collect the distinct hardware SKUs of all registered devices.
-//  2. For each SKU, GET <repo>/releases/latest/download/update-<SKU>.json.
-//     GitHub 302-redirects this to the newest non-prerelease release's
-//     asset; the stdlib http.Client follows the redirect chain.
+//  2. For each SKU on the STABLE track, GET
+//     <repo>/releases/latest/download/update-<SKU>.json. GitHub
+//     302-redirects this to the newest non-prerelease release's asset; the
+//     stdlib http.Client follows the redirect chain (zero API, no rate
+//     limit). For the DEV track there is no "latest prerelease" redirect, so
+//     the broker lists releases via the GitHub API once per check and picks
+//     the newest immutable vX.Y.Z-dev.<ts> prerelease carrying that SKU.
 //  3. Decode the index's manifest_b64 + signature_b64 and verify the
 //     Ed25519 signature against the configured keyring. This is defense
 //     in depth — the device verifies the same signature again before it
@@ -35,6 +39,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -55,6 +60,17 @@ const (
 	initialDelay = 30 * time.Second
 	httpTimeout  = 10 * time.Second
 	maxIndexBody = 64 * 1024 // an update-<SKU>.json is well under 1 KiB
+	// maxReleasesBody caps the GitHub releases-list JSON read to resolve the
+	// newest dev prerelease. 100 releases × a few small assets each is well
+	// under this; it's a guard, not a tuning knob.
+	maxReleasesBody = 4 * 1024 * 1024
+	// devReleasesPerPage requests the newest N releases in one page. GitHub
+	// returns releases newest-first by created_at, so the newest dev
+	// prerelease is always on the first page; we never paginate. Bound caveat:
+	// a SKU whose newest dev build is >N releases back (i.e. N other releases
+	// were cut without it) would be missed — irrelevant in practice, since a
+	// dev publish ships every SKU together at an hourly cadence.
+	devReleasesPerPage = 100
 )
 
 // Index is the per-SKU update descriptor published as the release asset
@@ -64,6 +80,24 @@ type Index struct {
 	ManifestB64  string `json:"manifest_b64"`
 	SignatureB64 string `json:"signature_b64"`
 	BinURL       string `json:"bin_url"`
+}
+
+// ghAsset / ghRelease are the subset of the GitHub Releases API
+// (GET /repos/<owner>/<repo>/releases) the broker reads to locate the
+// newest dev prerelease. Dev builds publish IMMUTABLE per-version
+// prerelease tags (vX.Y.Z-dev.<ts>) — GitHub has no "latest prerelease"
+// redirect, so the broker lists releases and picks the newest by SemVer.
+// Stable still rides the zero-API latest/download redirect.
+type ghAsset struct {
+	Name string `json:"name"`
+	URL  string `json:"browser_download_url"`
+}
+
+type ghRelease struct {
+	TagName    string    `json:"tag_name"`
+	Prerelease bool      `json:"prerelease"`
+	Draft      bool      `json:"draft"`
+	Assets     []ghAsset `json:"assets"`
 }
 
 // manifestFields is the subset of the canonical OTA manifest the broker
@@ -335,6 +369,19 @@ func (c *Checker) Check(ctx context.Context, dryRun bool, skuFilter, deviceFilte
 		}
 	}
 
+	// Dev resolution needs the GitHub releases listing (no "latest
+	// prerelease" redirect exists). Fetch it ONCE per check, and only if a
+	// dev target is actually in scope — a stable-only fleet makes zero API
+	// calls. A listing failure is recorded and surfaced per dev SKU below.
+	var devRels []ghRelease
+	var devErr error
+	for _, t := range targets {
+		if t.channel != "" && t.channel != "stable" {
+			devRels, devErr = c.listDevReleases(ctx)
+			break
+		}
+	}
+
 	// Resolve each (SKU, channel) signed release once, iterating in a
 	// stable sorted key order so the report is deterministic.
 	resolvedByKey := map[string]*resolved{}
@@ -345,7 +392,7 @@ func (c *Checker) Check(ctx context.Context, dryRun bool, skuFilter, deviceFilte
 	sort.Strings(keys)
 	for _, k := range keys {
 		t := targets[k]
-		r, sres := c.resolveSKU(ctx, t.sku, t.channel)
+		r, sres := c.resolveSKU(ctx, t.sku, t.channel, devRels, devErr)
 		rep.PerSKU = append(rep.PerSKU, sres)
 		if r != nil {
 			resolvedByKey[k] = r
@@ -398,13 +445,17 @@ func (c *Checker) Check(ctx context.Context, dryRun bool, skuFilter, deviceFilte
 // channel). Returns (nil, SKUResult{Error}) on any failure. `channel` is
 // the device's effective channel ("stable" or "dev"); want collapses ""
 // to "stable" defensively.
-func (c *Checker) resolveSKU(ctx context.Context, sku, channel string) (*resolved, SKUResult) {
+func (c *Checker) resolveSKU(ctx context.Context, sku, channel string, devRels []ghRelease, devErr error) (*resolved, SKUResult) {
 	want := channel
 	if want == "" {
 		want = "stable"
 	}
 	sres := SKUResult{SKU: sku, Channel: want}
-	idx, err := c.fetchIndex(ctx, sku, channel)
+	if want == "dev" && devErr != nil {
+		sres.Error = devErr.Error()
+		return nil, sres
+	}
+	idx, err := c.fetchIndex(ctx, sku, channel, devRels)
 	if err != nil {
 		sres.Error = err.Error()
 		return nil, sres
@@ -533,21 +584,141 @@ func (c *Checker) decide(dev *registry.Device, r *resolved, dryRun bool) DeviceR
 	return out
 }
 
+// apiReleasesURL maps the public releases repo URL to the GitHub Releases
+// API listing endpoint. For a github.com repo it rewrites
+// https://github.com/<owner>/<repo> → https://api.github.com/repos/<owner>/
+// <repo>/releases; for any other host (self-hosted mirror / test server) it
+// appends /releases, so a test can intercept the same path shape.
+// githubToken returns an optional API token from the environment to lift
+// the unauthenticated rate limit; empty (unauthenticated) is fine for a
+// public repo at the broker's hourly cadence.
+func githubToken() string {
+	if t := strings.TrimSpace(os.Getenv("GITHUB_TOKEN")); t != "" {
+		return t
+	}
+	return strings.TrimSpace(os.Getenv("GH_TOKEN"))
+}
+
+func isGitHubRepo(repo string) bool {
+	return strings.HasPrefix(strings.TrimRight(repo, "/"), "https://github.com/")
+}
+
+func apiReleasesURL(repo string) string {
+	base := strings.TrimRight(repo, "/")
+	const gh = "https://github.com/"
+	q := fmt.Sprintf("?per_page=%d", devReleasesPerPage)
+	if rest, ok := strings.CutPrefix(base, gh); ok {
+		return "https://api.github.com/repos/" + rest + "/releases" + q
+	}
+	return base + "/releases" + q
+}
+
+// listDevReleases fetches the newest page of releases and returns them
+// newest-first (as GitHub orders them). Used only when a dev device is in
+// scope; stable resolution never calls it (no API, no rate limit). An
+// optional GITHUB_TOKEN / GH_TOKEN in the environment raises the
+// unauthenticated 60/h rate limit, but is not required for a public repo.
+func (c *Checker) listDevReleases(ctx context.Context) ([]ghRelease, error) {
+	url := apiReleasesURL(c.cfg.OTA.ReleasesRepo)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	req.Header.Set("User-Agent", "cwm-mcp-ota")
+	// Only ever send a GitHub credential to GitHub itself — never leak it to a
+	// self-hosted mirror configured as releases_repo.
+	if isGitHubRepo(c.cfg.OTA.ReleasesRepo) {
+		if tok := githubToken(); tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list releases %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list releases %s: HTTP %d", url, resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxReleasesBody))
+	if err != nil {
+		return nil, fmt.Errorf("read releases %s: %w", url, err)
+	}
+	var rels []ghRelease
+	if err := json.Unmarshal(body, &rels); err != nil {
+		return nil, fmt.Errorf("decode releases %s: %w", url, err)
+	}
+	return rels, nil
+}
+
+// pickDevAsset selects, among the dev prereleases, the NEWEST one (by
+// CompareSemver on the tag's version) that actually carries an
+// update-<SKU>.json asset, and returns that version + the release tag. A
+// release qualifies only if it is flagged prerelease (and NOT draft) and its
+// tag is a valid X.Y.Z-dev.<ts> version — a stray non-dev, non-prerelease or
+// draft release is ignored. Picking per-SKU (not "the newest dev release") is
+// deliberate: a dev publish that ships only S1 must not hide an older S2 dev
+// build. We return the tag (not the listing's browser_download_url) so the
+// caller builds the asset URL from the TRUSTED repo base — the listing is
+// untrusted metadata and must never steer the broker to an arbitrary host.
+func pickDevAsset(rels []ghRelease, sku string) (version, tag string, ok bool) {
+	want := "update-" + sku + ".json"
+	for _, r := range rels {
+		if !r.Prerelease || r.Draft {
+			continue
+		}
+		ver := strings.TrimPrefix(r.TagName, "v")
+		dash := strings.Index(ver, "-")
+		if dash < 0 {
+			continue // a final X.Y.Z is never a dev build
+		}
+		if _, isDev := devPrerelease(ver[dash:]); !isDev || !ValidVersion(ver) {
+			continue
+		}
+		has := false
+		for _, a := range r.Assets {
+			if a.Name == want {
+				has = true
+				break
+			}
+		}
+		if !has {
+			continue
+		}
+		if !ok {
+			version, tag, ok = ver, r.TagName, true
+			continue
+		}
+		if cmp, cok := CompareSemver(ver, version); cok && cmp > 0 {
+			version, tag = ver, r.TagName
+		}
+	}
+	return version, tag, ok
+}
+
 // fetchIndex GETs the update-<SKU>.json release asset for one (SKU,
 // channel). Stable rides GitHub's latest/download redirect (newest
-// non-prerelease); dev rides the rolling prerelease tag, so a dev device
-// never sees a stable build and a stable device never sees a prerelease.
-// The stdlib client follows GitHub's cross-host redirect chain
+// non-prerelease, zero API). Dev resolves the newest immutable
+// vX.Y.Z-dev.<ts> prerelease carrying this SKU from the pre-fetched
+// `devRels` listing, then GETs that release's asset — so a dev device never
+// sees a stable build and a stable device never sees a prerelease. The
+// stdlib client follows GitHub's cross-host redirect chain
 // (github.com → objects.githubusercontent.com) automatically.
-func (c *Checker) fetchIndex(ctx context.Context, sku, channel string) (Index, error) {
+func (c *Checker) fetchIndex(ctx context.Context, sku, channel string, devRels []ghRelease) (Index, error) {
 	base := strings.TrimRight(c.cfg.OTA.ReleasesRepo, "/")
 	var url string
 	if channel != "" && channel != "stable" {
-		devTag := c.cfg.OTA.DevTag
-		if devTag == "" {
-			devTag = "dev"
+		_, tag, found := pickDevAsset(devRels, sku)
+		if !found {
+			return Index{}, fmt.Errorf("no dev prerelease carrying update-%s.json among %d release(s)", sku, len(devRels))
 		}
-		url = base + "/releases/download/" + devTag + "/update-" + sku + ".json"
+		// Build the asset URL from the TRUSTED repo base + tag (same shape as
+		// the stable latest/download path and the publisher's bin_url), not
+		// from the listing's browser_download_url — never let untrusted
+		// listing metadata point the fetch at an arbitrary host.
+		url = base + "/releases/download/" + tag + "/update-" + sku + ".json"
 	} else {
 		url = base + "/releases/latest/download/update-" + sku + ".json"
 	}

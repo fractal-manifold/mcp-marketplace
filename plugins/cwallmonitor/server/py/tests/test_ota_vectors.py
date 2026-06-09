@@ -226,6 +226,117 @@ async def test_check_dev_unit_considers_both_channels(tmp_path):
         await server.close()
 
 
+def test_api_releases_url():
+    assert ota.api_releases_url("https://github.com/fractal-manifold/cwm-ota-releases") == \
+        "https://api.github.com/repos/fractal-manifold/cwm-ota-releases/releases?per_page=100"
+    assert ota.api_releases_url("https://github.com/fractal-manifold/cwm-ota-releases/") == \
+        "https://api.github.com/repos/fractal-manifold/cwm-ota-releases/releases?per_page=100"
+    assert ota.api_releases_url("http://127.0.0.1:5000") == "http://127.0.0.1:5000/releases?per_page=100"
+
+
+def test_dev_release_select_vectors():
+    """Drive pick_dev_asset from the shared cross-runtime contract so Go, JS
+    and Python pick the identical dev release."""
+    fx = json.loads(_find_compat("ota/dev_release_select.json").read_text())
+    assert fx["cases"], "fixture carries no cases"
+    for c in fx["cases"]:
+        for q in c["queries"]:
+            got = ota.pick_dev_asset(c["releases"], q["sku"])
+            if q["expect"] is None:
+                assert got is None, (c["name"], q["sku"])
+            else:
+                assert got == (q["expect"]["version"], q["expect"]["tag"]), (c["name"], q["sku"])
+
+
+def test_pick_dev_asset():
+    def a(sku):
+        return {"name": f"update-{sku}.json", "browser_download_url": f"u/{sku}"}
+    rels = [
+        {"tag_name": "v0.6.8-dev.202606022100", "prerelease": True, "assets": [a("S1")]},
+        {"tag_name": "v0.9.0-dev.202609090000", "prerelease": True, "draft": True, "assets": [a("S1")]},  # draft → ignored
+        {"tag_name": "v0.7.0", "prerelease": False, "assets": [a("S1")]},  # not prerelease
+        {"tag_name": "v0.6.8-dev.202606021930", "prerelease": True, "assets": [a("S1"), a("S2")]},
+        {"tag_name": "v0.6.7", "prerelease": True, "assets": [a("S1")]},  # plain version → ignored
+    ]
+    assert ota.pick_dev_asset(rels, "S1") == ("0.6.8-dev.202606022100", "v0.6.8-dev.202606022100")
+    assert ota.pick_dev_asset(rels, "S2") == ("0.6.8-dev.202606021930", "v0.6.8-dev.202606021930")
+    assert ota.pick_dev_asset(rels, "S9") is None
+    assert ota.pick_dev_asset([], "S1") is None
+
+
+def _dev_vector(name: str) -> tuple[str, str]:
+    for m in VECTORS["manifests"]:
+        if m["name"] == name:
+            return m["canonical_string"], m["signature_b64"]
+    raise AssertionError(f"no manifest vector named {name}")
+
+
+async def _mock_server_full(stable_by_sku: dict[str, dict], devs: list[dict]) -> TestServer:
+    """Serve the stable latest/download redirect AND the dev surface: the
+    releases-list API at /releases plus each dev release's per-SKU asset at
+    /releases/download/v<version>/update-<SKU>.json. devs: [{"version", "idx": {SKU: index}}]."""
+    async def list_handler(request: web.Request) -> web.Response:
+        out = []
+        for d in devs:
+            assets = [
+                {"name": f"update-{sku}.json",
+                 "browser_download_url": f"http://{request.host}/releases/download/v{d['version']}/update-{sku}.json"}
+                for sku in d["idx"]
+            ]
+            out.append({"tag_name": f"v{d['version']}", "prerelease": True, "assets": assets})
+        return web.json_response(out)
+
+    async def dev_asset_handler(request: web.Request) -> web.Response:
+        version = request.match_info["version"]
+        asset = request.match_info["asset"]
+        sku = asset[len("update-"):-len(".json")] if asset.startswith("update-") and asset.endswith(".json") else ""
+        for d in devs:
+            if d["version"] == version and sku in d["idx"]:
+                return web.json_response(d["idx"][sku])
+        return web.Response(status=404)
+
+    async def stable_handler(request: web.Request) -> web.Response:
+        asset = request.match_info["asset"]
+        sku = asset[len("update-"):-len(".json")] if asset.startswith("update-") and asset.endswith(".json") else ""
+        idx = stable_by_sku.get(sku)
+        return web.json_response(idx) if idx is not None else web.Response(status=404)
+
+    app = web.Application()
+    app.router.add_get("/releases", list_handler)
+    app.router.add_get("/releases/download/v{version}/{asset}", dev_asset_handler)
+    app.router.add_get("/releases/latest/download/{asset}", stable_handler)
+    server = TestServer(app)
+    await server.start_server()
+    return server
+
+
+async def test_check_dev_unit_stages_dev_prerelease(tmp_path):
+    """Full dev path: a DEV unit, the API listing advertises an immutable
+    vX.Y.Z-dev.<ts> prerelease, and the broker resolves + verifies its signed
+    manifest and stages it on the dev channel."""
+    dev_ver = "0.6.8-dev.202606021930"
+    canonical, sig_b64 = _dev_vector(f"ota-S1-dev-v{dev_ver}")
+    dev_idx = _index(canonical, sig_b64, version=dev_ver, bin_url=f"https://dl.example/cwm-S1-{dev_ver}.bin")
+    server = await _mock_server_full({}, [{"version": dev_ver, "idx": {"S1": dev_idx}}])
+    try:
+        cfg = _cfg_for(str(server.make_url("/")).rstrip("/"))
+        # The dev manifest is signed under key_id "ed25519-dev" (same test key).
+        cfg.ota.keys.append(OTAKey(key_id="ed25519-dev", pubkey_b64=cfg.ota.keys[0].pubkey_b64))
+        reg = _registry_with_device(tmp_path, "S1", 0)
+        reg.set_serial(TEST_DEVICE, "CWM-S1-DEV-2620-000001-0", "S1")  # flip to DEV
+
+        rep = await ota.check(cfg, reg, dry_run=True)
+        by_chan = {s["channel"]: s for s in rep["per_sku"]}
+        assert "dev" in by_chan and by_chan["dev"]["verified"], by_chan
+        assert by_chan["dev"]["latest_version"] == dev_ver
+        assert len(rep["devices"]) == 1
+        assert rep["devices"][0]["action"] == "would_stage"
+        assert rep["devices"][0]["channel"] == "dev"
+        assert rep["devices"][0]["to"] == dev_ver
+    finally:
+        await server.close()
+
+
 async def test_check_inert_when_unconfigured(tmp_path):
     cfg = Config()
     cfg.ota = OTA(enabled=True, releases_repo="https://github.com/x/y", keys=[])
