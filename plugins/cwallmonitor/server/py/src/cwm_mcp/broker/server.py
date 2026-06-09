@@ -788,6 +788,15 @@ async def _handle_device_settings(req: web.Request) -> web.Response:
         if autorotate_enabled is not None and not isinstance(autorotate_enabled, bool):
             raise ValueError("bad autorotate_enabled")
         autorotate_interval_s = _uint("autorotate_interval_s", 65535)
+        pet_enabled = body.get("pet_enabled")
+        if pet_enabled is not None and not isinstance(pet_enabled, bool):
+            raise ValueError("bad pet_enabled")
+        # pet_species is a uint (0..255 here); applyReported clamps to 0..9.
+        # Absent → None → left untouched (device hasn't picked a species).
+        pet_species = _uint("pet_species", 255)
+        pet_name = body.get("pet_name")
+        if pet_name is not None and not isinstance(pet_name, str):
+            raise ValueError("bad pet_name")
     except ValueError:
         return _error(400, "bad settings body")
 
@@ -800,6 +809,9 @@ async def _handle_device_settings(req: web.Request) -> web.Response:
             vol=vol,
             autorotate_enabled=autorotate_enabled,
             autorotate_interval_s=autorotate_interval_s,
+            pet_enabled=pet_enabled,
+            pet_species=pet_species,
+            pet_name=pet_name,
         )
     except NotFound:
         return _error(404, "unknown device")
@@ -862,6 +874,12 @@ def _pending_payload_json(p) -> str:
     # no-op /wall-monitor:theme switches.
     if getattr(p, "theme_mode", ""):
         wire["theme_mode"] = p.theme_mode
+    if p.pet_enabled is not None:
+        wire["pet_enabled"] = bool(p.pet_enabled)
+    if p.pet_species is not None:
+        wire["pet_species"] = int(p.pet_species)
+    if p.pet_name:
+        wire["pet_name"] = str(p.pet_name)
     gm = getattr(p, "gemini_models", None)
     if gm is not None and len(gm) > 0:
         # firmware/config_sync.c reads "gemini_models" as a CSV string

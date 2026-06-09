@@ -296,6 +296,10 @@ function emptyPayload() {
     br_day: 0, br_night: 0, vol: 0,
     providers: null, provider_modes: null, autorotate_enabled: null, autorotate_interval_s: null,
     theme_mode: "",
+    // Virtual pet — device-owned display settings, synced like theme/brightness.
+    // pet_enabled null = no change (default true on-device); pet_species null =
+    // not picked yet (no sentinel stored); pet_name "" = use species default.
+    pet_enabled: null, pet_species: null, pet_name: "",
     // null = "no opinion" (use global default); [] = clear override.
     gemini_models: null,
     // Diagnostic log upload toggle (NVS cwm_log_en). null = no change;
@@ -332,6 +336,9 @@ function payloadToTomlObj(p) {
   if (p.autorotate_enabled != null) d.autorotate_enabled = !!p.autorotate_enabled;
   if (p.autorotate_interval_s != null) d.autorotate_interval_s = Number(p.autorotate_interval_s);
   if (p.theme_mode) d.theme_mode = String(p.theme_mode);
+  if (p.pet_enabled != null) d.pet_enabled = !!p.pet_enabled;
+  if (p.pet_species != null) d.pet_species = Number(p.pet_species);
+  if (p.pet_name) d.pet_name = String(p.pet_name);
   if (Array.isArray(p.gemini_models) && p.gemini_models.length > 0) {
     d.gemini_models = p.gemini_models.map(String);
   }
@@ -364,6 +371,9 @@ function tomlObjToPayload(d) {
     autorotate_enabled: typeof d.autorotate_enabled === "boolean" ? d.autorotate_enabled : null,
     autorotate_interval_s: typeof d.autorotate_interval_s === "number" ? d.autorotate_interval_s : null,
     theme_mode: String(d.theme_mode || ""),
+    pet_enabled: typeof d.pet_enabled === "boolean" ? d.pet_enabled : null,
+    pet_species: typeof d.pet_species === "number" ? d.pet_species : null,
+    pet_name: String(d.pet_name || ""),
     gemini_models: Array.isArray(d.gemini_models) ? d.gemini_models.map(String) : null,
     log_enabled: typeof d.log_enabled === "boolean" ? d.log_enabled : null,
     firmware_url: String(d.firmware_url || ""),
@@ -485,6 +495,21 @@ function applyReported(p, s) {
     const v = clamp(Math.trunc(Number(s.autorotate_interval_s)), 1, 300);
     if (p.autorotate_interval_s !== v) { p.autorotate_interval_s = v; changed = true; }
   }
+  if (s.pet_enabled != null) {
+    const b = Boolean(s.pet_enabled);
+    if (p.pet_enabled !== b) { p.pet_enabled = b; changed = true; }
+  }
+  if (s.pet_species != null) {
+    // Clamp to the species enum 0..9 like every other numeric field. Absence
+    // (null) is handled by the caller — the device omits the field until it
+    // has picked a species, so no sentinel is stored.
+    const v = clamp(Math.trunc(Number(s.pet_species)), 0, 9);
+    if (p.pet_species !== v) { p.pet_species = v; changed = true; }
+  }
+  if (s.pet_name != null) {
+    const name = String(s.pet_name).slice(0, 15);
+    if (p.pet_name !== name) { p.pet_name = name; changed = true; }
+  }
   return changed;
 }
 
@@ -504,6 +529,9 @@ function mergePayload(base, upd) {
     autorotate_enabled: upd.autorotate_enabled != null ? upd.autorotate_enabled : base.autorotate_enabled,
     autorotate_interval_s: upd.autorotate_interval_s != null ? upd.autorotate_interval_s : base.autorotate_interval_s,
     theme_mode: upd.theme_mode || base.theme_mode,
+    pet_enabled: upd.pet_enabled != null ? upd.pet_enabled : base.pet_enabled,
+    pet_species: upd.pet_species != null ? upd.pet_species : base.pet_species,
+    pet_name: upd.pet_name || base.pet_name,
     gemini_models: Array.isArray(upd.gemini_models)
       ? upd.gemini_models.slice()
       : base.gemini_models,
@@ -528,6 +556,11 @@ function payloadEquivalent(a, b) {
   if ((a.autorotate_interval_s == null) !== (b.autorotate_interval_s == null)) return false;
   if (a.autorotate_interval_s != null && a.autorotate_interval_s !== b.autorotate_interval_s) return false;
   if ((a.theme_mode || "") !== (b.theme_mode || "")) return false;
+  if ((a.pet_enabled == null) !== (b.pet_enabled == null)) return false;
+  if (a.pet_enabled != null && a.pet_enabled !== b.pet_enabled) return false;
+  if ((a.pet_species == null) !== (b.pet_species == null)) return false;
+  if (a.pet_species != null && a.pet_species !== b.pet_species) return false;
+  if ((a.pet_name || "") !== (b.pet_name || "")) return false;
   const am = Array.isArray(a.gemini_models) ? a.gemini_models : [];
   const bm = Array.isArray(b.gemini_models) ? b.gemini_models : [];
   if (am.length !== bm.length) return false;

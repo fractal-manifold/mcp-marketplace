@@ -90,6 +90,9 @@ function pendingChanges(a, p) {
   if (p.log_enabled != null && (a.log_enabled == null || p.log_enabled !== a.log_enabled)) out.push("log_enabled");
   if (p.autorotate_interval_s != null && p.autorotate_interval_s !== a.autorotate_interval_s) out.push("autorotate_interval_s");
   if (p.theme_mode && p.theme_mode !== a.theme_mode) out.push("theme_mode");
+  if (p.pet_enabled != null && p.pet_enabled !== a.pet_enabled) out.push("pet_enabled");
+  if (p.pet_species != null && p.pet_species !== a.pet_species) out.push("pet_species");
+  if (p.pet_name && p.pet_name !== a.pet_name) out.push("pet_name");
   if (Array.isArray(p.gemini_models)) {
     const am = Array.isArray(a.gemini_models) ? a.gemini_models : [];
     const same = am.length === p.gemini_models.length && am.every((m, i) => m === p.gemini_models[i]);
@@ -380,7 +383,7 @@ function setDevicePendingTool(deps, args) {
       return { error: e.message };
     }
   }
-  const upd = { version: 0, broker_url: "", psk_hex: "", city: "", br_day: 0, br_night: 0, vol: 0, providers: null, provider_modes: null, autorotate_enabled: null, autorotate_interval_s: null, theme_mode: "", gemini_models: null, log_enabled: null, firmware_url: "", firmware_sha256: "", firmware_version: "", firmware_manifest_b64: "", firmware_manifest_sig_b64: "", min_secure_version: 0 };
+  const upd = { version: 0, broker_url: "", psk_hex: "", city: "", br_day: 0, br_night: 0, vol: 0, providers: null, provider_modes: null, autorotate_enabled: null, autorotate_interval_s: null, theme_mode: "", pet_enabled: null, pet_species: null, pet_name: "", gemini_models: null, log_enabled: null, firmware_url: "", firmware_sha256: "", firmware_version: "", firmware_manifest_b64: "", firmware_manifest_sig_b64: "", min_secure_version: 0 };
   if (args.broker_url) upd.broker_url = String(args.broker_url).trim();
   if (args.psk_hex) {
     const v = String(args.psk_hex).trim().toLowerCase();
@@ -430,6 +433,14 @@ function setDevicePendingTool(deps, args) {
     }
     upd.theme_mode = tm;
   }
+  // Virtual pet — device-owned display settings, same handling shape as
+  // theme/brightness/autorotate above.
+  if ("pet_enabled" in args) upd.pet_enabled = !!args.pet_enabled;
+  if ("pet_species" in args) {
+    const v = Number.parseInt(args.pet_species, 10);
+    if (Number.isFinite(v)) upd.pet_species = clamp(v, 0, 9);
+  }
+  if (args.pet_name) upd.pet_name = String(args.pet_name).slice(0, 15);
   if ("gemini_models" in args) {
     const raw = args.gemini_models == null ? "" : String(args.gemini_models);
     const parts = raw.split(",").map((s) => s.trim()).filter((s) => s.length > 0);

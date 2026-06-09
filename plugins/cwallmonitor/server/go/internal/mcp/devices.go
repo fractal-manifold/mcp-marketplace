@@ -99,6 +99,19 @@ func pendingChanges(active, pending registry.ConfigPayload) []string {
 	if pending.ThemeMode != "" && pending.ThemeMode != active.ThemeMode {
 		diffs = append(diffs, "theme_mode")
 	}
+	if pending.PetEnabled != nil {
+		if active.PetEnabled == nil || *active.PetEnabled != *pending.PetEnabled {
+			diffs = append(diffs, "pet_enabled")
+		}
+	}
+	if pending.PetSpecies != nil {
+		if active.PetSpecies == nil || *active.PetSpecies != *pending.PetSpecies {
+			diffs = append(diffs, "pet_species")
+		}
+	}
+	if pending.PetName != "" && pending.PetName != active.PetName {
+		diffs = append(diffs, "pet_name")
+	}
 	if pending.GeminiModels != nil && !stringSliceEqual(active.GeminiModels, pending.GeminiModels) {
 		diffs = append(diffs, "gemini_models")
 	}
@@ -370,6 +383,23 @@ func handleSetDevicePending(d Deps) server.ToolHandlerFunc {
 				return mcp.NewToolResultError("theme_mode must be one of: day, night, auto"), nil
 			}
 			update.ThemeMode = tm
+		}
+
+		// Virtual pet — device-owned display settings, same handling shape
+		// as theme/brightness/autorotate above.
+		if _, ok := anyProv["pet_enabled"]; ok {
+			v := req.GetBool("pet_enabled", true)
+			update.PetEnabled = &v
+		}
+		if _, ok := anyProv["pet_species"]; ok {
+			sp := clamp8(uint8(req.GetFloat("pet_species", 0)), 0, 9)
+			update.PetSpecies = &sp
+		}
+		if v := req.GetString("pet_name", ""); v != "" {
+			if len(v) > 15 {
+				v = v[:15]
+			}
+			update.PetName = v
 		}
 
 		// gemini_models: comma-separated list. Empty string clears the

@@ -144,6 +144,12 @@ def _pending_changes(active: ConfigPayload, pending: ConfigPayload) -> list[str]
         diffs.append("autorotate_interval_s")
     if pending.theme_mode and pending.theme_mode != active.theme_mode:
         diffs.append("theme_mode")
+    if pending.pet_enabled is not None and (active.pet_enabled is None or pending.pet_enabled != active.pet_enabled):
+        diffs.append("pet_enabled")
+    if pending.pet_species is not None and (active.pet_species is None or pending.pet_species != active.pet_species):
+        diffs.append("pet_species")
+    if pending.pet_name and pending.pet_name != active.pet_name:
+        diffs.append("pet_name")
     if pending.gemini_models is not None:
         am = list(active.gemini_models or [])
         pm = list(pending.gemini_models or [])
@@ -558,6 +564,17 @@ def _set_device_pending(deps: Deps, args: dict) -> dict:
         if v not in ("day", "night", "auto"):
             return {"error": "theme_mode must be one of: day, night, auto"}
         update.theme_mode = v
+    # Virtual pet — device-owned display settings, same handling shape as
+    # theme/brightness/autorotate above.
+    if "pet_enabled" in args:
+        update.pet_enabled = bool(args["pet_enabled"])
+    if "pet_species" in args:
+        try:
+            update.pet_species = _clamp(int(args["pet_species"]), 0, 9)
+        except (TypeError, ValueError):
+            pass
+    if (pn := (args.get("pet_name") or "")):
+        update.pet_name = str(pn)[:15]
     if "gemini_models" in args:
         raw = args["gemini_models"]
         if raw is None:

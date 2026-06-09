@@ -618,6 +618,20 @@ function handleDeviceSettings({ cfg, cache, state, registry, logger, deviceID },
       if (!validUint(body.autorotate_interval_s, 65535)) return finishErr(400, "bad settings body");
       s.autorotate_interval_s = body.autorotate_interval_s;
     }
+    if (body.pet_enabled != null) {
+      if (typeof body.pet_enabled !== "boolean") return finishErr(400, "bad settings body");
+      s.pet_enabled = body.pet_enabled;
+    }
+    if (body.pet_species != null) {
+      // uint (0..255 here); applyReported clamps to the 0..9 enum. Absent →
+      // left untouched (device hasn't picked a species).
+      if (!validUint(body.pet_species, 255)) return finishErr(400, "bad settings body");
+      s.pet_species = body.pet_species;
+    }
+    if (body.pet_name != null) {
+      if (typeof body.pet_name !== "string") return finishErr(400, "bad settings body");
+      s.pet_name = body.pet_name;  // truncated to 15 chars downstream
+    }
 
     try { registry.reportSettings(deviceID, s); }
     catch (e) {
@@ -658,6 +672,9 @@ function pendingPayloadJSON(p) {
   // and writes it to KEY_THEME_MD. Omitting it here would silently
   // no-op /wall-monitor:theme switches.
   if (p.theme_mode) wire.theme_mode = p.theme_mode;
+  if (p.pet_enabled != null) wire.pet_enabled = !!p.pet_enabled;
+  if (p.pet_species != null) wire.pet_species = Number(p.pet_species);
+  if (p.pet_name) wire.pet_name = String(p.pet_name);
   if (Array.isArray(p.gemini_models) && p.gemini_models.length > 0) {
     // firmware/config_sync.c reads "gemini_models" as a CSV string and
     // writes it to NVS key cwm_gem_mdls.

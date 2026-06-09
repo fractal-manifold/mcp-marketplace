@@ -1,6 +1,6 @@
 ---
 name: settings
-description: cwallmonitor plugin — remotely change any on-device setting that the Settings panel exposes (city, day / night brightness, alert volume, enabled providers, auto-rotation, broker URL, passphrase) on a C Wall Monitor device. Equivalent to long-pressing the mascot on the dashboard and editing a row, but driven from Claude Code via the control plane. Use this when the user says "set the wall monitor city to Madrid", "lower the night brightness", "mute the alerts", "disable Codex on device X", "rotate providers every 60 s", "rotate the broker passphrase", "change the broker URL", or any similar reconfiguration of an already-provisioned device.
+description: cwallmonitor plugin — remotely change any on-device setting that the Settings panel exposes (city, day / night brightness, alert volume, enabled providers, auto-rotation, virtual pet, broker URL, passphrase) on a C Wall Monitor device. Equivalent to long-pressing the mascot on the dashboard and editing a row, but driven from Claude Code via the control plane. Use this when the user says "set the wall monitor city to Madrid", "lower the night brightness", "mute the alerts", "disable Codex on device X", "rotate providers every 60 s", "change the pet to a dragon", "rename the pet", "hide the pet", "rotate the broker passphrase", "change the broker URL", or any similar reconfiguration of an already-provisioned device.
 ---
 
 # /cwallmonitor:settings
@@ -24,6 +24,7 @@ field here.
 - "Enable / disable Codex on the wall monitor."
 - "Rotate providers every 60 s."
 - "Stop rotating providers." / "Pin the dashboard to Claude."
+- "Change the pet to a dragon." / "Rename the pet to Sparky." / "Hide the pet."
 - "Change the broker URL on device `<id>`."
 - "Rotate the broker passphrase on the wall monitor."
 - "Update the wall monitor settings."
@@ -92,6 +93,27 @@ Codex" → `provider_mode_codex=disabled`; "show Claude as API spend" →
 | Theme (day / night / auto)        | `theme_mode`               | one of `day`, `night`, `auto`      |
 | Day brightness                    | `br_day`                   | int, 10..100 (% of backlight)      |
 | Night brightness                  | `br_night`                 | int, 5..100 (% of backlight)       |
+
+#### Virtual pet
+
+These are **device-owned** display settings: the user can also pick them on
+the device, and the device reports its choice back via
+`POST /device/<id>/settings` (so a control-plane push and an on-device edit
+converge — see `compat/SETTINGS_REPORT.md`). They apply on the device's next
+poll like any other Display field.
+
+| User intent                       | MCP argument               | Valid range / format               |
+| --------------------------------- | -------------------------- | ---------------------------------- |
+| Show / hide the pet               | `pet_enabled`              | bool (default true)                |
+| Pet species                       | `pet_species`              | int 0..9 (enum below; clamped)     |
+| Pet name                          | `pet_name`                 | string ≤ 15 chars (truncated; `""` = species default) |
+
+Species enum: `0=cat, 1=dog, 2=dragon, 3=robot, 4=blob, 5=slime, 6=duck,
+7=penguin, 8=owl, 9=ghost`. Map a named animal to its number (e.g. "make it a
+dragon" → `pet_species: 2`); if the user names a species not in the list, pick
+the closest or ask. Note the device may not have picked a species yet, in
+which case `pet_species` is simply absent from its report — that is normal and
+leaves the stored value untouched.
 
 #### Network
 
@@ -272,6 +294,15 @@ wall_monitor_set_device_pending
   provider_codex: false
   autorotate_enabled: true
   autorotate_interval_s: 45
+```
+
+### Change the pet to a named dragon
+
+```
+wall_monitor_set_device_pending
+  device_id: ab12cd34
+  pet_species: 2
+  pet_name: Sparky
 ```
 
 ### Rotate the passphrase

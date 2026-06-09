@@ -158,6 +158,17 @@ type ConfigPayload struct {
 	// opinion" / "don't touch on the device" for partial pending updates;
 	// see compat/tool-schemas.json for the enum.
 	ThemeMode            string       `toml:"theme_mode,omitempty"`
+	// PetEnabled toggles the on-device virtual pet. Pointer so an omitted
+	// field means "no change". PetSpecies is the species enum 0..9
+	// (0=cat,1=dog,2=dragon,3=robot,4=blob,5=slime,6=duck,7=penguin,
+	// 8=owl,9=ghost); pointer so absence (device hasn't picked yet) leaves
+	// it untouched — no sentinel is stored. PetName is the user-given pet
+	// name, up to 15 chars; empty string means "use the species default
+	// name" (device-side). These are device-owned display settings, synced
+	// exactly like theme_mode / brightness; see compat/SETTINGS_REPORT.md.
+	PetEnabled           *bool        `toml:"pet_enabled,omitempty"`
+	PetSpecies           *uint8       `toml:"pet_species,omitempty"`
+	PetName              string       `toml:"pet_name,omitempty"`
 	// GeminiModels overrides service.toml [gemini].models for this
 	// device. The broker honours this list when serving /usage/gemini
 	// for the device. Empty means "use the global default". Max 3 entries;
@@ -557,6 +568,9 @@ type ReportedSettings struct {
 	Vol                 *uint8
 	AutorotateEnabled   *bool
 	AutorotateIntervalS *uint16
+	PetEnabled          *bool
+	PetSpecies          *uint8
+	PetName             *string
 }
 
 // applyReported overlays the reported device-owned fields onto a payload,
@@ -614,6 +628,29 @@ func applyReported(p *ConfigPayload, s ReportedSettings) bool {
 		if p.AutorotateIntervalS == nil || *p.AutorotateIntervalS != v {
 			nv := v
 			p.AutorotateIntervalS = &nv
+			changed = true
+		}
+	}
+	if s.PetEnabled != nil {
+		if p.PetEnabled == nil || *p.PetEnabled != *s.PetEnabled {
+			v := *s.PetEnabled
+			p.PetEnabled = &v
+			changed = true
+		}
+	}
+	if s.PetSpecies != nil {
+		// Clamp to the species enum 0..9 like every other numeric field.
+		// Absence (nil) is handled by the caller — the device omits the
+		// field until it has picked a species, so no sentinel is stored.
+		clampSet(&p.PetSpecies, *s.PetSpecies, 0, 9)
+	}
+	if s.PetName != nil {
+		name := *s.PetName
+		if len(name) > 15 {
+			name = name[:15]
+		}
+		if p.PetName != name {
+			p.PetName = name
 			changed = true
 		}
 	}
@@ -943,6 +980,17 @@ func mergePayload(base, upd ConfigPayload) ConfigPayload {
 	if upd.ThemeMode != "" {
 		out.ThemeMode = upd.ThemeMode
 	}
+	if upd.PetEnabled != nil {
+		v := *upd.PetEnabled
+		out.PetEnabled = &v
+	}
+	if upd.PetSpecies != nil {
+		v := *upd.PetSpecies
+		out.PetSpecies = &v
+	}
+	if upd.PetName != "" {
+		out.PetName = upd.PetName
+	}
 	if upd.GeminiModels != nil {
 		// Copy so callers can't mutate the stored slice afterwards.
 		m := make([]string, len(upd.GeminiModels))
@@ -989,6 +1037,7 @@ func payloadEquivalent(a, b ConfigPayload) bool {
 		a.PSKHex != b.PSKHex ||
 		a.City != b.City ||
 		a.ThemeMode != b.ThemeMode ||
+		a.PetName != b.PetName ||
 		a.FirmwareURL != b.FirmwareURL ||
 		a.FirmwareSHA256 != b.FirmwareSHA256 ||
 		a.FirmwareVersion != b.FirmwareVersion ||
@@ -1016,6 +1065,12 @@ func payloadEquivalent(a, b ConfigPayload) bool {
 		return false
 	}
 	if !ptrU16Equal(a.AutorotateIntervalS, b.AutorotateIntervalS) {
+		return false
+	}
+	if !ptrBoolEqual(a.PetEnabled, b.PetEnabled) {
+		return false
+	}
+	if !ptrU8Equal(a.PetSpecies, b.PetSpecies) {
 		return false
 	}
 	if !strSliceEqual(a.GeminiModels, b.GeminiModels) {

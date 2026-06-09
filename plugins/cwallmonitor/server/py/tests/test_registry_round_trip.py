@@ -170,3 +170,33 @@ def test_report_settings_updates_active_and_pending_no_version_bump(tmp_path: Pa
     assert dev2.active.payload.theme_mode == "night"
     assert dev2.active.payload.br_day == 100
     assert dev2.active.payload.version == active_v
+
+
+def test_report_settings_pet_fields(tmp_path: Path):
+    reg = Registry(str(tmp_path))
+    reg.register("abcdef07", ConfigPayload(broker_url="http://x", psk_hex="aa" * 32))
+
+    dev = reg.report_settings(
+        "abcdef07",
+        pet_enabled=True,
+        pet_species=2,
+        pet_name="Sparky the very long pet name",  # truncates to 15
+    )
+    assert dev.active.payload.pet_enabled is True
+    assert dev.active.payload.pet_species == 2
+    assert dev.active.payload.pet_name == "Sparky the very"
+
+    # Out-of-range species clamps to 9.
+    dev = reg.report_settings("abcdef07", pet_species=42)
+    assert dev.active.payload.pet_species == 9
+
+    # Absent pet_species (None) leaves the stored value untouched.
+    dev = reg.report_settings("abcdef07", pet_name="Rex")
+    assert dev.active.payload.pet_species == 9
+    assert dev.active.payload.pet_name == "Rex"
+
+    # Survives reload from disk.
+    dev2 = reg.load("abcdef07")
+    assert dev2.active.payload.pet_species == 9
+    assert dev2.active.payload.pet_name == "Rex"
+    assert dev2.active.payload.pet_enabled is True

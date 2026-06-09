@@ -215,6 +215,62 @@ func TestReportSettings_UpdatesActiveAndPendingNoVersionBump(t *testing.T) {
 
 func sptr(s string) *string { return &s }
 
+// TestReportSettings_PetFields mirrors the display-settings report-back for the
+// device-owned virtual-pet fields: pet_enabled (bool), pet_species (clamped
+// 0..9), pet_name (truncated to 15). Absence of pet_species must leave the
+// stored value untouched (no sentinel). See compat/SETTINGS_REPORT.md.
+func TestReportSettings_PetFields(t *testing.T) {
+	r := newReg(t)
+	if _, err := r.Register(testID, ConfigPayload{PSKHex: testPSK, BrokerURL: "http://a"}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	enabled := true
+	name := "Sparky the very long pet name"
+	dev, err := r.ReportSettings(testID, ReportedSettings{
+		PetEnabled: &enabled, PetSpecies: u8ptr(2), PetName: &name,
+	})
+	if err != nil {
+		t.Fatalf("ReportSettings: %v", err)
+	}
+	if dev.Active.PetEnabled == nil || !*dev.Active.PetEnabled {
+		t.Errorf("PetEnabled not applied: %+v", dev.Active.PetEnabled)
+	}
+	if dev.Active.PetSpecies == nil || *dev.Active.PetSpecies != 2 {
+		t.Errorf("PetSpecies not applied: %+v", dev.Active.PetSpecies)
+	}
+	if dev.Active.PetName != "Sparky the very" {
+		t.Errorf("PetName not truncated to 15: %q", dev.Active.PetName)
+	}
+
+	// Out-of-range species is clamped to 9.
+	dev, err = r.ReportSettings(testID, ReportedSettings{PetSpecies: u8ptr(42)})
+	if err != nil {
+		t.Fatalf("ReportSettings clamp: %v", err)
+	}
+	if dev.Active.PetSpecies == nil || *dev.Active.PetSpecies != 9 {
+		t.Errorf("PetSpecies clamp failed: %+v", dev.Active.PetSpecies)
+	}
+
+	// Absent pet_species (nil) leaves the stored value untouched.
+	dev, err = r.ReportSettings(testID, ReportedSettings{PetName: sptr("Rex")})
+	if err != nil {
+		t.Fatalf("ReportSettings absence: %v", err)
+	}
+	if dev.Active.PetSpecies == nil || *dev.Active.PetSpecies != 9 {
+		t.Errorf("absent pet_species mutated stored value: %+v", dev.Active.PetSpecies)
+	}
+	if dev.Active.PetName != "Rex" {
+		t.Errorf("PetName not updated: %q", dev.Active.PetName)
+	}
+
+	// Survives reload from disk.
+	dev, _ = r.Load(testID)
+	if dev.Active.PetSpecies == nil || *dev.Active.PetSpecies != 9 || dev.Active.PetName != "Rex" {
+		t.Errorf("not persisted: %+v", dev.Active.ConfigPayload)
+	}
+}
+
 func TestSetPending_BumpsVersionAndMerges(t *testing.T) {
 	r := newReg(t)
 	if _, err := r.Register(testID, ConfigPayload{

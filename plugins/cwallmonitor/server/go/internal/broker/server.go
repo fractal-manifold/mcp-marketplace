@@ -772,6 +772,15 @@ func pendingPayloadJSON(p registry.ConfigPayload) ([]byte, error) {
 		// silently no-op /wall-monitor:theme switches.
 		wire["theme_mode"] = p.ThemeMode
 	}
+	if p.PetEnabled != nil {
+		wire["pet_enabled"] = *p.PetEnabled
+	}
+	if p.PetSpecies != nil {
+		wire["pet_species"] = *p.PetSpecies
+	}
+	if p.PetName != "" {
+		wire["pet_name"] = p.PetName
+	}
 	if len(p.GeminiModels) > 0 {
 		// firmware/config_sync.c reads "gemini_models" as a CSV string
 		// and writes it to NVS key cwm_gem_mdls. The device uses it
@@ -1042,6 +1051,9 @@ type settingsReportBody struct {
 	Vol                 *uint8  `json:"vol"`
 	AutorotateEnabled   *bool   `json:"autorotate_enabled"`
 	AutorotateIntervalS *uint16 `json:"autorotate_interval_s"`
+	PetEnabled          *bool   `json:"pet_enabled"`
+	PetSpecies          *uint8  `json:"pet_species"`
+	PetName             *string `json:"pet_name"`
 }
 
 // handleDeviceSettings ingests a device-reported display-settings update and
@@ -1133,6 +1145,9 @@ func handleDeviceSettings(cfg *config.Config, cache *auth.NonceCache, logger *lo
 		Vol:                 body.Vol,
 		AutorotateEnabled:   body.AutorotateEnabled,
 		AutorotateIntervalS: body.AutorotateIntervalS,
+		PetEnabled:          body.PetEnabled,
+		PetSpecies:          body.PetSpecies,
+		PetName:             body.PetName,
 	}); errors.Is(rerr, registry.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "unknown device")
 		return

@@ -221,6 +221,18 @@
             ],
             "description": "Theme mode applied on the device: 'day' (light palette), 'night' (dark palette) or 'auto' (follows sunrise/sunset). The change takes effect on the reboot that follows promotion."
           },
+          "pet_enabled": {
+            "type": "boolean",
+            "description": "Show the on-device virtual pet (default true). The pet is device-owned, like the display settings; the user can also toggle it on the device."
+          },
+          "pet_species": {
+            "type": "number",
+            "description": "Virtual pet species, 0..9: 0=cat,1=dog,2=dragon,3=robot,4=blob,5=slime,6=duck,7=penguin,8=owl,9=ghost. Out-of-range values are clamped."
+          },
+          "pet_name": {
+            "type": "string",
+            "description": "Virtual pet name, up to 15 chars (truncated). Empty string uses the species default name."
+          },
           "gemini_models": {
             "type": "string",
             "description": "Comma-separated list of Gemini model IDs to show on the dashboard (max 3). Example: 'gemini-2.5-pro,gemini-2.5-flash'. Empty string clears the override and falls back to the broker's global default (service.toml [gemini].models)."

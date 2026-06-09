@@ -179,6 +179,36 @@ test("reportSettings updates active and pending without bumping version", () => 
   }
 });
 
+test("reportSettings applies device-owned pet fields (clamp/truncate/absence)", () => {
+  const tmp = mkdtempSync(join(tmpdir(), "cwm-reg-"));
+  try {
+    const reg = new Registry(tmp);
+    reg.register("abcdef07", { ..._testing.emptyPayload(), broker_url: "http://x", psk_hex: "aa".repeat(32) });
+
+    let dev = reg.reportSettings("abcdef07", { pet_enabled: true, pet_species: 2, pet_name: "Sparky the very long pet name" });
+    assert.equal(dev.active.payload.pet_enabled, true);
+    assert.equal(dev.active.payload.pet_species, 2);
+    assert.equal(dev.active.payload.pet_name, "Sparky the very");  // truncated to 15
+
+    // Out-of-range species clamps to 9.
+    dev = reg.reportSettings("abcdef07", { pet_species: 42 });
+    assert.equal(dev.active.payload.pet_species, 9);
+
+    // Absent pet_species leaves the stored value untouched.
+    dev = reg.reportSettings("abcdef07", { pet_name: "Rex" });
+    assert.equal(dev.active.payload.pet_species, 9);
+    assert.equal(dev.active.payload.pet_name, "Rex");
+
+    // Survives reload from disk.
+    const dev2 = reg.load("abcdef07");
+    assert.equal(dev2.active.payload.pet_species, 9);
+    assert.equal(dev2.active.payload.pet_name, "Rex");
+    assert.equal(dev2.active.payload.pet_enabled, true);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 // Serial-derived channel routing must match the shared cross-runtime contract.
 const channelPath = findCompat("registry/channel_routing.json");
 const chanSkip = channelPath ? false : "compat/registry/channel_routing.json unavailable (standalone checkout)";

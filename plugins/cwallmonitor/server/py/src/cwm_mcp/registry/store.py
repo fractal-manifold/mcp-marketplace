@@ -185,6 +185,14 @@ class ConfigPayload:
     autorotate_enabled: bool | None = None
     autorotate_interval_s: int | None = None
     theme_mode: str = ""
+    # Virtual pet — device-owned display settings, synced exactly like
+    # theme_mode / brightness. pet_enabled: None = "no change" (default
+    # true on-device). pet_species: enum 0..9 (cat..ghost); None = "no
+    # change" / not picked yet, so no sentinel is stored. pet_name: up to
+    # 15 chars; "" = use the species default name. See SETTINGS_REPORT.md.
+    pet_enabled: bool | None = None
+    pet_species: int | None = None
+    pet_name: str = ""
     # Per-device override of the Gemini model list surfaced as
     # /usage/gemini slots. None = "no opinion" (use global default);
     # empty list = "clear the override". Max 3 entries.
@@ -233,6 +241,12 @@ class ConfigPayload:
             d["autorotate_interval_s"] = int(self.autorotate_interval_s)
         if self.theme_mode:
             d["theme_mode"] = str(self.theme_mode)
+        if self.pet_enabled is not None:
+            d["pet_enabled"] = bool(self.pet_enabled)
+        if self.pet_species is not None:
+            d["pet_species"] = int(self.pet_species)
+        if self.pet_name:
+            d["pet_name"] = str(self.pet_name)
         if self.gemini_models is not None and len(self.gemini_models) > 0:
             d["gemini_models"] = [str(m) for m in self.gemini_models]
         if self.log_enabled is not None:
@@ -273,6 +287,9 @@ class ConfigPayload:
             autorotate_enabled=d["autorotate_enabled"] if "autorotate_enabled" in d else None,
             autorotate_interval_s=int(d["autorotate_interval_s"]) if "autorotate_interval_s" in d else None,
             theme_mode=str(d.get("theme_mode", "")),
+            pet_enabled=bool(d["pet_enabled"]) if "pet_enabled" in d else None,
+            pet_species=int(d["pet_species"]) if "pet_species" in d else None,
+            pet_name=str(d.get("pet_name", "")),
             gemini_models=[str(m) for m in d["gemini_models"]] if "gemini_models" in d else None,
             log_enabled=bool(d["log_enabled"]) if "log_enabled" in d else None,
             firmware_url=str(d.get("firmware_url", "")),
@@ -493,6 +510,9 @@ class Registry:
         vol: int | None = None,
         autorotate_enabled: bool | None = None,
         autorotate_interval_s: int | None = None,
+        pet_enabled: bool | None = None,
+        pet_species: int | None = None,
+        pet_name: str | None = None,
     ) -> Device:
         """Apply device-reported display settings to the stored config WITHOUT
         bumping the version. The device owns these fields (the user sets them on
@@ -506,11 +526,13 @@ class Registry:
             changed = _apply_reported(
                 dev.active.payload, theme_mode, br_day, br_night, vol,
                 autorotate_enabled, autorotate_interval_s,
+                pet_enabled, pet_species, pet_name,
             )
             if dev.pending is not None:
                 changed = _apply_reported(
                     dev.pending.payload, theme_mode, br_day, br_night, vol,
                     autorotate_enabled, autorotate_interval_s,
+                    pet_enabled, pet_species, pet_name,
                 ) or changed
             if changed:
                 self._save_locked(dev)
@@ -662,6 +684,9 @@ def _apply_reported(
     vol: int | None,
     autorotate_enabled: bool | None,
     autorotate_interval_s: int | None,
+    pet_enabled: bool | None = None,
+    pet_species: int | None = None,
+    pet_name: str | None = None,
 ) -> bool:
     """Overlay reported device-owned fields onto a payload, clamping numeric
     ranges and ignoring an unknown theme_mode. Returns True if anything changed.
@@ -700,6 +725,24 @@ def _apply_reported(
         if p.autorotate_interval_s != v:
             p.autorotate_interval_s = v
             changed = True
+    if pet_enabled is not None:
+        b = bool(pet_enabled)
+        if p.pet_enabled != b:
+            p.pet_enabled = b
+            changed = True
+    if pet_species is not None:
+        # Clamp to the species enum 0..9 like every other numeric. Absence
+        # (None) is handled by the caller — the device omits the field until
+        # it has picked a species, so no sentinel is stored.
+        v = _clamp(int(pet_species), 0, 9)
+        if p.pet_species != v:
+            p.pet_species = v
+            changed = True
+    if pet_name is not None:
+        name = str(pet_name)[:15]
+        if p.pet_name != name:
+            p.pet_name = name
+            changed = True
     return changed
 
 
@@ -721,6 +764,9 @@ def _merge_payload(base: ConfigPayload, upd: ConfigPayload) -> ConfigPayload:
         autorotate_enabled=upd.autorotate_enabled if upd.autorotate_enabled is not None else base.autorotate_enabled,
         autorotate_interval_s=upd.autorotate_interval_s if upd.autorotate_interval_s is not None else base.autorotate_interval_s,
         theme_mode=upd.theme_mode or base.theme_mode,
+        pet_enabled=upd.pet_enabled if upd.pet_enabled is not None else base.pet_enabled,
+        pet_species=upd.pet_species if upd.pet_species is not None else base.pet_species,
+        pet_name=upd.pet_name or base.pet_name,
         gemini_models=list(upd.gemini_models) if upd.gemini_models is not None else base.gemini_models,
         log_enabled=upd.log_enabled if upd.log_enabled is not None else base.log_enabled,
         firmware_url=upd.firmware_url or base.firmware_url,
@@ -761,6 +807,16 @@ def _payload_equivalent(a: ConfigPayload, b: ConfigPayload) -> bool:
     if a.autorotate_interval_s is not None and a.autorotate_interval_s != b.autorotate_interval_s:
         return False
     if a.theme_mode != b.theme_mode:
+        return False
+    if (a.pet_enabled is None) != (b.pet_enabled is None):
+        return False
+    if a.pet_enabled is not None and a.pet_enabled != b.pet_enabled:
+        return False
+    if (a.pet_species is None) != (b.pet_species is None):
+        return False
+    if a.pet_species is not None and a.pet_species != b.pet_species:
+        return False
+    if a.pet_name != b.pet_name:
         return False
     am = a.gemini_models or []
     bm = b.gemini_models or []
