@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cwm-mcp-py"
 version = "0.4.0"
-description = "Python implementation of cwm-mcp: HTTP credentials broker + MCP server for the Claude Wall Monitor ESP32"
+description = "Python implementation of cwm-mcp: HTTP credentials broker + MCP server for the C Wall Monitor ESP32"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

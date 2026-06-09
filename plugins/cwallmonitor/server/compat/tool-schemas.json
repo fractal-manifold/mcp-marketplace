@@ -354,7 +354,7 @@
     },
     {
       "name": "wall_monitor_discover_devices",
-      "description": "Scan the local network via mDNS for Claude Wall Monitor devices that have just connected to WiFi and are waiting for an initial config (`_cwm._tcp.local.`). Returns one entry per device with its device_id, firmware version, hostname, IPv4 address(es) and the URL to POST a /provision payload to. The pairing code is NOT returned \u2014 the user must read it from the device's screen. Default scan window is 4 seconds.",
+      "description": "Scan the local network via mDNS for C Wall Monitor devices that have just connected to WiFi and are waiting for an initial config (`_cwm._tcp.local.`). Returns one entry per device with its device_id, firmware version, hostname, IPv4 address(es) and the URL to POST a /provision payload to. The pairing code is NOT returned \u2014 the user must read it from the device's screen. Default scan window is 4 seconds.",
       "inputSchema": {
         "type": "object",
         "properties": {

@@ -1,7 +1,7 @@
 # cwm-mcp
 
 Local broker that serves Claude OAuth credentials to the
-[Claude Wall Monitor](https://github.com/fractal-manifold/claude-wall-monitor)
+[C Wall Monitor](https://github.com/fractal-manifold/claude-wall-monitor)
 ESP32 device, packaged as an MCP server so it gets launched automatically
 with your Claude Code sessions.
 
@@ -193,7 +193,7 @@ Drop something like this in `~/.config/systemd/user/cwm-mcp.service`:
 
 ```ini
 [Unit]
-Description=Claude Wall Monitor credential broker
+Description=C Wall Monitor credential broker
 After=network-online.target
 
 [Service]

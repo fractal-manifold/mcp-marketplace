@@ -1,4 +1,4 @@
-// cwm-mcp serves OAuth credentials to the Claude Wall Monitor device.
+// cwm-mcp serves OAuth credentials to the C Wall Monitor device.
 //
 // Default mode (no flags) is "MCP-stdio + bind-elected broker": several
 // Claude Code sessions can each launch this binary; one of them wins the
