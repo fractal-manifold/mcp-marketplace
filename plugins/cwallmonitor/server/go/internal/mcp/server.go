@@ -229,7 +229,7 @@ func NewServer(d Deps) *server.MCPServer {
 				mcp.Description("When true (default), report what would be staged without writing any pending. Set false to actually stage the updates."),
 			),
 			mcp.WithString("sku",
-				mcp.Description("Optional 2-char SKU (or 'DEV') to restrict the check to a single SKU. Omit to check every SKU present among registered devices."),
+				mcp.Description("Optional 2-char hardware SKU (e.g. 'S1') to restrict the check to a single SKU. Omit to check every SKU present among registered devices."),
 			),
 			mcp.WithString("device_id",
 				mcp.Description("Optional 8-lowercase-hex device id to restrict staging to a single device. Omit to consider every matching device."),

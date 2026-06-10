@@ -134,7 +134,7 @@ release the broker auto-discovers (no manual `set_device_pending`):
 
 ```
 python -m cwmtools.ota.publish \
-    --version <version> --sku DEV \
+    --version <version> --sku S1 \
     --bin firmware/build/cwm_wall_monitor.bin \
     --channel dev \
     --key firmware/secrets/ota_signing_key.pem

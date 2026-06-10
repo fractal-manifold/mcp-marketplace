@@ -233,11 +233,15 @@ type Device struct {
 	// pre-rev-2 firmware). Persisted but never authoritative — we
 	// always trust the device's eFuse over what the broker remembers.
 	SerialNumber string `toml:"serial_number,omitempty"`
-	// HWSku is the 2-char SKU code parsed out of SerialNumber (or "DEV"
-	// for non-factory units). Stored separately so MCP queries don't
-	// have to re-parse the serial. The broker NEVER promotes a pending
-	// whose firmware_manifest_b64.sku conflicts with this — the
-	// firmware would reject it anyway, this just spares the round trip.
+	// HWSku is the 2-char hardware SKU the device reports (via the
+	// X-Cwm-Sku header — the eFuse serial's SKU field, or the build-time
+	// CONFIG_CWM_SKU for a unit with no factory serial). It is ALWAYS a
+	// real hardware code; dev-ness is orthogonal and tracked via the
+	// serial's FAC field (SerialIsDev), never the SKU. Stored separately
+	// so MCP queries don't have to re-parse the serial. The broker NEVER
+	// promotes a pending whose firmware_manifest_b64.sku conflicts with
+	// this — the firmware would reject it anyway, this just spares the
+	// round trip.
 	HWSku string `toml:"hw_sku,omitempty"`
 	// Channel is the device's OTA release track. "" / "stable" both mean
 	// the stable track (the key is OMITTED on disk in that case); "dev"
