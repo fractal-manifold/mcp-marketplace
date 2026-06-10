@@ -141,7 +141,7 @@ test("device-sync emits legacy CTR pending when fw header is below the GCM floor
       cfg: makeCfg(), cache: new auth.NonceCache(300), state: new State(),
       fwLogs: null, registry: reg, logger: silentLogger(),
     });
-    const req = makeReq("GET", `/device/${DEVID}/sync`, syncHeaders(DEVID, 1, { "x-cwm-fw-version": "0.8.5" }));
+    const req = makeReq("GET", `/device/${DEVID}/sync`, syncHeaders(DEVID, 1, { "x-cwm-fw-version": "0.8.0" }));
     const res = new FakeRes();
     await dispatch(handler, req, res);
     assert.equal(res.statusCode, 200, res.body);

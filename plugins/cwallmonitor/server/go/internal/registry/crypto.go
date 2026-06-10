@@ -27,7 +27,7 @@ const PendingGCMNonceLen = 12
 // maj.min.patch) that understands the AES-256-GCM pending envelope.
 // Devices reporting an X-Cwm-Fw-Version below this still receive the
 // legacy AES-CTR blob. Mirrors compat/vectors/aes_gcm.json min_fw_version.
-const PendingGCMMinFwVersion = "0.9.0"
+const PendingGCMMinFwVersion = "0.8.1"
 
 // EncryptPending encrypts `plaintext` with AES-CTR using `key` (must be
 // 32 bytes — the device's active PSK). Returns the random nonce and the

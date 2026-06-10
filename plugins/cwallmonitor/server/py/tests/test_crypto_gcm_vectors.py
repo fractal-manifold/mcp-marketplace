@@ -101,17 +101,19 @@ def test_gcm_key_and_nonce_length_enforced():
     "fw,expect_gcm",
     [
         # At/above the floor → GCM.
+        ("0.8.1", True),
+        ("0.8.99", True),
         ("0.9.0", True),
         ("0.9.1", True),
         ("1.0.0", True),
         ("0.10.0", True),
         ("255.255.65535", True),
         # Suffix of the floor still counts (same source tree).
-        ("0.9.0-dev.202606091938", True),
-        ("0.9.0-rc1", True),
+        ("0.8.1-dev.202606091938", True),
+        ("0.8.1-rc1", True),
         # Below the floor → CTR.
         ("0.8.0", False),
-        ("0.8.99", False),
+        ("0.7.99", False),
         ("0.8.0-dev.1", False),
         ("0.0.0", False),
         # Loose forms go/py REJECT (old js accepted) → CTR.

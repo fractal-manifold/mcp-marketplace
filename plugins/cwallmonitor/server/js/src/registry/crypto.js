@@ -16,7 +16,7 @@ export const PENDING_GCM_TAG_LEN = 16;
 // broker only emits "enc":"gcm" when the live X-Cwm-Fw-Version request header
 // is >= this; older firmware keeps getting the legacy CTR blob. Must equal
 // compat/vectors/aes_gcm.json min_fw_version (asserted in the tests).
-export const PENDING_GCM_MIN_FW = "0.9.0";
+export const PENDING_GCM_MIN_FW = "0.8.1";
 
 export function encryptPending(key, plaintext) {
   if (key.length !== 32) throw new Error(`registry/crypto: key must be 32 bytes, got ${key.length}`);

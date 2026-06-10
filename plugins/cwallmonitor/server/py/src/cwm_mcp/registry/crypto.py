@@ -16,7 +16,7 @@ PENDING_NONCE_LEN = 16  # AES block size (CTR IV)
 PENDING_GCM_NONCE_LEN = 12  # AES-GCM nonce
 # Firmware at or above this version carries the GCM decrypt path. The broker
 # only emits "enc":"gcm" when the live X-Cwm-Fw-Version says so.
-PENDING_GCM_MIN_FW = "0.9.0"
+PENDING_GCM_MIN_FW = "0.8.1"
 
 
 def encrypt_pending(key: bytes, plaintext: bytes) -> tuple[bytes, bytes]:

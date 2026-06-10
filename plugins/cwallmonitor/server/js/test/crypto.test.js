@@ -148,18 +148,20 @@ test("encryptPendingGCM/decryptPendingGCM enforce key + nonce lengths", () => {
 // zeros, in range), optional "-suffix" ignored; ANYTHING else → CTR.
 const GCM_GATE_CASES = [
   // At/above the floor → GCM.
+  ["0.8.1", true],
+  ["0.8.99", true],
+  ["0.8.9", true],
   ["0.9.0", true],
   ["0.9.1", true],
   ["1.0.0", true],
   ["0.10.0", true],
   ["255.255.65535", true],
   // Suffix of the floor still counts (same source tree, carries the decryptor).
-  ["0.9.0-dev.202606091938", true],
-  ["0.9.0-rc1", true],
+  ["0.8.1-dev.202606091938", true],
+  ["0.8.1-rc1", true],
   // Below the floor → CTR.
   ["0.8.0", false],
-  ["0.8.99", false],
-  ["0.8.9", false],
+  ["0.7.99", false],
   ["0.8.0-dev.1", false],
   ["0.0.0", false],
   // Loose forms the OLD js accepted but go/py REJECT — must now be CTR.

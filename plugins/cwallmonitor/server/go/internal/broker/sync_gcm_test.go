@@ -54,17 +54,19 @@ func TestFwSupportsGCM_GateComparator(t *testing.T) {
 		want bool
 	}{
 		// At/above the floor → GCM.
+		{"0.8.1", true},
+		{"0.8.99", true},
 		{"0.9.0", true},
 		{"0.9.1", true},
 		{"1.0.0", true},
 		{"0.10.0", true},
 		{"255.255.65535", true},
 		// Suffix of the floor still counts (same source tree).
-		{"0.9.0-dev.202606091938", true},
-		{"0.9.0-rc1", true},
+		{"0.8.1-dev.202606091938", true},
+		{"0.8.1-rc1", true},
 		// Below the floor → CTR.
 		{"0.8.0", false},
-		{"0.8.99", false},
+		{"0.7.99", false},
 		{"0.8.0-dev.1", false},
 		{"0.0.0", false},
 		// Loose forms go/py REJECT (js used to accept these) → CTR.
@@ -99,7 +101,7 @@ func TestDeviceSync_LegacyFwGetsCTR(t *testing.T) {
 	reg.SetPending(syncTestID, registry.ConfigPayload{City: "Paris"})
 
 	pskBytes, _ := hex.DecodeString(activePSK)
-	resp := signedSyncRequestFW(t, ts, pskBytes, syncTestID, 1, "0.8.5")
+	resp := signedSyncRequestFW(t, ts, pskBytes, syncTestID, 1, "0.8.0")
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("status = %d", resp.StatusCode)
