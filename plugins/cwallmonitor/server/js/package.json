@@ -1,6 +1,6 @@
 {
   "name": "cwm-mcp-js",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "Node.js implementation of cwm-mcp: HTTP credentials broker + MCP server for the C Wall Monitor ESP32",
   "type": "module",
   "engines": { "node": ">=20" },
