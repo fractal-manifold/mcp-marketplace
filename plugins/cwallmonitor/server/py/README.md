@@ -20,7 +20,7 @@ cwm-mcp-py --version
 cwm-mcp-py               # default: MCP stdio + leader-elected broker
 ```
 
-Config lives at `~/.config/claude-wall-monitor/cwm.toml`; the schema
+Config lives at `~/.config/cwallmonitor/cwm.toml`; the schema
 matches the Go impl (see `../compat/`).
 
 ## Tests

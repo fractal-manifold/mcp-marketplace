@@ -31,6 +31,7 @@ import (
 	"github.com/fractal-manifold/cwm-mcp/internal/creds"
 	"github.com/fractal-manifold/cwm-mcp/internal/devlog"
 	"github.com/fractal-manifold/cwm-mcp/internal/logbuf"
+	"github.com/fractal-manifold/cwm-mcp/internal/ota"
 	"github.com/fractal-manifold/cwm-mcp/internal/registry"
 	"github.com/fractal-manifold/cwm-mcp/internal/spend"
 	"github.com/fractal-manifold/cwm-mcp/internal/state"
@@ -186,14 +187,6 @@ type firmwareSHACacheEntry struct {
 var (
 	firmwareSHACache   = map[string]firmwareSHACacheEntry{}
 	firmwareSHACacheMu sync.Mutex
-)
-
-// fwVersionSeen remembers the last X-Cwm-Fw-Version reported by each
-// device so the sync handler logs the running firmware only when it
-// changes rather than on every 60s poll.
-var (
-	fwVersionSeen = map[string]string{}
-	fwVersionMu   sync.Mutex
 )
 
 func firmwareSHA(path string, fi os.FileInfo) (string, error) {
@@ -572,8 +565,7 @@ func handleUsage(cfg *config.Config, nonceCache *auth.NonceCache, logger *log.Lo
 			if gf, ok := usageCache.GeminiFetcher(); ok {
 				snap, ferr := gf.FetchWithModels(ctx, models)
 				if ferr != nil {
-					status, msg := usageErrorToHTTP(ferr)
-					writeError(w, status, msg)
+					writeUsageError(w, ferr)
 					return
 				}
 				snap.FetchedAtUnix = time.Now().Unix()
@@ -594,8 +586,7 @@ func handleUsage(cfg *config.Config, nonceCache *auth.NonceCache, logger *log.Lo
 			writeJSON(w, http.StatusOK, snap)
 			return
 		}
-		status, msg := usageErrorToHTTP(err)
-		writeError(w, status, msg)
+		writeUsageError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, snap)
@@ -679,6 +670,24 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_, _ = w.Write(body)
 }
 
+// writeUsageError maps a usage-layer error to an HTTP response. For a 429
+// it also mirrors the upstream Retry-After hint (carried on
+// *usage.RateLimitedError) into the response header, matching the py/js
+// brokers which forward RateLimited.retry_after. The header is only set
+// when the hint is a positive whole number of seconds.
+func writeUsageError(w http.ResponseWriter, err error) {
+	var rl *usage.RateLimitedError
+	if errors.As(err, &rl) && rl.RetryAfter > 0 {
+		secs := int(rl.RetryAfter.Round(time.Second) / time.Second)
+		if secs < 1 {
+			secs = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+	}
+	status, msg := usageErrorToHTTP(err)
+	writeError(w, status, msg)
+}
+
 func usageErrorToHTTP(err error) (int, string) {
 	switch {
 	case errors.Is(err, usage.ErrCredsMissing):
@@ -701,15 +710,49 @@ func usageErrorToHTTP(err error) (int, string) {
 }
 
 // pendingBlob is the wire format of an encrypted pending payload.
-// payload_b64 is the AES-CTR ciphertext (base64-std), nonce_b64 is the
-// 16-byte IV (also base64-std). Decryption requires the device's
-// currently-active PSK; the new PSK lives *inside* the payload, so a
-// passive attacker watching one rotation can't learn the next key
-// unless they already broke the active one.
+// payload_b64 is the ciphertext (base64-std); nonce_b64 is the nonce
+// (also base64-std). Decryption requires the device's currently-active
+// PSK; the new PSK lives *inside* the payload, so a passive attacker
+// watching one rotation can't learn the next key unless they already
+// broke the active one.
+//
+// Enc selects the cipher: "gcm" => AES-256-GCM with a 12-byte nonce and
+// payload_b64 = ciphertext||16-byte-tag, AAD = ASCII decimal of Version.
+// Empty (omitted) => legacy AES-CTR with a 16-byte IV nonce (no auth
+// tag; integrity rides the surrounding HTTP-response HMAC). The broker
+// emits "gcm" only when the live X-Cwm-Fw-Version header reports a
+// version >= PendingGCMMinFwVersion; older / absent / unparseable
+// versions still get the CTR blob. Gating on the LIVE header (never on
+// registry state) makes canary reverts self-healing: a device that rolls
+// back to pre-GCM firmware immediately gets CTR again on its next poll.
 type pendingBlob struct {
 	Version    uint32 `json:"version"`
+	Enc        string `json:"enc,omitempty"`
 	NonceB64   string `json:"nonce_b64"`
 	PayloadB64 string `json:"payload_b64"`
+}
+
+// fwSupportsGCM reports whether a device reporting firmware version `fw`
+// (the live X-Cwm-Fw-Version header) understands the AES-256-GCM pending
+// envelope. The comparison is on the numeric MAJOR.MINOR.PATCH prefix
+// ONLY — any suffix (e.g. a "-dev.<ts>" prerelease) is ignored, because
+// a dev build like "0.9.0-dev.202606091938" carries the very same
+// decrypt code as the matured 0.9.0 release (same source tree). So
+// "0.8.0" -> false, "0.9.0" -> true, "0.10.0" -> true, "0.9.0-dev.x"
+// -> true. An absent / unparseable header -> false (legacy CTR).
+func fwSupportsGCM(fw string) bool {
+	if fw == "" {
+		return false
+	}
+	got, ok := ota.PackSemver(fw) // strips any "-…" suffix, packs maj.min.patch
+	if !ok {
+		return false
+	}
+	min, ok := ota.PackSemver(registry.PendingGCMMinFwVersion)
+	if !ok {
+		return false
+	}
+	return got >= min
 }
 
 type syncResponse struct {
@@ -911,16 +954,20 @@ func handleDeviceSync(cfg *config.Config, cache *auth.NonceCache, logger *log.Lo
 		}
 	}
 	// The device reports its running firmware version on every request
-	// (X-Cwm-Fw-Version, unsigned metadata like serial/sku). It's the
-	// hook for future version-aware responses; for now we just surface
-	// it, logging only on change so a 60s poll doesn't spam.
-	if fw := r.Header.Get("X-Cwm-Fw-Version"); fw != "" {
-		fwVersionMu.Lock()
-		if fwVersionSeen[deviceID] != fw {
-			fwVersionSeen[deviceID] = fw
-			logger.Printf("device %s running firmware %s", deviceID, fw)
+	// (X-Cwm-Fw-Version, unsigned metadata like serial/sku). Persist it to
+	// Active.FirmwareVersion so the OTA auto-discovery loop (ota.decide,
+	// which keys off Active.FirmwareVersion) sees the version the device is
+	// actually running. This is what makes a canary revert stick: without
+	// it, a rolled-back device kept reporting the OLD (newer) version only
+	// to a process-local map, and auto-discovery happily re-staged the
+	// release it had just reverted from. The write happens only when the
+	// header changed (SetActiveFirmwareVersion is a no-op otherwise), so
+	// the 60s poll doesn't churn the TOML, and it survives broker restarts.
+	fwReported := r.Header.Get("X-Cwm-Fw-Version")
+	if fwReported != "" {
+		if ferr := reg.SetActiveFirmwareVersion(deviceID, fwReported, logger); ferr != nil {
+			logger.Printf("registry set-fw-version %s: %v", deviceID, ferr)
 		}
-		fwVersionMu.Unlock()
 	}
 
 	dev, lerr := reg.Load(deviceID)
@@ -928,6 +975,23 @@ func handleDeviceSync(cfg *config.Config, cache *auth.NonceCache, logger *log.Lo
 		logger.Printf("registry reload %s: %v", deviceID, lerr)
 		writeError(w, http.StatusInternalServerError, "registry error")
 		return
+	}
+
+	// Clear a stale revert tombstone once the device has reached a version
+	// STRICTLY NEWER than the blocked one (a fixed release landed), so the
+	// tombstone doesn't outlive the bad release and surprise a future
+	// re-publish of that same version number. Uses ota.PackSemver so an
+	// unparseable header never clears it.
+	if dev.BlockedFirmwareVersion != "" && fwReported != "" {
+		if got, gok := ota.PackSemver(fwReported); gok {
+			if blk, bok := ota.PackSemver(dev.BlockedFirmwareVersion); bok && got > blk {
+				if cerr := reg.SetBlockedFirmwareVersion(deviceID, ""); cerr != nil {
+					logger.Printf("registry clear-blocked %s: %v", deviceID, cerr)
+				} else {
+					dev.BlockedFirmwareVersion = ""
+				}
+			}
+		}
 	}
 
 	resp := syncResponse{ActiveVersion: dev.Active.Version}
@@ -947,7 +1011,20 @@ func handleDeviceSync(cfg *config.Config, cache *auth.NonceCache, logger *log.Lo
 			writeError(w, http.StatusInternalServerError, "pending serialize")
 			return
 		}
-		nonce, ct, eerr := registry.EncryptPending(active, pt)
+		// Cipher choice is gated on the LIVE reported firmware version,
+		// never on registry state, so a canary revert to pre-GCM firmware
+		// self-heals: the next poll's header decides the envelope.
+		var (
+			nonce, ct []byte
+			eerr      error
+			enc       string
+		)
+		if fwSupportsGCM(fwReported) {
+			enc = "gcm"
+			nonce, ct, eerr = registry.EncryptPendingGCM(active, dev.Pending.Version, pt)
+		} else {
+			nonce, ct, eerr = registry.EncryptPending(active, pt)
+		}
 		if eerr != nil {
 			logger.Printf("pending encrypt %s: %v", deviceID, eerr)
 			writeError(w, http.StatusInternalServerError, "pending encrypt")
@@ -955,6 +1032,7 @@ func handleDeviceSync(cfg *config.Config, cache *auth.NonceCache, logger *log.Lo
 		}
 		resp.Pending = &pendingBlob{
 			Version:    dev.Pending.Version,
+			Enc:        enc,
 			NonceB64:   base64.StdEncoding.EncodeToString(nonce),
 			PayloadB64: base64.StdEncoding.EncodeToString(ct),
 		}

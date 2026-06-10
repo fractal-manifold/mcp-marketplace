@@ -7,9 +7,10 @@ import * as creds from "../creds.js";
 import * as usage from "../usage.js";
 import * as spend from "../spend.js";
 import * as devlog from "../devlog.js";
-import { encryptPending } from "../registry/crypto.js";
+import { encryptPending, encryptPendingGCM, gcmFwGate } from "../registry/crypto.js";
 import { NotFound, validDeviceID } from "../registry/store.js";
 import { firmwarePath } from "../config.js";
+import { packSemver } from "../ota.js";
 import { createHash } from "node:crypto";
 import { createReadStream, statSync } from "node:fs";
 import { resolve as resolvePath, sep as pathSep } from "node:path";
@@ -30,10 +31,49 @@ function parseUint32(s) {
   return Number.isFinite(n) && n >= 0 && n <= 0xffffffff ? n : 0;
 }
 
+// Auth header names whose values feed (or gate) the HMAC. Per
+// compat/HMAC_CANONICAL.md these are ASCII-only; a non-ASCII byte in any of
+// them is rejected with 401 BEFORE the HMAC is computed. Node's http parser
+// hands header values back latin-1-decoded, so a raw 0xc3 0xa9 ("é") arrives
+// as the two chars U+00C3 U+00A9 — both > 0x7f, which this catches.
+const AUTH_HEADER_NAMES = [
+  "x-cwm-timestamp", "x-cwm-nonce", "x-cwm-signature",
+  "x-cwm-device", "x-cwm-config-version",
+];
+function authHeadersAreASCII(req) {
+  for (const name of AUTH_HEADER_NAMES) {
+    const v = req.headers[name];
+    if (v == null) continue;
+    // Duplicate X-Cwm-* headers would arrive as an array; reject the lot.
+    const vals = Array.isArray(v) ? v : [v];
+    for (const s of vals) {
+      for (let i = 0; i < s.length; i++) {
+        if (s.charCodeAt(i) > 0x7f) return false;
+      }
+    }
+  }
+  return true;
+}
+
 export function createHandler({ cfg, cache, state, fwLogs, registry, logger, usageCache, spendCache }) {
   return (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-    const path = url.pathname;
+    // Sign and route off the PERCENT-DECODED path, matching Go's
+    // net/http r.URL.Path and aiohttp's req.path (both decoded). So
+    // /usage/cla%75de and /usage/claude produce an identical canonical input
+    // and route to the same handler. A malformed %-escape can't be decoded →
+    // 400 (we never sign the raw encoded form as a fallback).
+    let path;
+    try {
+      path = decodeURIComponent(url.pathname);
+    } catch {
+      return writeError(res, 400, "bad path encoding");
+    }
+    // Auth headers are ASCII-only — reject non-ASCII before any HMAC work.
+    if (!authHeadersAreASCII(req)) {
+      logger.info(`auth rejected ${path}: non-ascii auth header`);
+      return writeError(res, 401, "unauthorized");
+    }
     if (path === "/credentials" && req.method === "GET") return handleCredentials({ cfg, cache, state, registry, logger }, req, res);
     if (path === "/credentials/codex" && req.method === "GET") return handleCredentialsCodex({ cfg, cache, state, registry, logger }, req, res);
     if (path === "/firmware-logs" && req.method === "GET") return handleFirmwareLogs({ cfg, cache, fwLogs, logger }, req, res, url);
@@ -403,14 +443,21 @@ function handleFirmwareLogs({ cfg, cache, fwLogs, logger }, req, res, url) {
       cache, cfg.security.max_timestamp_skew_seconds,
     );
   } catch (e) { logger.info(`auth rejected /firmware-logs: ${e.message}`); return writeError(res, 401, "unauthorized"); }
-  let limit = 200;
-  const raw = url.searchParams.get("limit");
-  if (raw != null) {
-    const n = Number.parseInt(raw, 10);
-    if (Number.isFinite(n)) limit = Math.max(1, Math.min(2000, n));
+  // fwLogs() touches the serial tailer / ring buffer; guard so a throw there
+  // becomes a 500, not a process-killing escape from the request listener.
+  try {
+    let limit = 200;
+    const raw = url.searchParams.get("limit");
+    if (raw != null) {
+      const n = Number.parseInt(raw, 10);
+      if (Number.isFinite(n)) limit = Math.max(1, Math.min(2000, n));
+    }
+    const body = fwLogs ? fwLogs(limit) : { connected: false, total_available: 0, lines: [] };
+    return writeJSON(res, 200, body);
+  } catch (e) {
+    logger.error(`firmware-logs handler crashed: ${e.stack || e.message}`);
+    return writeError(res, 500, "internal");
   }
-  const body = fwLogs ? fwLogs(limit) : { connected: false, total_available: 0, lines: [] };
-  return writeJSON(res, 200, body);
 }
 
 function handleDeviceSync({ cfg, cache, state, registry, logger, deviceID }, req, res) {
@@ -440,40 +487,91 @@ function handleDeviceSync({ cfg, cache, state, registry, logger, deviceID }, req
     );
   } catch (e) { logger.info(`auth rejected ${signedPath}: ${e.message}`); return finishErr(401, "unauthorized"); }
 
-  const observed = parseUint32(req.headers["x-cwm-config-version"] || "");
-  try { registry.maybePromote(deviceID, observed, res2.pskIndex === 1); } catch (e) { logger.warn(`promote: ${e.message}`); }
-  try { registry.touch(deviceID); } catch (e) { logger.warn(`touch: ${e.message}`); }
-  // Schema v2: capture factory identity from headers. Not bound to
-  // HMAC — metadata only; the Ed25519 manifest enforces SKU.
-  const serialHdr = String(req.headers["x-cwm-serial"] || "");
-  if (serialHdr) {
-    try { registry.setSerial(deviceID, serialHdr, String(req.headers["x-cwm-sku"] || "")); }
-    catch (e) { logger.warn(`set-serial: ${e.message}`); }
-  }
-  // Mirror anti-rollback floor. bumpMinSV is monotonic, so a spoofed-high
-  // value only locks the device into rejecting downgrades.
-  const minSvHdr = String(req.headers["x-cwm-min-sv"] || "");
-  if (minSvHdr) {
-    const sv = Number.parseInt(minSvHdr, 10);
-    if (Number.isFinite(sv) && sv >= 0 && sv <= 0xFFFFFFFF) {
-      try { registry.bumpMinSV(deviceID, sv); }
-      catch (e) { logger.warn(`bump-min-sv: ${e.message}`); }
+  // Everything past the HMAC check runs under a try/catch: registry.load can
+  // race a concurrent device delete (NotFound), hit corrupt TOML, or a bad PSK
+  // can blow up encryption. Without this, a throw escapes the request listener
+  // and (absent the index.js process guard) would take the broker down. We map
+  // it to a 4xx/5xx response instead — mirroring handleCredentials' envelope.
+  try {
+    const observed = parseUint32(req.headers["x-cwm-config-version"] || "");
+    try { registry.maybePromote(deviceID, observed, res2.pskIndex === 1); } catch (e) { logger.warn(`promote: ${e.message}`); }
+    try { registry.touch(deviceID); } catch (e) { logger.warn(`touch: ${e.message}`); }
+    // Schema v2: capture factory identity from headers. Not bound to
+    // HMAC — metadata only; the Ed25519 manifest enforces SKU.
+    const serialHdr = String(req.headers["x-cwm-serial"] || "");
+    if (serialHdr) {
+      try { registry.setSerial(deviceID, serialHdr, String(req.headers["x-cwm-sku"] || "")); }
+      catch (e) { logger.warn(`set-serial: ${e.message}`); }
     }
-  }
+    // Mirror anti-rollback floor. bumpMinSV is monotonic, so a spoofed-high
+    // value only locks the device into rejecting downgrades.
+    const minSvHdr = String(req.headers["x-cwm-min-sv"] || "");
+    if (minSvHdr) {
+      const sv = Number.parseInt(minSvHdr, 10);
+      if (Number.isFinite(sv) && sv >= 0 && sv <= 0xFFFFFFFF) {
+        try { registry.bumpMinSV(deviceID, sv); }
+        catch (e) { logger.warn(`bump-min-sv: ${e.message}`); }
+      }
+    }
+    // Persist the device's actually-running firmware version (unsigned
+    // metadata, like serial/sku). Only-on-change so a 60s poll doesn't churn
+    // the TOML. This keeps active.firmware_version in sync with reality so the
+    // OTA auto-discovery loop (ota.js decide()) doesn't re-stage a release the
+    // device already runs after a canary revert — its compareSemver/floor
+    // guards key off active.payload.firmware_version.
+    const fwHdr = String(req.headers["x-cwm-fw-version"] || "").trim();
+    if (fwHdr) {
+      try { registry.setActiveFirmwareVersion(deviceID, fwHdr); }
+      catch (e) { logger.warn(`set-fw-version: ${e.message}`); }
+    }
 
-  const dev = registry.load(deviceID);
-  const out = { active_version: dev.active.payload.version };
-  if (dev.pending && observed < dev.pending.payload.version) {
-    if (!active || active.length !== 32) return finishErr(500, "broker config invalid");
-    const pt = Buffer.from(pendingPayloadJSON(dev.pending.payload), "utf8");
-    const { nonce, ciphertext } = encryptPending(active, pt);
-    out.pending = {
-      version: dev.pending.payload.version,
-      nonce_b64: nonce.toString("base64"),
-      payload_b64: ciphertext.toString("base64"),
-    };
+    const dev = registry.load(deviceID);
+
+    // Clear a stale revert tombstone once the device has reached a version
+    // STRICTLY NEWER than the blocked one (a fixed release landed), so the
+    // tombstone doesn't outlive the bad release. Uses packSemver so an
+    // unparseable header never clears it. Mirrors Go/Py.
+    if (dev.blockedFirmwareVersion && fwHdr) {
+      const got = packSemver(fwHdr);
+      const blk = packSemver(dev.blockedFirmwareVersion);
+      if (got !== null && blk !== null && got > blk) {
+        try { registry.setBlockedFirmwareVersion(deviceID, ""); dev.blockedFirmwareVersion = ""; }
+        catch (e) { logger.warn(`clear-blocked: ${e.message}`); }
+      }
+    }
+
+    const out = { active_version: dev.active.payload.version };
+    if (dev.pending && observed < dev.pending.payload.version) {
+      if (!active || active.length !== 32) return finishErr(500, "broker config invalid");
+      const pt = Buffer.from(pendingPayloadJSON(dev.pending.payload), "utf8");
+      const ver = dev.pending.payload.version;
+      // Gate the GCM wire format on the LIVE firmware version, never on
+      // registry state: a device that just OTA'd to >= 0.9.0 must immediately
+      // get GCM even though its stored config predates it. Below the gate (or
+      // header absent) → legacy AES-CTR, unchanged.
+      if (gcmFwGate(fwHdr)) {
+        const { nonce, ciphertext } = encryptPendingGCM(active, pt, ver);
+        out.pending = {
+          version: ver,
+          enc: "gcm",
+          nonce_b64: nonce.toString("base64"),
+          payload_b64: ciphertext.toString("base64"),
+        };
+      } else {
+        const { nonce, ciphertext } = encryptPending(active, pt);
+        out.pending = {
+          version: ver,
+          nonce_b64: nonce.toString("base64"),
+          payload_b64: ciphertext.toString("base64"),
+        };
+      }
+    }
+    return finish(200, out);
+  } catch (e) {
+    if (e instanceof NotFound) return finishErr(404, "unknown device");
+    logger.error(`device sync handler crashed: ${e.stack || e.message}`);
+    return finishErr(500, "internal");
   }
-  return finish(200, out);
 }
 
 // Receive a diagnostic log batch the device POSTs and append it to the
@@ -692,10 +790,15 @@ function pendingPayloadJSON(p) {
   // "both or neither" — we forward whichever fields are present.
   if (p.firmware_manifest_b64) wire.firmware_manifest_b64 = p.firmware_manifest_b64;
   if (p.firmware_manifest_sig_b64) wire.firmware_manifest_sig_b64 = p.firmware_manifest_sig_b64;
-  // Go's json.Marshal on map[string]any sorts keys alphabetically and
-  // Python uses sort_keys=True; mirror both so the AES-CTR ciphertext
-  // is deterministic across runtimes. Recursive — `providers` is a
-  // nested object whose own keys must also sort.
+  // Go's json.Marshal on map[string]any sorts keys alphabetically and Python
+  // uses sort_keys=True; mirror both with sortKeysDeep so each runtime emits
+  // the SAME key order. The JSON is semantically identical across runtimes,
+  // but the bytes are NOT guaranteed equal: Go escapes <, >, & as < etc.,
+  // Python's default ensure_ascii escapes non-ASCII to \uXXXX, and this JS
+  // emits raw UTF-8 (e.g. "Málaga" stays two bytes 0xc3 0xa1). So for an ASCII
+  // payload with none of <>& the ciphertext matches across ports; a payload
+  // with those characters will differ byte-for-byte. The wire contract is the
+  // decrypted JSON semantics, not a byte-identical blob.
   return JSON.stringify(sortKeysDeep(wire));
 }
 

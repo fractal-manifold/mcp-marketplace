@@ -399,6 +399,16 @@ def _decide(reg: Registry, dev, resolved: dict, dry_run: bool) -> dict:
     if release_packed is None:
         out["action"] = "skipped:bad-version"
         return out
+    # Revert tombstone: never AUTO-stage the exact version the operator just
+    # reverted the device away from (wall_monitor_revert records it in
+    # blocked_firmware_version). A NEWER release (a fixed 0.9.2 over a blocked
+    # 0.9.1) still stages — we match on version equality only. Manual
+    # set_device_pending / publish bypass this path entirely. The tombstone is
+    # cleared on /sync once the device reports a newer version. Mirrors Go/JS.
+    blocked = getattr(dev, "blocked_firmware_version", "")
+    if blocked and str(mf.get("version", "")) == blocked:
+        out["action"] = "skipped:blocked-version"
+        return out
     out["from"] = dev.active.payload.firmware_version
     # Release not strictly newer than the version the device is actually
     # RUNNING? Then it's up to date even if the anti-rollback floor hasn't

@@ -110,7 +110,7 @@ export class Registry {
         this._loadLocked(id);
         throw new RegistryError(`registry: device ${id} already exists`);
       } catch (e) { if (!(e instanceof NotFound)) throw e; }
-      const dev = { schemaVersion: SCHEMA_VERSION, deviceID: id, serialNumber: "", hwSku: "", channel: normalizeChannel(active.channel), active: { payload: active, lastSeen: null }, pending: null };
+      const dev = { schemaVersion: SCHEMA_VERSION, deviceID: id, serialNumber: "", hwSku: "", channel: normalizeChannel(active.channel), blockedFirmwareVersion: "", active: { payload: active, lastSeen: null }, pending: null };
       delete active.channel; // channel is device-level, not part of the config payload
       this._saveLocked(dev);
       return dev;
@@ -214,6 +214,43 @@ export class Registry {
       let dev;
       try { dev = this._loadLocked(id); } catch (e) { if (e instanceof NotFound) return; throw e; }
       if (norm !== dev.channel) { dev.channel = norm; this._saveLocked(dev); }
+    });
+  }
+
+  // setActiveFirmwareVersion records the version the device reports it is
+  // actually RUNNING (X-Cwm-Fw-Version), into active.firmware_version. Unsigned
+  // metadata, like setSerial. Only-on-change to keep TOML churn bounded under a
+  // 60s poll. Unknown devices are silently ignored. This keeps the OTA
+  // auto-discovery loop honest after a canary revert: decide() compares the
+  // candidate release against active.payload.firmware_version, so persisting
+  // the real running version stops it re-staging a build the device rolled back.
+  setActiveFirmwareVersion(id, version) {
+    if (!validDeviceID(id)) return;
+    const v = String(version || "");
+    if (!v) return;
+    this._withLock(id, () => {
+      let dev;
+      try { dev = this._loadLocked(id); } catch (e) { if (e instanceof NotFound) return; throw e; }
+      if (dev.active.payload.firmware_version === v) return;
+      dev.active.payload.firmware_version = v;
+      this._saveLocked(dev);
+    });
+  }
+
+  // setBlockedFirmwareVersion records (or clears, when version is "") the
+  // per-device OTA revert tombstone — a firmware version the auto-discovery
+  // loop must not re-stage. Written by wall_monitor_revert with the version the
+  // device is being reverted FROM. Only-on-change; unknown devices ignored.
+  // Mirror of go/py stores.
+  setBlockedFirmwareVersion(id, version) {
+    if (!validDeviceID(id)) return;
+    const v = String(version || "");
+    this._withLock(id, () => {
+      let dev;
+      try { dev = this._loadLocked(id); } catch (e) { if (e instanceof NotFound) return; throw e; }
+      if (dev.blockedFirmwareVersion === v) return;
+      dev.blockedFirmwareVersion = v;
+      this._saveLocked(dev);
     });
   }
 
@@ -437,6 +474,7 @@ function deviceToTOML(dev) {
   if (dev.serialNumber) doc.serial_number = dev.serialNumber;
   if (dev.hwSku) doc.hw_sku = dev.hwSku;
   if (dev.channel) doc.channel = dev.channel;
+  if (dev.blockedFirmwareVersion) doc.blocked_firmware_version = dev.blockedFirmwareVersion;
   const a = payloadToTomlObj(dev.active.payload);
   if (dev.active.lastSeen) a.last_seen = dev.active.lastSeen;
   doc.active = a;
@@ -461,6 +499,7 @@ function deviceFromTOML(text) {
     serialNumber: String(d.serial_number || ""),
     hwSku: String(d.hw_sku || ""),
     channel: normalizeChannel(d.channel),
+    blockedFirmwareVersion: String(d.blocked_firmware_version || ""),
     active,
     pending,
   };

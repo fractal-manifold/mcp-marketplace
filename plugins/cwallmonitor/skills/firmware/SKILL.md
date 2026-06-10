@@ -74,7 +74,7 @@ wall_monitor_publish_firmware
 
 What this does, in order:
 
-1. Copies the .bin to `~/.config/claude-wall-monitor/firmware/cwm-<version>.bin`.
+1. Copies the .bin to `~/.config/cwallmonitor/firmware/cwm-<version>.bin`.
 2. Computes the SHA-256 and caches it (also surfaced as the `ETag` and
    `X-Cwm-Firmware-SHA256` headers on subsequent `/firmware/<file>` requests).
 3. Stages a pending update on the device's TOML record with the URL,
@@ -85,7 +85,70 @@ The response includes the computed `firmware_url`, `firmware_sha256`
 and the updated `device` summary (which now shows
 `pending_changes: ["firmware: <version>"]`).
 
-### 4. Watch the device come back
+### 4. Sign + attach the OTA manifest (REQUIRED on default builds)
+
+`publish_firmware` stages the URL + SHA-256, but on a **default build**
+(`CWM_OTA_UNSIGNED=n`) the device gates the OTA on an **Ed25519-signed
+manifest** before it will even download the .bin — see
+`gate_manifest()` in `firmware/components/ota/src/cwm_ota.c`. The
+SHA-256 is *not* the trust root; the signed manifest is. Skip this step
+and the device refuses the update at the manifest gate.
+
+Sign the manifest with the offline OTA key, then merge it into the
+already-staged pending blob:
+
+```
+python tools/cwmtools/lib/manifest.py sign \
+    --bin firmware/build/cwm_wall_monitor.bin \
+    --version <version> \
+    --sku <SKU> \
+    --channel dev \
+    --key firmware/secrets/ota_signing_key.pem \
+    --out /tmp/cwm-manifest.json
+```
+
+`--channel dev` for development units (a production unit refuses a
+`channel:dev` manifest; omit the flag / use `--channel stable` for
+factory SKUs). `--sku` is the hardware SKU (`DEV`, `S1`, `S2`). The
+output JSON carries `manifest_b64` and `signature_b64`.
+
+Deliver them with a **manifest-only** `set_device_pending` — it merges
+with the firmware pending you just staged (it does NOT replace it):
+
+```
+wall_monitor_set_device_pending
+    device_id=<id>
+    firmware_manifest_b64="<manifest_b64 from the JSON>"
+    firmware_manifest_sig_b64="<signature_b64 from the JSON>"
+```
+
+The device verifies `sig(manifest)` against its trusted OTA pubkey,
+checks the manifest SKU / version / `min_secure_version` (anti-rollback)
+and only then downloads + hashes the .bin.
+
+#### Shortcut: the public-channel publisher
+
+For the canary / public-channel flow the maintainer uses
+`cwmtools.ota.publish`, which signs the manifest and pushes a GitHub
+release the broker auto-discovers (no manual `set_device_pending`):
+
+```
+python -m cwmtools.ota.publish \
+    --version <version> --sku DEV \
+    --bin firmware/build/cwm_wall_monitor.bin \
+    --channel dev \
+    --key firmware/secrets/ota_signing_key.pem
+```
+
+Run `python -m cwmtools.ota.publish --help` for the full flag set
+(`--dry-run` previews without touching git/GitHub). Dev builds must
+carry a `-dev.<ts>` canary suffix baked into `cwm_version.h`. Devices
+then pick it up via `wall_monitor_check_updates` (or their own poll).
+Use this for releases; use the `manifest.py sign` +
+`set_device_pending` path above for a one-off push to a single
+locally-registered device.
+
+### 5. Watch the device come back
 
 The cadence on the device side:
 
@@ -120,7 +183,7 @@ Look for:
 - After the reboot: `ota no pending OTA` (already-installed branch)
   followed by `ota running image marked valid (rollback cancelled)`.
 
-### 5. Rollback paths (no action required)
+### 6. Rollback paths (no action required)
 
 The device is responsible for rolling back, not the broker. The
 mechanisms:
@@ -160,6 +223,13 @@ Requirements:
   are covered by the standard set.
 - You compute the SHA-256 ahead of time (`sha256sum
   cwm_wall_monitor.bin`) and pass it verbatim.
+- The **signed manifest is still mandatory** on default builds — the
+  external host only changes where the .bin is fetched from, not the
+  manifest gate. After this `publish_firmware`, run the same `manifest.py
+  sign` + manifest-only `set_device_pending` step from step 4 (sign the
+  exact .bin you uploaded; the manifest's SHA-256 must match the hosted
+  file). For a public GitHub-release host, `cwmtools.ota.publish`
+  produces both the signed manifest and the release in one shot.
 
 ## Secure Boot v2
 
@@ -176,8 +246,15 @@ This requires `firmware/secrets/secure_boot_signing_key.pem` to exist.
 A `.bin` without a valid signature is rejected by the device
 (`ESP_ERR_OTA_VALIDATE_FAILED`) — `cwm_ota.c` retries 3 times then
 gives up. The device keeps the prior firmware. The broker does not
-know whether the bin is signed — that check is entirely on the device,
-so `wall_monitor_publish_firmware` takes no extra argument.
+know whether the bin is image-signed — that check is entirely on the
+device, so `wall_monitor_publish_firmware` takes no extra argument for
+Secure Boot.
+
+Note this is a **separate** signature from the OTA manifest in step 4:
+Secure Boot v2 signs the *image* (bootloader-enforced); the Ed25519
+**manifest** gates the OTA at the application layer
+(`gate_manifest()`). On a default build the manifest step is required
+regardless of whether Secure Boot is burned.
 
 Devices without SB burned accept both signed and unsigned bins, so
 once SB infra is in the build pipeline you can leave `CWM_SECURE_BOOT=1`
@@ -197,7 +274,12 @@ unsecured devices.
   minute before publishing.
 - Wire format: the firmware fields ride inside the AES-CTR-encrypted
   pending blob, so a captured `/sync` response cannot be tampered to
-  redirect to a malicious URL without breaking the PSK seal. The
-  .bin itself is served unsigned over HTTPS; integrity comes from the
-  SHA-256 carried inside that encrypted blob.
+  redirect to a malicious URL without breaking the PSK seal. The .bin
+  file is served over HTTPS, but transport/host integrity is **not**
+  the trust root: on a default build (`CWM_OTA_UNSIGNED=n`) the device
+  installs the image only if the **Ed25519-signed manifest** verifies
+  against its trusted OTA pubkey and the manifest's SHA-256 matches the
+  downloaded bytes. The SHA-256 alone proves nothing about authenticity
+  — it's the signature over the manifest (which carries that SHA-256)
+  that does. Only an `CWM_OTA_UNSIGNED=y` build skips the manifest gate.
 

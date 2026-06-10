@@ -129,6 +129,35 @@ func TestLoad_NotFound(t *testing.T) {
 	}
 }
 
+// TestSetBlockedFirmwareVersion: the revert tombstone setter persists and
+// round-trips through disk, is only-on-change, clears on empty, and ignores
+// unknown devices.
+func TestSetBlockedFirmwareVersion(t *testing.T) {
+	r := newReg(t)
+	if _, err := r.Register(testID, ConfigPayload{PSKHex: testPSK, BrokerURL: "http://x"}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := r.SetBlockedFirmwareVersion(testID, "0.9.1"); err != nil {
+		t.Fatalf("SetBlockedFirmwareVersion: %v", err)
+	}
+	dev, _ := r.Load(testID)
+	if dev.BlockedFirmwareVersion != "0.9.1" {
+		t.Fatalf("blocked = %q, want 0.9.1", dev.BlockedFirmwareVersion)
+	}
+	// Clear with empty string.
+	if err := r.SetBlockedFirmwareVersion(testID, ""); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	dev, _ = r.Load(testID)
+	if dev.BlockedFirmwareVersion != "" {
+		t.Fatalf("blocked = %q, want cleared", dev.BlockedFirmwareVersion)
+	}
+	// Unknown device is a silent no-op.
+	if err := r.SetBlockedFirmwareVersion("ffffffff", "0.9.1"); err != nil {
+		t.Fatalf("unknown device should be a no-op, got %v", err)
+	}
+}
+
 func TestRegister_ForcesVersion1(t *testing.T) {
 	r := newReg(t)
 	dev, err := r.Register(testID, ConfigPayload{

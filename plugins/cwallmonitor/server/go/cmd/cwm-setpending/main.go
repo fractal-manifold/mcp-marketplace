@@ -18,7 +18,7 @@ import (
 func main() {
 	def := ""
 	if home, err := os.UserHomeDir(); err == nil {
-		def = filepath.Join(home, ".config", "claude-wall-monitor", "devices")
+		def = filepath.Join(home, ".config", "cwallmonitor", "devices")
 	}
 	dir := flag.String("dir", def, "devices dir")
 	id := flag.String("id", "", "device id")

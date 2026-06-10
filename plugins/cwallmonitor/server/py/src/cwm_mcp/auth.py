@@ -63,6 +63,15 @@ ERR_TIMESTAMP_SKEW = AuthError("timestamp skew")
 ERR_BAD_NONCE_FORMAT = AuthError("bad nonce format")
 ERR_BAD_SIGNATURE = AuthError("bad signature")
 ERR_NONCE_REPLAY = AuthError("nonce replay")
+ERR_NON_ASCII_HEADER = AuthError("non-ascii auth header")
+
+
+def _auth_headers_ascii(*values: str) -> bool:
+    """Auth headers (X-Cwm-*) are ASCII-only per compat/HMAC_CANONICAL.md.
+    A non-ASCII value (attacker-controlled, pre-auth) must be rejected as a
+    normal 401 — never let .encode('ascii') escape as a 500. str.isascii()
+    is True for the empty string, so absent headers pass."""
+    return all(v.isascii() for v in values)
 
 
 @dataclass
@@ -112,6 +121,10 @@ def verify(
         raise TypeError("verify() requires a NonceCache")
     if not ts_header or not nonce_header or not sig_header:
         raise ERR_MISSING_HEADERS
+    if not _auth_headers_ascii(
+        ts_header, nonce_header, sig_header, device_header, config_version_header
+    ):
+        raise ERR_NON_ASCII_HEADER
     ts = _parse_strict_int(ts_header)
     if ts is None:
         raise ERR_BAD_TIMESTAMP
@@ -154,6 +167,10 @@ def verify_multi(
         raise TypeError("verify_multi() requires a NonceCache")
     if not ts_header or not nonce_header or not sig_header:
         raise ERR_MISSING_HEADERS
+    if not _auth_headers_ascii(
+        ts_header, nonce_header, sig_header, device_header, config_version_header
+    ):
+        raise ERR_NON_ASCII_HEADER
     ts = _parse_strict_int(ts_header)
     if ts is None:
         raise ERR_BAD_TIMESTAMP

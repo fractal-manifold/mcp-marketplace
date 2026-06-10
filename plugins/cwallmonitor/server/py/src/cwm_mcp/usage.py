@@ -28,7 +28,13 @@ PROVIDER_GEMINI = "gemini"
 
 
 class UsageError(Exception):
-    """Base class for usage errors. The broker maps subclasses to HTTP."""
+    """Base class for usage errors. The broker maps subclasses to HTTP.
+
+    stale_snapshot, when set by the cache, carries the last-good Snapshot so
+    the broker can answer 200 + X-Cwm-Stale-Reason instead of an error
+    (matching Go/JS stale-with-200 semantics)."""
+
+    stale_snapshot: "Snapshot | None" = None
 
 
 class CredsMissing(UsageError):
@@ -153,16 +159,17 @@ class Cache:
 
         try:
             return await task
-        except UsageError:
-            # On error, fall back to last-good if present.
+        except UsageError as err:
+            # On error, fall back to last-good if present. Re-raise so the
+            # caller can map the error to HTTP, but attach the last-good
+            # snapshot to the exception so the broker can answer
+            # stale-with-200 (matching Go/JS: 200 + X-Cwm-Stale-Reason).
             async with self._lock:
                 entry = self._entries.get(provider)
                 if entry is not None:
                     snap = Snapshot(**asdict(entry.snap))
                     snap.stale_seconds = int(self._now() - entry.fetched)
-                    # Re-raise so the caller can decide; pass the snap via
-                    # exception attribute for the broker's stale-with-200.
-                    raise
+                    err.stale_snapshot = snap
             raise
 
     async def _refresh(self, session: aiohttp.ClientSession, provider: str, fetcher: Fetcher) -> Snapshot:

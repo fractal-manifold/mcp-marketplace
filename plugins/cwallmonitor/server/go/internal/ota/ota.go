@@ -530,6 +530,16 @@ func (c *Checker) decide(dev *registry.Device, r *resolved, dryRun bool) DeviceR
 		out.Action = "skipped:bad-version"
 		return out
 	}
+	// Revert tombstone: never AUTO-stage the exact version the operator just
+	// reverted the device away from (wall_monitor_revert records it in
+	// BlockedFirmwareVersion). A NEWER release (a fixed 0.9.2 over a blocked
+	// 0.9.1) still stages — we match on version equality only. Manual
+	// set_device_pending / publish bypass this path entirely. The tombstone is
+	// cleared on /sync once the device reports a newer version.
+	if dev.BlockedFirmwareVersion != "" && r.mf.Version == dev.BlockedFirmwareVersion {
+		out.Action = "skipped:blocked-version"
+		return out
+	}
 	out.From = dev.Active.FirmwareVersion
 	// Primary guard: never announce a release that isn't STRICTLY newer than
 	// the version the device is actually running. Active.FirmwareVersion is

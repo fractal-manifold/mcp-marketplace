@@ -67,6 +67,47 @@ test("theme_mode-only pending bumps version and round-trips", () => {
   }
 });
 
+test("setBlockedFirmwareVersion round-trips, clears, and ignores unknown", () => {
+  const tmp = mkdtempSync(join(tmpdir(), "cwm-reg-"));
+  try {
+    const reg = new Registry(tmp);
+    reg.register("abcdef0a", { ..._testing.emptyPayload(), broker_url: "http://x", psk_hex: "aa".repeat(32) });
+
+    reg.setBlockedFirmwareVersion("abcdef0a", "0.9.1");
+    assert.equal(reg.load("abcdef0a").blockedFirmwareVersion, "0.9.1");
+    // Persisted to TOML (survives reload).
+    assert.match(readFileSync(join(tmp, "abcdef0a.toml"), "utf8"), /blocked_firmware_version/);
+
+    // Clear with empty string.
+    reg.setBlockedFirmwareVersion("abcdef0a", "");
+    assert.equal(reg.load("abcdef0a").blockedFirmwareVersion, "");
+
+    // Unknown device is a silent no-op.
+    reg.setBlockedFirmwareVersion("ffffffff", "0.9.1");
+    assert.equal(existsSync(join(tmp, "ffffffff.toml")), false);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("setActiveFirmwareVersion clears a stale revert tombstone when newer", () => {
+  const tmp = mkdtempSync(join(tmpdir(), "cwm-reg-"));
+  try {
+    const reg = new Registry(tmp);
+    reg.register("abcdef0b", { ..._testing.emptyPayload(), broker_url: "http://x", psk_hex: "aa".repeat(32) });
+    reg.setBlockedFirmwareVersion("abcdef0b", "0.9.1");
+
+    // NOTE: the version-comparison clear lives in the broker /sync handler
+    // (broker_sync.test.js); the store setter itself only records the running
+    // version. Verify the setter does NOT spuriously clear on its own.
+    reg.setActiveFirmwareVersion("abcdef0b", "0.9.2");
+    assert.equal(reg.load("abcdef0b").active.payload.firmware_version, "0.9.2");
+    assert.equal(reg.load("abcdef0b").blockedFirmwareVersion, "0.9.1");
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("register then set_pending workflow", () => {
   const tmp = mkdtempSync(join(tmpdir(), "cwm-reg-"));
   try {

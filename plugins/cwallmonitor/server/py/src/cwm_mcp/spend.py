@@ -27,7 +27,12 @@ MAX_MODELS = 8  # mirrors CWM_SPEND_MAX_MODELS
 
 
 class SpendError(Exception):
-    pass
+    """Base class for spend errors.
+
+    stale_snapshot, when set by the cache, carries the last-good Snapshot so
+    the broker can answer 200 + X-Cwm-Stale-Reason (Go/JS parity)."""
+
+    stale_snapshot: "Snapshot | None" = None
 
 
 class NotImplementedProvider(SpendError):
@@ -529,13 +534,16 @@ class Cache:
                 self._inflight[provider] = task
         try:
             return await task
-        except SpendError:
+        except SpendError as err:
+            # Re-raise so the broker can answer stale-with-200 (200 +
+            # X-Cwm-Stale-Reason); attach the last-good snapshot to the
+            # exception. No last-good → propagate the error unadorned.
             async with self._lock:
                 entry = self._entries.get(provider)
                 if entry is not None:
                     snap = Snapshot(**asdict(entry.snap))
                     snap.stale_seconds = int(self._now() - entry.fetched)
-                    return snap
+                    err.stale_snapshot = snap
             raise
 
     async def _refresh(self, provider: str, fetcher: ProviderSpend) -> Snapshot:

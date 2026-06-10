@@ -20,6 +20,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -245,6 +246,19 @@ type Device struct {
 	// uses it only to pick which GitHub asset to fetch. Always stored
 	// canonical via normalizeChannel (trim+lowercase; "stable" → "").
 	Channel string   `toml:"channel,omitempty"`
+	// BlockedFirmwareVersion is a per-device OTA tombstone: a version the
+	// AUTO-discovery loop (ota.decide) must NOT re-stage. wall_monitor_revert
+	// writes the version the device is being reverted FROM here, so a canary
+	// that the device rolled back is not immediately re-announced by the
+	// newest-release scan (the device reports the old version, Active=old,
+	// decide() sees published > Active and would otherwise re-stage the exact
+	// bad release). Only the auto path honours it — manual set_device_pending /
+	// publish targeted at the device still override. Cleared automatically on
+	// /sync once the device reports a version STRICTLY NEWER than the tombstone
+	// (a fixed release landed), so stale tombstones don't accumulate. Device-
+	// level (sibling of Channel), NOT part of the config payload — the firmware
+	// never sees it. Mirror of py/js blocked_firmware_version.
+	BlockedFirmwareVersion string `toml:"blocked_firmware_version,omitempty"`
 	Active  Active   `toml:"active"`
 	Pending *Pending `toml:"pending,omitempty"`
 }
@@ -324,8 +338,17 @@ func New(devicesDir string) (*Registry, error) {
 	if devicesDir == "" {
 		return nil, errors.New("registry: empty directory")
 	}
-	if err := os.MkdirAll(devicesDir, 0o755); err != nil {
+	// 0o700: device TOMLs hold plaintext PSKs, so the directory must not be
+	// group/other-readable. Mirrors the py/js stores (0700).
+	if err := os.MkdirAll(devicesDir, 0o700); err != nil {
 		return nil, fmt.Errorf("registry: mkdir %s: %w", devicesDir, err)
+	}
+	// Tighten an already-deployed directory created by an older broker with
+	// the lax 0o755 mode. Best-effort: a chmod failure (e.g. not the owner)
+	// must not stop the broker from starting.
+	if err := os.Chmod(devicesDir, 0o700); err != nil && !os.IsNotExist(err) {
+		// non-fatal; the data files themselves are still written 0o600.
+		_ = err
 	}
 	return &Registry{dir: devicesDir}, nil
 }
@@ -355,7 +378,9 @@ var ErrNotFound = errors.New("registry: device not found")
 // data file atomically without invalidating the lock.
 func (r *Registry) withLock(deviceID string, fn func(dataPath string) error) error {
 	lockPath := r.path(deviceID) + ".lock"
-	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	// 0o600: the lock file is empty but sits beside the PSK-bearing TOMLs;
+	// keep the whole store owner-only. py/js use 0600 for their locks too.
+	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return fmt.Errorf("registry: open lock %s: %w", lockPath, err)
 	}
@@ -411,9 +436,17 @@ func (r *Registry) saveLocked(dev *Device, dataPath string) error {
 	}
 	dev.SchemaVersion = SchemaVersion
 	tmp := dataPath + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	// 0o600: the file holds the plaintext PSK. py/js write 0600.
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("registry: create %s: %w", tmp, err)
+	}
+	// Defeat a permissive umask: O_CREATE's mode is AND-ed with ~umask, so
+	// chmod the tmp file to the exact mode before it is renamed into place.
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("registry: chmod %s: %w", tmp, err)
 	}
 	enc := toml.NewEncoder(f)
 	if err := enc.Encode(dev); err != nil {
@@ -434,6 +467,12 @@ func (r *Registry) saveLocked(dev *Device, dataPath string) error {
 		os.Remove(tmp)
 		return fmt.Errorf("registry: rename %s: %w", dataPath, err)
 	}
+	// Tighten an already-deployed store on every save: the directory and the
+	// sibling .lock predate the data file and may have been created 0o755 /
+	// 0o644 by an older broker. Best-effort — a chmod we don't own must not
+	// fail the save (the data file itself is already 0o600 via the rename).
+	_ = os.Chmod(r.dir, 0o700)
+	_ = os.Chmod(dataPath+".lock", 0o600)
 	return nil
 }
 
@@ -817,6 +856,74 @@ func (r *Registry) SetChannel(deviceID, channel string) error {
 			return nil
 		}
 		dev.Channel = norm
+		return r.saveLocked(dev, p)
+	})
+}
+
+// SetActiveFirmwareVersion records the running firmware version the
+// device reported via the X-Cwm-Fw-Version header on /sync. Persisting it
+// to Active.FirmwareVersion is what lets the OTA auto-discovery loop
+// (ota.decide keys off Active.FirmwareVersion) see what the device is
+// ACTUALLY running — including after a canary revert, so it stops
+// re-staging the release the device just rolled back from.
+//
+// Only-on-change: the file is rewritten only when the reported version
+// differs from what's stored, keeping the 60s poll from churning the
+// TOML while still surviving broker restarts. Empty `version` is a no-op.
+// Unknown devices are silently ignored (the header arrived on an already
+// authenticated request, so unknown-device means a race with a fresh
+// registration, not a forgery). When `logger` is non-nil, logs once on
+// each change. Mirror of SetChannel's only-on-change pattern.
+func (r *Registry) SetActiveFirmwareVersion(deviceID, version string, logger *log.Logger) error {
+	if !ValidDeviceID(deviceID) {
+		return fmt.Errorf("registry: invalid device_id %q", deviceID)
+	}
+	if version == "" {
+		return nil
+	}
+	return r.withLock(deviceID, func(p string) error {
+		dev, err := r.loadLocked(p)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return nil
+			}
+			return err
+		}
+		if dev.Active.FirmwareVersion == version {
+			return nil
+		}
+		dev.Active.FirmwareVersion = version
+		if err := r.saveLocked(dev, p); err != nil {
+			return err
+		}
+		if logger != nil {
+			logger.Printf("device %s running firmware %s", deviceID, version)
+		}
+		return nil
+	})
+}
+
+// SetBlockedFirmwareVersion records (or clears, when version is empty) a
+// per-device OTA tombstone: a firmware version the auto-discovery loop must
+// not re-stage. Written by wall_monitor_revert with the version the device is
+// being reverted FROM. Unknown devices are silently ignored. Mirror of the
+// py/js stores.
+func (r *Registry) SetBlockedFirmwareVersion(deviceID, version string) error {
+	if !ValidDeviceID(deviceID) {
+		return fmt.Errorf("registry: invalid device_id %q", deviceID)
+	}
+	return r.withLock(deviceID, func(p string) error {
+		dev, err := r.loadLocked(p)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return nil
+			}
+			return err
+		}
+		if dev.BlockedFirmwareVersion == version {
+			return nil
+		}
+		dev.BlockedFirmwareVersion = version
 		return r.saveLocked(dev, p)
 	})
 }

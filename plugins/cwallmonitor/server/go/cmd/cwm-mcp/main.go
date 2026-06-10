@@ -11,7 +11,7 @@
 //   --once     Validate that the credentials file is readable + not expired,
 //              print a one-line summary, and exit. Useful for smoke tests.
 //   --status   Probe the local broker (if any) for a status JSON dump.
-//   --config   Path to cwm.toml (default: ~/.config/claude-wall-monitor/cwm.toml,
+//   --config   Path to cwm.toml (default: ~/.config/cwallmonitor/cwm.toml,
 //              with fallback to service.toml for legacy installations).
 //   --version  Print version and exit.
 //   --probe    Report the runtime ("go") plus version to stderr and exit
@@ -61,7 +61,7 @@ import (
 var Version = "dev"
 
 func main() {
-	configPath := flag.String("config", "", "Path to cwm.toml (default: ~/.config/claude-wall-monitor/cwm.toml)")
+	configPath := flag.String("config", "", "Path to cwm.toml (default: ~/.config/cwallmonitor/cwm.toml)")
 	daemonMode := flag.Bool("daemon", false, "Standalone broker — bind unconditionally, no leader-election")
 	onceMode := flag.Bool("once", false, "Validate credentials file and exit")
 	statusMode := flag.Bool("status", false, "Probe local broker and print status JSON")
@@ -114,7 +114,7 @@ func addrOf(cfg *config.Config) string {
 }
 
 // openRegistry opens the per-device store under
-// ~/.config/claude-wall-monitor/devices/. A failure is logged but does
+// ~/.config/cwallmonitor/devices/. A failure is logged but does
 // not abort the broker — the legacy global-PSK path still works without
 // it, and the next /credentials call from a registered device will 401
 // instead of brick-flashing a working setup.

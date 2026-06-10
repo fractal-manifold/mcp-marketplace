@@ -496,6 +496,70 @@ func TestCheckNoStageWhenRunningEqualsRelease(t *testing.T) {
 	}
 }
 
+// TestCheckSkipsBlockedVersion locks the revert tombstone: when a device has
+// BlockedFirmwareVersion set to the exact version of the newest release, the
+// AUTO-discovery loop must NOT re-stage it (a canary that was just rolled back
+// must stay rolled back). A NEWER release over a blocked one still stages.
+func TestCheckSkipsBlockedVersion(t *testing.T) {
+	v := loadVectors(t)
+	canonical, sigB64 := s1Vector(t, v)
+	idx := Index{
+		Version:      "0.5.1",
+		ManifestB64:  base64.StdEncoding.EncodeToString([]byte(canonical)),
+		SignatureB64: sigB64,
+		BinURL:       "https://downloads.example/cwm-S1-0.5.1.bin",
+	}
+	srv := mockReleases(t, map[string]Index{"S1": idx})
+	defer srv.Close()
+	cfg := otaConfigForVectors(t, v, srv.URL)
+
+	// Fresh device (no running version), tombstone == the release version.
+	reg := newRegistryWithDevice(t, testDevice, "S1", 0)
+	if err := reg.SetBlockedFirmwareVersion(testDevice, "0.5.1"); err != nil {
+		t.Fatalf("SetBlockedFirmwareVersion: %v", err)
+	}
+	checker := NewChecker(cfg, reg, nil)
+	rep, err := checker.Check(context.Background(), false, "", "")
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if rep.Staged != 0 || rep.Devices[0].Action != "skipped:blocked-version" {
+		t.Fatalf("blocked: got staged=%d action=%s, want skipped:blocked-version",
+			rep.Staged, rep.Devices[0].Action)
+	}
+}
+
+// TestCheckStagesNewerThanBlocked: the tombstone must match on version equality
+// ONLY — a fixed release NEWER than the blocked version must still go out.
+func TestCheckStagesNewerThanBlocked(t *testing.T) {
+	v := loadVectors(t)
+	canonical, sigB64 := s1Vector(t, v)
+	idx := Index{
+		Version:      "0.5.1",
+		ManifestB64:  base64.StdEncoding.EncodeToString([]byte(canonical)),
+		SignatureB64: sigB64,
+		BinURL:       "https://downloads.example/cwm-S1-0.5.1.bin",
+	}
+	srv := mockReleases(t, map[string]Index{"S1": idx})
+	defer srv.Close()
+	cfg := otaConfigForVectors(t, v, srv.URL)
+
+	reg := newRegistryWithDevice(t, testDevice, "S1", 0)
+	// Block an OLDER version than the release — release 0.5.1 must still stage.
+	if err := reg.SetBlockedFirmwareVersion(testDevice, "0.5.0"); err != nil {
+		t.Fatalf("SetBlockedFirmwareVersion: %v", err)
+	}
+	checker := NewChecker(cfg, reg, nil)
+	rep, err := checker.Check(context.Background(), false, "", "")
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if rep.Staged != 1 || rep.Devices[0].Action != "staged" {
+		t.Fatalf("newer-than-blocked: got staged=%d action=%s, want 1 staged",
+			rep.Staged, rep.Devices[0].Action)
+	}
+}
+
 func TestCheckRejectsTamperedSignature(t *testing.T) {
 	v := loadVectors(t)
 	canonical, sigB64 := s1Vector(t, v)

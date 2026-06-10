@@ -184,7 +184,7 @@ def _local_ipv4s() -> list[str]:
 
 
 def _registry_unavailable_text() -> str:
-    return "device registry is not configured on this cwm-mcp install; configure ~/.config/claude-wall-monitor/devices/ and retry"
+    return "device registry is not configured on this cwm-mcp install; configure ~/.config/cwallmonitor/devices/ and retry"
 
 
 def _clamp(v: int, lo: int, hi: int) -> int:
@@ -673,6 +673,13 @@ def _revert_firmware(deps: Deps, args: dict) -> dict:
     upd.firmware_version = fv
     upd.firmware_manifest_b64 = mb
     upd.firmware_manifest_sig_b64 = ms
+    # Tombstone the version we're reverting FROM (the bad release the device is
+    # currently running) so the OTA auto-discovery loop doesn't immediately
+    # re-stage it once the device reports the older version. Empty active
+    # version (fresh device) → nothing to block.
+    bad = dev.active.payload.firmware_version
+    if bad and bad != fv:
+        deps.registry.set_blocked_firmware_version(device_id, bad)
     try:
         dev2 = deps.registry.set_pending(device_id, upd)
     except Exception as e:

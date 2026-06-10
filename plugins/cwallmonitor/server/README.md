@@ -22,9 +22,9 @@ server/
 
 `cwm-mcp` auto-detects "bundle mode" from the sibling `VERSION` + `compat/` +
 `js|py|go/` and execs the first available runtime (Node → Python → Go; override
-with `runtime=` in `~/.config/claude-wall-monitor/launcher.conf`). Dependencies
+with `runtime=` in `~/.config/cwallmonitor/launcher.conf`). Dependencies
 — including native ones (serialport, fs-ext, cryptography) — are resolved on
-first run into `~/.cache/claude-wall-monitor/<version>/`, not committed here.
+first run into `~/.cache/cwallmonitor/<version>/`, not committed here.
 
 ## The two vendored files (`VERSION`, `compat/tool-schemas.json`)
 

@@ -173,6 +173,43 @@ test("check up_to_date when device floor is ABOVE release", { skip }, async () =
   }
 });
 
+test("check skips the blocked (reverted) version", { skip }, async () => {
+  // Revert tombstone: the AUTO-discovery loop must NOT re-stage the exact
+  // version the device was reverted away from. Fresh device, tombstone == the
+  // release version (0.5.1).
+  const { canonical, sigB64 } = s1Vector();
+  const { server, url } = await mockReleases({ S1: index(canonical, sigB64) });
+  try {
+    const cfg = makeCfg(url);
+    const reg = registryWithDevice("S1", 0);
+    reg.setBlockedFirmwareVersion(TEST_DEVICE, "0.5.1");
+    const rep = await ota.check(cfg, reg, { dryRun: false });
+    assert.equal(rep.staged, 0);
+    assert.equal(rep.devices[0].action, "skipped:blocked-version");
+    assert.equal(reg.load(TEST_DEVICE).pending, null);
+  } finally {
+    server.close();
+  }
+});
+
+test("check stages a release NEWER than the blocked version", { skip }, async () => {
+  // The tombstone matches on version equality only — a newer fixed release
+  // over a blocked older one must still stage. Block 0.5.0, release is 0.5.1.
+  const { canonical, sigB64 } = s1Vector();
+  const { server, url } = await mockReleases({ S1: index(canonical, sigB64) });
+  try {
+    const cfg = makeCfg(url);
+    const reg = registryWithDevice("S1", 0);
+    reg.setBlockedFirmwareVersion(TEST_DEVICE, "0.5.0");
+    const rep = await ota.check(cfg, reg, { dryRun: false });
+    assert.equal(rep.staged, 1);
+    assert.equal(rep.devices[0].action, "staged");
+    assert.equal(reg.load(TEST_DEVICE).pending.payload.firmware_version, "0.5.1");
+  } finally {
+    server.close();
+  }
+});
+
 test("check stages when release packed EQUALS the floor", { skip }, async () => {
   // The device refuses only packed < floor, so a release whose base == floor
   // is installable and must be staged (mirrors a newer same-base dev canary

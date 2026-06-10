@@ -126,7 +126,7 @@ function localIPv4s() {
 }
 
 function registryUnavailableMsg() {
-  return "device registry is not configured on this cwm-mcp install; configure ~/.config/claude-wall-monitor/devices/ and retry";
+  return "device registry is not configured on this cwm-mcp install; configure ~/.config/cwallmonitor/devices/ and retry";
 }
 
 export async function serve(deps) {
@@ -582,6 +582,15 @@ function revertFirmwareTool(deps, args) {
                 firmware_url: fu, firmware_sha256: fs, firmware_version: fv,
                 firmware_manifest_b64: mb, firmware_manifest_sig_b64: ms,
                 min_secure_version: 0 };
+  // Tombstone the version we're reverting FROM (the bad release the device is
+  // currently running) so the OTA auto-discovery loop doesn't immediately
+  // re-stage it once the device reports the older version. Empty active
+  // version (fresh device) → nothing to block.
+  const bad = dev.active.payload.firmware_version || "";
+  if (bad && bad !== fv) {
+    try { deps.registry.setBlockedFirmwareVersion(deviceID, bad); }
+    catch (e) { return { error: e.message }; }
+  }
   try {
     const dev2 = deps.registry.setPending(deviceID, upd);
     return { ok: true, reverts_to: fv, device: deviceSummary(dev2) };

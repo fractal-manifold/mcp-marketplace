@@ -11,10 +11,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-DEFAULT_PATH = "~/.config/claude-wall-monitor/cwm.toml"
-LEGACY_PATH = "~/.config/claude-wall-monitor/service.toml"
-DEVICES_DIR = "~/.config/claude-wall-monitor/devices"
-FIRMWARE_DIR = "~/.config/claude-wall-monitor/firmware"
+DEFAULT_PATH = "~/.config/cwallmonitor/cwm.toml"
+LEGACY_PATH = "~/.config/cwallmonitor/service.toml"
+DEVICES_DIR = "~/.config/cwallmonitor/devices"
+FIRMWARE_DIR = "~/.config/cwallmonitor/firmware"
 
 
 def devices_path() -> str:
@@ -92,7 +92,7 @@ class Pricing:
     fallback so $ works offline."""
 
     url: str = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
-    cache_path: str = "~/.config/claude-wall-monitor/pricing-cache.json"
+    cache_path: str = "~/.config/cwallmonitor/pricing-cache.json"
     ttl_hours: int = 24
 
 

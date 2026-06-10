@@ -348,6 +348,54 @@ async def test_check_inert_when_unconfigured(tmp_path):
     assert rep["devices"] == []
 
 
+def _resolved(version: str) -> dict:
+    """A minimal resolved-release dict shaped like ota._resolve_sku output."""
+    return {
+        "mf": {"version": version, "sha256": "ab" * 32},
+        "idx": {
+            "bin_url": "https://downloads.example/cwm.bin",
+            "manifest_b64": "bWFuaWZlc3Q=",
+            "signature_b64": "c2ln",
+        },
+    }
+
+
+def test_decide_skips_blocked_version(tmp_path: Path):
+    """Revert tombstone: decide() must NOT auto-stage the exact version the
+    device was reverted away from (blocked_firmware_version == release)."""
+    reg = Registry(str(tmp_path))
+    reg.register(TEST_DEVICE, ConfigPayload(broker_url="http://x", psk_hex="aa" * 32))
+    reg.set_blocked_firmware_version(TEST_DEVICE, "0.9.1")
+    dev = reg.load(TEST_DEVICE)
+
+    out = ota._decide(reg, dev, _resolved("0.9.1"), dry_run=False)
+    assert out["action"] == "skipped:blocked-version"
+    assert reg.load(TEST_DEVICE).pending is None
+
+
+def test_decide_stages_newer_than_blocked(tmp_path: Path):
+    """The tombstone matches on version equality only — a NEWER fixed release
+    over a blocked one must still stage."""
+    reg = Registry(str(tmp_path))
+    reg.register(TEST_DEVICE, ConfigPayload(broker_url="http://x", psk_hex="aa" * 32))
+    reg.set_blocked_firmware_version(TEST_DEVICE, "0.9.1")
+    dev = reg.load(TEST_DEVICE)
+
+    out = ota._decide(reg, dev, _resolved("0.9.2"), dry_run=False)
+    assert out["action"] == "staged"
+    assert reg.load(TEST_DEVICE).pending.payload.firmware_version == "0.9.2"
+
+
+def test_decide_no_tombstone_stages_normally(tmp_path: Path):
+    """Sanity: with no tombstone a fresh release stages."""
+    reg = Registry(str(tmp_path))
+    reg.register(TEST_DEVICE, ConfigPayload(broker_url="http://x", psk_hex="aa" * 32))
+    dev = reg.load(TEST_DEVICE)
+
+    out = ota._decide(reg, dev, _resolved("0.9.1"), dry_run=False)
+    assert out["action"] == "staged"
+
+
 def test_semver_order_vectors():
     """Drive pack_semver + compare_semver from the shared cross-runtime
     contract so Go, JS and Python stay byte-for-byte aligned."""

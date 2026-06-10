@@ -76,8 +76,9 @@ Resolve only the broker URL before asking the user anything else:
   IP (so the device doesn't end up pointed at an interface it can't
   reach). If `wall_monitor_provision_hint` warns that the broker is
   bound to `127.0.0.1`, stop and tell the user to edit
-  `~/.config/claude-wall-monitor/service.toml` (`[server] bind =
-  "0.0.0.0"`) and restart the broker.
+  `~/.config/cwallmonitor/cwm.toml` (`[server] bind =
+  "0.0.0.0"`) and restart the broker. (The legacy `service.toml` is
+  still read for back-compat, but `cwm.toml` is the primary config.)
 - **psk_hex** — DO NOT ask the user. The broker auto-generates a fresh
   32-byte random PSK on every `wall_monitor_provision` call where
   `psk_hex` is omitted (recommended). The PSK lives on the broker
@@ -137,11 +138,15 @@ Resolve only the broker URL before asking the user anything else:
   (`true` for selected, omit for not-selected — the broker treats the
   absence as "keep current", which on a fresh provision means disabled).
 
-- **rotation** — if the final selection has **2 or more providers**,
-  enable autorotation by passing `rotation_enabled: true` (a single
-  provider doesn't need rotation; passing it would just animate one
-  card swap into itself). Leave `rotation_interval_seconds` at the
-  broker's default (30 s) unless the user volunteers a number.
+- **rotation** — `wall_monitor_provision` does NOT accept rotation
+  fields (its schema is `additionalProperties: false`; passing them
+  fails the call). If the final selection has **2 or more providers**
+  and you want autorotation on at setup, enable it as a **follow-up**
+  `wall_monitor_set_device_pending` call after the provision succeeds,
+  using the real fields `autorotate_enabled: true` and (optionally)
+  `autorotate_interval_s` (seconds, 1..300; leave it unset for the
+  device default unless the user volunteers a number). A single provider
+  doesn't need rotation.
 
 ### 4. POST the provision
 

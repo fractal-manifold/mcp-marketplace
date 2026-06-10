@@ -80,7 +80,7 @@ func registerDiscoveryTools(s *server.MCPServer, d Deps) {
 			mcp.WithString("broker_url",
 				mcp.Description("HTTP(S) URL of the cwm-mcp broker the device should poll. Run wall_monitor_provision_hint to learn the laptop's reachable URL on this LAN; do not assume a specific IP. If omitted, only the optional fields below are pushed.")),
 			mcp.WithString("psk_hex",
-				mcp.Description("Optional 64-hex PSK the device should sign requests with. If omitted (recommended), the broker generates a fresh 32-byte random PSK with crypto/rand and stores it in the registry — the user never has to think of or remember one. Supplying psk_hex is only needed when reproducing an existing PSK (e.g. migrating a device between brokers).")),
+				mcp.Description("64-hex PSK the device should sign requests with.")),
 			mcp.WithString("city", mcp.Description("Optional city for ambient weather.")),
 			mcp.WithNumber("br_day",   mcp.Description("Daytime brightness 10..100.")),
 			mcp.WithNumber("br_night", mcp.Description("Nighttime brightness 5..100.")),

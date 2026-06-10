@@ -235,7 +235,7 @@
           },
           "gemini_models": {
             "type": "string",
-            "description": "Comma-separated list of Gemini model IDs to show on the dashboard (max 3). Example: 'gemini-2.5-pro,gemini-2.5-flash'. Empty string clears the override and falls back to the broker's global default (service.toml [gemini].models)."
+            "description": "Comma-separated list of Gemini model IDs to show on the dashboard (max 3). Example: 'gemini-2.5-pro,gemini-2.5-flash'. Empty string clears the override and falls back to the broker's global default (cwm.toml [gemini].models)."
           },
           "firmware_url": {
             "type": "string",
@@ -251,7 +251,7 @@
           },
           "firmware_manifest_b64": {
             "type": "string",
-            "description": "Base64 of the canonical-JSON Ed25519 manifest produced by `firmware/components/ota/scripts/manifest.py sign`. The device verifies sig(manifest) BEFORE downloading the .bin and refuses unsigned manifests unless built with CWM_OTA_UNSIGNED=y. Must be supplied together with firmware_manifest_sig_b64."
+            "description": "Base64 of the canonical-JSON Ed25519 manifest produced by `tools/cwmtools/lib/manifest.py sign`. The device verifies sig(manifest) BEFORE downloading the .bin and refuses unsigned manifests unless built with CWM_OTA_UNSIGNED=y. Must be supplied together with firmware_manifest_sig_b64."
           },
           "firmware_manifest_sig_b64": {
             "type": "string",
@@ -274,7 +274,7 @@
     },
     {
       "name": "wall_monitor_publish_firmware",
-      "description": "Stage a firmware OTA for a registered device. Copies the .bin from bin_path into the broker's firmware directory (~/.config/claude-wall-monitor/firmware), computes the SHA-256, then queues a pending update with firmware_url pointing back at this broker's /firmware/<file> endpoint. The device picks up the change on its next /sync, downloads + verifies via the encrypted pending blob, switches the boot slot and reboots. If the new image's first broker poll fails, the bootloader auto-rolls back. Use external_url to point at an off-broker host (S3, GitHub Releases) instead of copying locally.",
+      "description": "Stage a firmware OTA for a registered device. Copies the .bin from bin_path into the broker's firmware directory (~/.config/cwallmonitor/firmware), computes the SHA-256, then queues a pending update with firmware_url pointing back at this broker's /firmware/<file> endpoint. The device picks up the change on its next /sync, downloads + verifies via the encrypted pending blob, switches the boot slot and reboots. If the new image's first broker poll fails, the bootloader auto-rolls back. Use external_url to point at an off-broker host (S3, GitHub Releases) instead of copying locally.",
       "inputSchema": {
         "type": "object",
         "properties": {

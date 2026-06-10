@@ -195,7 +195,7 @@ async def _run_mcp(cfg, logs: Buffer, logger: logging.Logger) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(prog="cwm-mcp-py", add_help=True)
-    parser.add_argument("--config", default="", help="Path to cwm.toml (default: ~/.config/claude-wall-monitor/cwm.toml)")
+    parser.add_argument("--config", default="", help="Path to cwm.toml (default: ~/.config/cwallmonitor/cwm.toml)")
     parser.add_argument("--daemon", action="store_true")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--status", action="store_true")

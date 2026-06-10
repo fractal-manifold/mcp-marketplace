@@ -77,6 +77,74 @@ def test_v1_form_is_dead():
         assert got != v["v1_expected_hex_rejected_now"]
 
 
+def test_percent_encoded_path_signs_decoded():
+    """The DECODED path is signed (aiohttp req.path / Go r.URL.Path are
+    already %-decoded). Signing the still-encoded form yields a different,
+    WRONG hash. Wires the percent-encoded-path vector from hmac.json."""
+    data = _load_vectors()
+    matched = 0
+    for v in data["vectors"]:
+        if "raw_path_on_wire" not in v:
+            continue
+        matched += 1
+        psk = v["psk_utf8"].encode("utf-8")
+        # Signing the decoded path reproduces the expected signature.
+        got = auth.compute_signature(
+            psk, v["method"], v["path"], v["timestamp"], v["nonce"],
+            v.get("device", ""), v.get("config_version", ""),
+        )
+        assert got == v["expected_hex"], f"vector {v['name']!r}"
+        # Signing the raw (encoded) path must NOT match, and must equal the
+        # documented wrong answer.
+        wrong = auth.compute_signature(
+            psk, v["method"], v["raw_path_on_wire"], v["timestamp"], v["nonce"],
+            v.get("device", ""), v.get("config_version", ""),
+        )
+        assert wrong != v["expected_hex"]
+        assert wrong == v["raw_path_must_not_be_signed"]
+    assert matched, "percent-encoded-path vector not found in hmac.json"
+
+
+def test_non_ascii_auth_header_rejected():
+    """X-Cwm-* auth headers are ASCII-only: a non-ASCII value must be
+    rejected as an AuthError (mapped to 401), never escape as a 500 from
+    .encode('ascii'). Wires the reject_vectors entry from hmac.json."""
+    data = _load_vectors()
+    rejects = data.get("reject_vectors", [])
+    assert rejects, "reject_vectors missing from hmac.json"
+    matched = 0
+    for rv in rejects:
+        assert rv.get("must_reject") is True, rv["name"]
+        # The hex round-trips to the same UTF-8 value the vector pins.
+        val = rv["header_value_utf8"]
+        assert val.encode("utf-8").hex() == rv["header_value_hex"]
+        assert not val.isascii()
+        matched += 1
+
+        psk = b"active-32-bytes-of-secret-mat!!!"
+        cache = auth.NonceCache(ttl_seconds=300)
+        now = 1700000000.0
+        ts = "1700000000"
+        nonce = "0123456789abcdef0123456789abcdef"
+        # A plausible (correctly-shaped) signature is irrelevant — the
+        # non-ASCII header must be rejected BEFORE the HMAC is computed.
+        sig = "0" * 64
+        header = rv["header"]
+        device = val if header == "X-Cwm-Device" else ""
+        config_version = val if header == "X-Cwm-Config-Version" else ""
+        with pytest.raises(auth.AuthError):
+            auth.verify(
+                psk, "GET", "/device/ab12cd34/sync", ts, nonce, sig,
+                device, config_version, cache, 60, now,
+            )
+        with pytest.raises(auth.AuthError):
+            auth.verify_multi(
+                [psk], "GET", "/device/ab12cd34/sync", ts, nonce, sig,
+                device, config_version, cache, 60, now,
+            )
+    assert matched, "no reject vectors exercised"
+
+
 def test_verify_happy_path():
     psk = b"psk-32-bytes-of-secret-material!"
     cache = auth.NonceCache(ttl_seconds=300)

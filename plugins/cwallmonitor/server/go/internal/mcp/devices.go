@@ -163,7 +163,7 @@ func summarise(dev *registry.Device) deviceSummary {
 func registryUnavailable() *mcp.CallToolResult {
 	return mcp.NewToolResultErrorFromErr(
 		"registry disabled",
-		errors.New("device registry is not configured on this cwm-mcp install; configure ~/.config/claude-wall-monitor/devices/ and retry"),
+		errors.New("device registry is not configured on this cwm-mcp install; configure ~/.config/cwallmonitor/devices/ and retry"),
 	)
 }
 
@@ -594,6 +594,15 @@ func handleRevertFirmware(d Deps) server.ToolHandlerFunc {
 			FirmwareVersion:        fv,
 			FirmwareManifestB64:    mb,
 			FirmwareManifestSigB64: sb,
+		}
+		// Tombstone the version we're reverting FROM (the bad release the
+		// device is currently running) so the OTA auto-discovery loop doesn't
+		// immediately re-stage it once the device reports the older version.
+		// Empty active version (fresh device) → nothing to block.
+		if bad := dev.Active.FirmwareVersion; bad != "" && bad != fv {
+			if err := d.Registry.SetBlockedFirmwareVersion(deviceID, bad); err != nil {
+				return mcp.NewToolResultErrorFromErr("set_blocked", err), nil
+			}
 		}
 		dev2, err := d.Registry.SetPending(deviceID, update)
 		if err != nil {

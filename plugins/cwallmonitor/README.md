@@ -2,9 +2,9 @@
 
 Registers the `cwm-mcp` MCP server with Claude Code. `cwm-mcp` is the
 local broker that serves OAuth credentials to the C Wall Monitor
-ESP32 device, exposes diagnostic tools to the model, and ships the
-`/cwallmonitor:configure`, `/cwallmonitor:settings` and
-`/cwallmonitor:theme` on-device skills.
+ESP32 device, exposes diagnostic and control tools to the model, and
+ships the `/cwallmonitor:configure`, `/cwallmonitor:settings`,
+`/cwallmonitor:theme` and `/cwallmonitor:firmware` on-device skills.
 
 **The plugin is self-contained.** It bundles the server under
 [`server/`](./server/) and launches it directly via
@@ -31,10 +31,10 @@ built for your host rather than shipped in the plugin.
    | Go      | `go` (≥1.25)               | `go build` (compiled once, then cached)          |
 
    To pin a runtime, write `runtime=js` (or `python`, `go`) to
-   `~/.config/claude-wall-monitor/launcher.conf`. Default order is
+   `~/.config/cwallmonitor/launcher.conf`. Default order is
    `js → python → go`.
 
-2. Configure `~/.config/claude-wall-monitor/cwm.toml` with the
+2. Configure `~/.config/cwallmonitor/cwm.toml` with the
    passphrase you typed into the device's captive portal. The same
    schema is read by all three runtimes; a legacy `service.toml` from a
    `service-go` install is read as a fallback.
@@ -47,7 +47,7 @@ built for your host rather than shipped in the plugin.
    ```
 
 The **first** time the server starts it resolves the chosen runtime's
-dependencies into `~/.cache/claude-wall-monitor/<version>/` (one-time,
+dependencies into `~/.cache/cwallmonitor/<version>/` (one-time,
 per version — a fresh `npm install` / venv / `go build`). That run is
 slower; subsequent launches are a cache hit. The launcher logs which
 runtime it picked to stderr (`cwm-mcp launcher: using <runtime> (…)`).
@@ -64,17 +64,26 @@ and put `server/cwm-mcp` and `server/install.sh` on your `PATH`.
 
 ## Tools exposed to the model
 
+The bundled server exposes 14 tools (see
+[`server/compat/tool-schemas.json`](./server/compat/tool-schemas.json) for
+the authoritative schemas):
+
 | Tool                          | What it does |
 |-------------------------------|--------------|
 | `wall_monitor_status`         | Role (leader/follower), last ESP32 request, request count. |
 | `wall_monitor_health`         | Credentials file + signed self-ping + observed traffic — PASS/FAIL per component. |
 | `wall_monitor_recent_logs`    | In-memory tail of the broker log. |
+| `wall_monitor_firmware_logs`  | Tail the ESP-IDF log stream from the device over USB-CDC. |
+| `wall_monitor_device_logs`    | Tail diagnostic log lines a device uploaded over the air (config-sync channel). |
 | `wall_monitor_provision_hint` | Laptop LAN IPv4s + broker port as URLs ready for the device's captive portal. |
-
-Plus the control-plane tools the skills drive (`wall_monitor_list_devices`,
-`wall_monitor_register_device`, `wall_monitor_set_device_pending`,
-`wall_monitor_discover_devices`, `wall_monitor_provision`,
-`wall_monitor_publish_firmware`, `wall_monitor_revert_firmware`).
+| `wall_monitor_list_devices`   | List every device in the local registry (active version, pending update, last poll, providers). |
+| `wall_monitor_register_device`| Register a device so its future polls are recognised. |
+| `wall_monitor_set_device_pending` | Stage a pending config (or firmware-manifest) update for a registered device. |
+| `wall_monitor_publish_firmware` | Stage a firmware OTA (.bin URL + SHA-256) for a registered device. |
+| `wall_monitor_revert_firmware`| Stage a rollback to a previously-shipped firmware version. |
+| `wall_monitor_discover_devices` | mDNS scan (`_cwm._tcp.local.`) for devices waiting for initial config. |
+| `wall_monitor_provision`      | Send the initial config to a device in BOOT_NEEDS_CONFIG. |
+| `wall_monitor_check_updates`  | Poll the public OTA releases repo and stage a pending OTA per matching, out-of-date device. |
 
 ## Coexistence with `service-go`
 
@@ -90,7 +99,7 @@ schemas (verified by shared test vectors under `compat/`; the bundle
 carries the runtime slice at [`server/compat/`](./server/compat/)). A
 device registered by one runtime is readable by the others. If
 `wall_monitor_status` reports a different runtime than expected, check
-`~/.config/claude-wall-monitor/launcher.conf`.
+`~/.config/cwallmonitor/launcher.conf`.
 
 ## Editing the server
 

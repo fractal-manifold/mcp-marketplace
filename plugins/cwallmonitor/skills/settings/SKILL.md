@@ -89,7 +89,7 @@ Codex" → `provider_mode_codex=disabled`; "show Claude as API spend" →
 | User intent                       | MCP argument               | Valid range / format               |
 | --------------------------------- | -------------------------- | ---------------------------------- |
 | Auto-rotate enabled               | `autorotate_enabled`       | bool                               |
-| Auto-rotate interval (seconds)    | `autorotate_interval_s`    | int, 10..300                       |
+| Auto-rotate interval (seconds)    | `autorotate_interval_s`    | int, 1..300                        |
 | Theme (day / night / auto)        | `theme_mode`               | one of `day`, `night`, `auto`      |
 | Day brightness                    | `br_day`                   | int, 10..100 (% of backlight)      |
 | Night brightness                  | `br_night`                 | int, 5..100 (% of backlight)       |
@@ -99,8 +99,10 @@ Codex" → `provider_mode_codex=disabled`; "show Claude as API spend" →
 These are **device-owned** display settings: the user can also pick them on
 the device, and the device reports its choice back via
 `POST /device/<id>/settings` (so a control-plane push and an on-device edit
-converge — see `compat/SETTINGS_REPORT.md`). They apply on the device's next
-poll like any other Display field.
+converge — the report contract lives in the monorepo's shared compat suite at
+`compat/SETTINGS_REPORT.md`; a standalone plugin install only bundles
+`server/compat/tool-schemas.json`, not this file). They apply on the device's
+next poll like any other Display field.
 
 | User intent                       | MCP argument               | Valid range / format               |
 | --------------------------------- | -------------------------- | ---------------------------------- |
@@ -335,7 +337,7 @@ wall_monitor_set_device_pending
   normalisation rules in step 2.
 - **`registry disabled`** — the broker is running without a registry
   path; the user has to configure
-  `~/.config/claude-wall-monitor/devices/` and restart `cwm-mcp`.
+  `~/.config/cwallmonitor/devices/` and restart `cwm-mcp`.
 - **`pending_changes` never drains** — most often the new candidate
   fails to probe (wrong `broker_url`, wrong `psk_hex`). Check
   `wall_monitor_recent_logs` for `candidate probe failed`; the device

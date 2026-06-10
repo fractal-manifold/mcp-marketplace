@@ -1,6 +1,6 @@
 #!/bin/sh
 # install.sh — copy the cwm-mcp launcher to ~/.local/bin so Claude Code
-# (via the claude-wall-monitor plugin's .mcp.json that invokes "cwm-mcp")
+# (via the cwallmonitor plugin's .mcp.json that invokes "cwm-mcp")
 # can find it. The launcher then picks the actual impl (Go / Python /
 # JS) on each invocation.
 #
@@ -18,7 +18,7 @@ bindir="${HOME}/.local/bin"
 src_dir="$(cd "$(dirname "$0")" && pwd)"
 src="$src_dir/cwm-mcp"
 dst="$bindir/cwm-mcp"
-config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/claude-wall-monitor"
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/cwallmonitor"
 conf_file="$config_dir/launcher.conf"
 
 runtime=""

@@ -200,3 +200,73 @@ def test_report_settings_pet_fields(tmp_path: Path):
     assert dev2.active.payload.pet_species == 9
     assert dev2.active.payload.pet_name == "Rex"
     assert dev2.active.payload.pet_enabled is True
+
+
+def test_set_active_firmware_version_persists_only_on_change(tmp_path: Path):
+    """The /sync handler persists X-Cwm-Fw-Version into
+    Active.payload.firmware_version so ota.decide() stops re-staging the same
+    release after a canary revert. Empty values are no-ops; the file is
+    re-written only on an actual change."""
+    reg = Registry(str(tmp_path))
+    reg.register("abcdef08", ConfigPayload(broker_url="http://x", psk_hex="aa" * 32))
+    fpath = tmp_path / "abcdef08.toml"
+
+    # Empty header is ignored — no firmware_version recorded.
+    reg.set_active_firmware_version("abcdef08", "")
+    assert reg.load("abcdef08").active.payload.firmware_version == ""
+
+    # First non-empty report is persisted across reload.
+    reg.set_active_firmware_version("abcdef08", "0.9.0")
+    assert reg.load("abcdef08").active.payload.firmware_version == "0.9.0"
+
+    # Unchanged report does NOT re-write the file (only-on-change).
+    mtime_before = fpath.stat().st_mtime_ns
+    reg.set_active_firmware_version("abcdef08", "0.9.0")
+    assert fpath.stat().st_mtime_ns == mtime_before
+    assert reg.load("abcdef08").active.payload.firmware_version == "0.9.0"
+
+    # A changed report (e.g. after a canary revert to the older build) updates.
+    reg.set_active_firmware_version("abcdef08", "0.8.0")
+    assert reg.load("abcdef08").active.payload.firmware_version == "0.8.0"
+
+    # Unknown device is a silent no-op (no file created, no raise).
+    reg.set_active_firmware_version("ffffffff", "0.9.0")
+    assert not (tmp_path / "ffffffff.toml").exists()
+
+
+def test_set_blocked_firmware_version_round_trips(tmp_path: Path):
+    """The revert tombstone setter persists through disk, is only-on-change,
+    clears on empty, and ignores unknown devices."""
+    reg = Registry(str(tmp_path))
+    reg.register("abcdef08", ConfigPayload(broker_url="http://x", psk_hex="aa" * 32))
+
+    reg.set_blocked_firmware_version("abcdef08", "0.9.1")
+    assert reg.load("abcdef08").blocked_firmware_version == "0.9.1"
+    # Survives reload (persisted to TOML).
+    assert "blocked_firmware_version" in (tmp_path / "abcdef08.toml").read_text()
+
+    # Clear with empty string.
+    reg.set_blocked_firmware_version("abcdef08", "")
+    assert reg.load("abcdef08").blocked_firmware_version == ""
+
+    # Unknown device is a silent no-op.
+    reg.set_blocked_firmware_version("ffffffff", "0.9.1")
+    assert not (tmp_path / "ffffffff.toml").exists()
+
+
+def test_set_active_firmware_version_clears_stale_tombstone(tmp_path: Path):
+    """A revert tombstone is cleared on /sync once the device reports a version
+    STRICTLY NEWER than the blocked one (a fixed release landed); a report
+    <= the tombstone leaves it in place."""
+    reg = Registry(str(tmp_path))
+    reg.register("abcdef08", ConfigPayload(broker_url="http://x", psk_hex="aa" * 32))
+    reg.set_blocked_firmware_version("abcdef08", "0.9.1")
+
+    # Device still on the blocked version → tombstone stays.
+    reg.set_active_firmware_version("abcdef08", "0.9.1")
+    assert reg.load("abcdef08").blocked_firmware_version == "0.9.1"
+
+    # Device reaches a newer version (the fix) → tombstone cleared.
+    reg.set_active_firmware_version("abcdef08", "0.9.2")
+    assert reg.load("abcdef08").blocked_firmware_version == ""
+    assert reg.load("abcdef08").active.payload.firmware_version == "0.9.2"

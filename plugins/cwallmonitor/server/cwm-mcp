@@ -16,7 +16,7 @@
 #   is expected on PATH except the language toolchain (node+npm, python3
 #   +uv/pip, or go). On first run the launcher resolves the first usable
 #   runtime ON DEMAND into a per-user, per-version cache
-#   (~/.cache/claude-wall-monitor/<version>/<rt>/): npm install / venv +
+#   (~/.cache/cwallmonitor/<version>/<rt>/): npm install / venv +
 #   pip / go build. Subsequent runs are a cache hit. Heavy deps (incl.
 #   native modules) are therefore built for the host, never committed.
 #
@@ -25,8 +25,8 @@
 #   cwm-mcp-js already on PATH and execs the first that passes --probe.
 #
 # Selection in both modes:
-#   1. Read $XDG_CONFIG_HOME/claude-wall-monitor/launcher.conf (or
-#      ~/.config/claude-wall-monitor/launcher.conf). Format:
+#   1. Read $XDG_CONFIG_HOME/cwallmonitor/launcher.conf (or
+#      ~/.config/cwallmonitor/launcher.conf). Format:
 #          runtime=auto|go|python|js
 #      Missing file or invalid value -> "auto".
 #   2. Order candidates: preferred first (when not auto), then the rest.
@@ -36,9 +36,9 @@
 # POSIX sh, no bashisms. Tested with dash + zsh.
 set -u
 
-config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/claude-wall-monitor"
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/cwallmonitor"
 conf_file="$config_dir/launcher.conf"
-cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/claude-wall-monitor"
+cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/cwallmonitor"
 
 # Resolve the directory this launcher lives in (physical, no symlinks),
 # so bundle detection and the packaged runtimes resolve correctly even
@@ -92,12 +92,29 @@ release_lock() { rmdir "$1" 2>/dev/null || true; }
 
 # Copy the version-pinned shared files (VERSION + compat/) into the cache
 # so the runtimes' upward "find ../compat / find ../VERSION" walks resolve
-# without touching impl code.
+# without touching impl code. Refresh (not just create) when the bundled
+# source is newer than the cached copy: a re-vendored contract under the
+# SAME VERSION must not leave a stale schema behind. A marker file tracks
+# the last mirror time so we can cheaply detect a newer source.
 mirror_common() {
     _verdir="$1"
+    _marker="$_verdir/.mirror_marker"
     mkdir -p "$_verdir"
-    [ -e "$_verdir/VERSION" ] || cp -f "$script_dir/VERSION" "$_verdir/VERSION"
-    [ -d "$_verdir/compat" ]  || cp -R "$script_dir/compat" "$_verdir/compat"
+    _stale=0
+    [ -e "$_verdir/VERSION" ] || _stale=1
+    [ -d "$_verdir/compat" ]  || _stale=1
+    if [ -f "$_marker" ]; then
+        [ -n "$(find "$script_dir/VERSION" -newer "$_marker" -print 2>/dev/null | head -n 1)" ] && _stale=1
+        [ -n "$(find "$script_dir/compat" -newer "$_marker" -print 2>/dev/null | head -n 1)" ] && _stale=1
+    else
+        _stale=1
+    fi
+    if [ "$_stale" -eq 1 ]; then
+        cp -f "$script_dir/VERSION" "$_verdir/VERSION"
+        rm -rf "$_verdir/compat"
+        cp -R "$script_dir/compat" "$_verdir/compat"
+        : > "$_marker"
+    fi
 }
 
 # needs_setup <ready-marker> <bundle-source-dir>: true (exit 0) when the
@@ -105,9 +122,15 @@ mirror_common() {
 # newer than the marker. The cache is keyed by VERSION, but this also
 # refreshes it when the bundled source changes WITHOUT a version bump
 # (e.g. local iteration), so a regenerated bundle never runs stale code.
+# The shared contract (VERSION + compat/) is mirrored into the cache too,
+# so a change to either of those must also force a rebuild — otherwise a
+# re-vendored contract would leave the runtime serving a stale schema.
 needs_setup() {
     [ -f "$1" ] || return 0
-    [ -n "$(find "$2" -newer "$1" -print 2>/dev/null | head -n 1)" ]
+    [ -n "$(find "$2" -newer "$1" -print 2>/dev/null | head -n 1)" ] && return 0
+    [ -n "$(find "$script_dir/VERSION" -newer "$1" -print 2>/dev/null | head -n 1)" ] && return 0
+    [ -n "$(find "$script_dir/compat" -newer "$1" -print 2>/dev/null | head -n 1)" ] && return 0
+    return 1
 }
 
 # Each ensure_* returns non-zero (without execing) when its toolchain is
@@ -271,6 +294,12 @@ path_run() {
         js)     order="js go python"  ;;
     esac
 
+    # The version this launcher was shipped/vendored at, if a VERSION file
+    # sits next to it (install.sh puts server/cwm-mcp + its VERSION on PATH).
+    # Empty when there is nothing to compare against.
+    _want_ver=""
+    [ -r "$script_dir/VERSION" ] && _want_ver=$(cat "$script_dir/VERSION" 2>/dev/null)
+
     # Try each candidate. Probe is short: --probe must answer in <2s.
     attempted=""
     for impl in $order; do
@@ -281,7 +310,22 @@ path_run() {
             attempted="$attempted $impl(not-on-PATH)"
             continue
         fi
-        if "$bin_path" --probe >/dev/null 2>&1; then
+        # --probe reports "<runtime> <version>" on stderr (stdout stays
+        # clean for JSON-RPC). Capture it so we can sanity-check the binary's
+        # version against what this launcher expects — the standalone PATH
+        # binary is the classic stale-binary footgun (it goes out of date
+        # silently while the source moves on).
+        _probe_out=$("$bin_path" --probe 2>&1 >/dev/null)
+        _probe_rc=$?
+        if [ "$_probe_rc" -eq 0 ]; then
+            _got_ver=$(printf '%s\n' "$_probe_out" | awk 'NF{print $2; exit}')
+            if [ -n "$_want_ver" ] && [ -n "$_got_ver" ] && \
+               [ "$_got_ver" != "$_want_ver" ]; then
+                log "WARNING: PATH binary $bin_path reports version '$_got_ver'"
+                log "WARNING: but this launcher expects '$_want_ver' — the standalone"
+                log "WARNING: $bin is STALE. Rebuild it from the bundled source, or"
+                log "WARNING: remove it from PATH and use the plugin's bundle mode."
+            fi
             printf 'cwm-mcp launcher: using %s (%s)\n' "$impl" "$bin_path" >&2
             exec "$bin_path" "$@"
         fi

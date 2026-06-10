@@ -21,7 +21,7 @@ cwm-mcp-js               # default: MCP stdio + leader-elected broker
 ```
 
 Requires Node ≥ 20. Config lives at
-`~/.config/claude-wall-monitor/cwm.toml`; the schema matches the Go impl.
+`~/.config/cwallmonitor/cwm.toml`; the schema matches the Go impl.
 
 ## Tests
 

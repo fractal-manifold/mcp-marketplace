@@ -36,6 +36,39 @@ def _error(status: int, msg: str) -> web.Response:
     return web.json_response({"error": msg}, status=status)
 
 
+def _stale_response(snap: Any, reason: str) -> web.Response:
+    """200 + last-good snapshot + X-Cwm-Stale-Reason, mirroring Go/JS
+    stale-with-200 (go/internal/broker/server.go ~586-600,
+    js/src/broker/server.js ~291-295). reason is the upstream error message."""
+    snap.fetched_at_unix = snap.fetched_at_unix or int(time.time())
+    resp = web.json_response(asdict(snap))
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["X-Cwm-Stale-Reason"] = reason
+    return resp
+
+
+def _map_usage_error(e: "usage.UsageError") -> tuple[int, web.Response]:
+    """Map a UsageError with NO last-good snapshot to (status, response).
+    Caller handles the stale-with-200 case before reaching here."""
+    if isinstance(e, usage.NotImplementedProvider):
+        return 501, _error(501, "provider not enabled")
+    if isinstance(e, usage.CredsMissing):
+        return 404, _error(404, "creds file missing")
+    if isinstance(e, usage.TokenExpired):
+        return 503, _error(503, "token expired, refresh on laptop")
+    if isinstance(e, usage.Unauthorized):
+        return 401, _error(401, "upstream rejected token")
+    if isinstance(e, usage.RateLimited):
+        r = _error(429, "rate limited")
+        if e.retry_after > 0:
+            r.headers["Retry-After"] = str(e.retry_after)
+        return 429, r
+    if isinstance(e, (usage.Upstream, usage.ParseUpstream, usage.Transport)):
+        return 502, _error(502, f"upstream error: {e}")
+    # Unknown UsageError subclass: treat as upstream failure.
+    return 502, _error(502, f"upstream error: {e}")
+
+
 def make_app(
     cfg: Config,
     cache: auth.NonceCache,
@@ -449,27 +482,15 @@ async def _handle_usage(req: web.Request) -> web.Response:
 
         try:
             snap = await usage_cache.get(http, provider)
-        except usage.NotImplementedProvider:
-            status_to_record = 501
-            return _error(501, "provider not enabled")
-        except usage.CredsMissing as e:
-            status_to_record = 404
-            return _error(404, "creds file missing")
-        except usage.TokenExpired:
-            status_to_record = 503
-            return _error(503, "token expired, refresh on laptop")
-        except usage.Unauthorized:
-            status_to_record = 401
-            return _error(401, "upstream rejected token")
-        except usage.RateLimited as e:
-            status_to_record = 429
-            r = _error(429, "rate limited")
-            if e.retry_after > 0:
-                r.headers["Retry-After"] = str(e.retry_after)
+        except usage.UsageError as e:
+            # Stale-with-200: when a last-good snapshot exists the cache
+            # attaches it to the error. Surface 200 + X-Cwm-Stale-Reason
+            # instead of the error (Go/JS parity). No snapshot → normal
+            # error mapping.
+            if getattr(e, "stale_snapshot", None) is not None:
+                return _stale_response(e.stale_snapshot, str(e))
+            status_to_record, r = _map_usage_error(e)
             return r
-        except (usage.Upstream, usage.ParseUpstream, usage.Transport) as e:
-            status_to_record = 502
-            return _error(502, f"upstream error: {e}")
         body = asdict(snap)
         resp = web.json_response(body)
         resp.headers["Cache-Control"] = "no-store"
@@ -504,10 +525,14 @@ async def _handle_spend(req: web.Request) -> web.Response:
             return _error(501, "spend disabled")
         try:
             snap = await spend_cache.get(provider)
-        except spend.NotImplementedProvider:
-            status_to_record = 501
-            return _error(501, "provider not enabled")
-        except spend.SpendUnavailable:
+        except spend.SpendError as e:
+            # Stale-with-200: the cache attaches the last-good snapshot when
+            # one exists; surface 200 + X-Cwm-Stale-Reason (Go/JS parity).
+            if getattr(e, "stale_snapshot", None) is not None:
+                return _stale_response(e.stale_snapshot, str(e))
+            if isinstance(e, spend.NotImplementedProvider):
+                status_to_record = 501
+                return _error(501, "provider not enabled")
             status_to_record = 503
             return _error(503, "spend unavailable")
         resp = web.json_response(asdict(snap))
@@ -628,6 +653,16 @@ async def _handle_device_sync(req: web.Request) -> web.Response:
                     registry.bump_min_sv(device_id, sv)
             except (ValueError, Exception) as e:
                 log.warning("registry bump_min_sv %s: %s", device_id, e)
+        # Persist the firmware version the device reports running into
+        # Active.firmware_version (only-on-change). ota.decide() keys off it,
+        # so this stops auto-discovery re-staging the same release after a
+        # canary revert. Unsigned metadata, like serial/sku/min-sv above.
+        fw_hdr = req.headers.get("X-Cwm-Fw-Version", "")
+        if fw_hdr:
+            try:
+                registry.set_active_firmware_version(device_id, fw_hdr)
+            except Exception as e:
+                log.warning("registry set_active_firmware_version %s: %s", device_id, e)
 
         dev = registry.load(device_id)
         resp_body: dict[str, Any] = {"active_version": dev.active.payload.version}
@@ -636,12 +671,27 @@ async def _handle_device_sync(req: web.Request) -> web.Response:
                 status_to_record = 500
                 return _error(500, "broker config invalid")
             pt = _pending_payload_json(dev.pending.payload).encode("utf-8")
-            nonce, ct = reg_crypto.encrypt_pending(active, pt)
-            resp_body["pending"] = {
-                "version": dev.pending.payload.version,
-                "nonce_b64": base64.b64encode(nonce).decode("ascii"),
-                "payload_b64": base64.b64encode(ct).decode("ascii"),
-            }
+            pending_version = dev.pending.payload.version
+            # Gate on the LIVE firmware version the device reports, never on
+            # registry state: a device running >= PENDING_GCM_MIN_FW carries
+            # the GCM decrypt path, so emit "enc":"gcm". Older firmware (or
+            # an unparseable / absent header) gets the legacy 16-byte-IV CTR
+            # blob. dev builds "0.9.0-dev.<ts>" pass the gate (same code).
+            if reg_crypto.gcm_fw_gate_open(req.headers.get("X-Cwm-Fw-Version", "")):
+                nonce, ct = reg_crypto.encrypt_pending_gcm(active, pt, pending_version)
+                resp_body["pending"] = {
+                    "version": pending_version,
+                    "enc": "gcm",
+                    "nonce_b64": base64.b64encode(nonce).decode("ascii"),
+                    "payload_b64": base64.b64encode(ct).decode("ascii"),
+                }
+            else:
+                nonce, ct = reg_crypto.encrypt_pending(active, pt)
+                resp_body["pending"] = {
+                    "version": pending_version,
+                    "nonce_b64": base64.b64encode(nonce).decode("ascii"),
+                    "payload_b64": base64.b64encode(ct).decode("ascii"),
+                }
         resp = web.json_response(resp_body)
         resp.headers["Cache-Control"] = "no-store"
         return resp
@@ -907,6 +957,11 @@ def _pending_payload_json(p) -> str:
         wire["firmware_manifest_b64"] = mb
     if ms:
         wire["firmware_manifest_sig_b64"] = ms
-    # Go's json.Marshal on map[string]any sorts keys alphabetically;
-    # mirror it so the AES-CTR ciphertext is deterministic across impls.
+    # Key-sorted, compact JSON so the plaintext is deterministic *within*
+    # this runtime. NOTE: the encrypted bytes are NOT guaranteed identical
+    # across impls — the SEMANTICS match, the bytes need not. Go's
+    # json.Marshal HTML-escapes <>&, Python json with ensure_ascii=True
+    # escapes non-ASCII as \uXXXX, and JS JSON.stringify emits raw UTF-8.
+    # The device decodes whatever its own broker sent; cross-impl
+    # byte-identity is not a requirement here.
     return json.dumps(wire, separators=(",", ":"), sort_keys=True)

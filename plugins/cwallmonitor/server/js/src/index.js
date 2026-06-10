@@ -215,6 +215,20 @@ async function main() {
 
   const logs = new LogBuffer(200);
   const logger = buildLogger(logs, cfg.logging.level);
+
+  // Process-level guards. A throw escaping the http 'request' listener (or a
+  // rejected promise inside a handler) would otherwise take the whole process
+  // down — broker socket, mDNS advertiser and the OTA poller with it. The
+  // broker is a long-lived daemon serving devices in the field, so we log and
+  // keep running rather than crash. Per-request errors are still mapped to a
+  // 4xx/5xx inside the handlers; these handlers only catch what slips past.
+  process.on("uncaughtException", (e) => {
+    logger.error(`uncaughtException: ${e && (e.stack || e.message) || e}`);
+  });
+  process.on("unhandledRejection", (reason) => {
+    logger.error(`unhandledRejection: ${reason && (reason.stack || reason.message) || reason}`);
+  });
+
   if (flags.once) return runOnce(cfg);
   if (flags.status) return await runStatus(cfg);
   if (flags.daemon) return await runDaemon(cfg, logs, logger);

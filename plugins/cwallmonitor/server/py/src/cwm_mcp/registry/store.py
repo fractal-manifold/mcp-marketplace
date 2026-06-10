@@ -331,6 +331,17 @@ class Device:
     # rolling dev tag. Device-level (a sibling of hw_sku), NOT part of the
     # config payload. Always stored canonical via normalize_channel.
     channel: str = ""
+    # Per-device OTA revert tombstone: a firmware version the AUTO-discovery
+    # loop (ota.decide) must NOT re-stage. wall_monitor_revert writes the
+    # version the device is being reverted FROM here, so a canary the device
+    # rolled back is not immediately re-announced (the device reports the old
+    # version, active=old, decide() sees published > active and would otherwise
+    # re-stage the exact bad release). Only the auto path honours it — manual
+    # set_device_pending / publish targeted at the device still override.
+    # Cleared on /sync once the device reports a version STRICTLY NEWER than the
+    # tombstone. Device-level (sibling of channel), NOT in the config payload.
+    # Mirror of go/js blocked_firmware_version.
+    blocked_firmware_version: str = ""
     active: Active = field(default_factory=Active)
     pending: Pending | None = None
 
@@ -345,6 +356,8 @@ class Device:
             doc["hw_sku"] = self.hw_sku
         if self.channel:
             doc["channel"] = self.channel
+        if self.blocked_firmware_version:
+            doc["blocked_firmware_version"] = self.blocked_firmware_version
         doc["active"] = self.active.payload.to_toml_dict()
         if self.active.last_seen:
             doc["active"]["last_seen"] = self.active.last_seen
@@ -381,6 +394,7 @@ def _device_from_toml(text: str) -> Device:
         serial_number=str(d.get("serial_number", "")),
         hw_sku=str(d.get("hw_sku", "")),
         channel=normalize_channel(d.get("channel")),
+        blocked_firmware_version=str(d.get("blocked_firmware_version", "")),
         active=active,
         pending=pending,
     )
@@ -593,6 +607,63 @@ class Registry:
                 dev.hw_sku = sku
                 changed = True
             if changed:
+                self._save_locked(dev)
+
+    def set_active_firmware_version(self, device_id: str, fw_version: str) -> None:
+        """Persist the firmware version the device reports running
+        (X-Cwm-Fw-Version) into Active.payload.firmware_version.
+
+        This is what ota.decide() keys off ("from"), so persisting it fixes
+        auto-discovery re-staging the same release after a canary revert (the
+        in-memory-only path forgot the running version on restart). Empty
+        values are ignored; the file is re-written only on an actual change
+        (bounded churn under a 60s poll). Unknown devices are ignored.
+        """
+        if not valid_device_id(device_id):
+            return
+        if not fw_version:
+            return
+        from ..ota import pack_semver  # lazy: avoid import cycle (ota → registry)
+
+        with self._with_lock(device_id):
+            try:
+                dev = self._load_locked(device_id)
+            except NotFound:
+                return
+            # Clear a stale revert tombstone once the device has moved on to a
+            # version STRICTLY NEWER than the blocked one (a fixed release
+            # landed). Guarded by pack_semver so unparseable reports never
+            # touch it. Computed independently of the only-on-change guard so
+            # a clear still persists even if the running version is unchanged.
+            clear_blocked = False
+            if dev.blocked_firmware_version:
+                got = pack_semver(fw_version)
+                blk = pack_semver(dev.blocked_firmware_version)
+                if got is not None and blk is not None and got > blk:
+                    clear_blocked = True
+            if dev.active.payload.firmware_version == fw_version and not clear_blocked:
+                return
+            dev.active.payload.firmware_version = fw_version
+            if clear_blocked:
+                dev.blocked_firmware_version = ""
+            self._save_locked(dev)
+
+    def set_blocked_firmware_version(self, device_id: str, version: str) -> None:
+        """Record (or clear, when version is "") the per-device OTA revert
+        tombstone — a firmware version the auto-discovery loop must not
+        re-stage. Written by wall_monitor_revert with the version the device is
+        being reverted FROM. Only-on-change; unknown devices ignored. Mirror of
+        go/js stores.
+        """
+        if not valid_device_id(device_id):
+            return
+        with self._with_lock(device_id):
+            try:
+                dev = self._load_locked(device_id)
+            except NotFound:
+                return
+            if dev.blocked_firmware_version != version:
+                dev.blocked_firmware_version = version
                 self._save_locked(dev)
 
     def set_channel(self, device_id: str, channel: str) -> None:

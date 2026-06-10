@@ -109,4 +109,4 @@ skill.
   `wall_monitor_register_device` if it was registered elsewhere.
 - **`registry disabled`** — the user's broker is running without a
   registry path. They need to configure
-  `~/.config/claude-wall-monitor/devices/` and restart the broker.
+  `~/.config/cwallmonitor/devices/` and restart the broker.

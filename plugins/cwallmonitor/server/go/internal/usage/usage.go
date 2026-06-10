@@ -8,6 +8,7 @@ package usage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"time"
@@ -33,7 +34,24 @@ type Snapshot struct {
 	// reserved for any future provider with N model-scoped buckets). When
 	// non-empty, the firmware ignores SessionPct/WeeklyPct/DesignPct and
 	// uses these entries instead. See compat/USAGE_WIRE.md.
-	Slots []Slot `json:"slots,omitempty"`
+	//
+	// No omitempty, and MarshalJSON below substitutes a nil slice with an
+	// empty array, so the field always serialises as "slots": [] (never
+	// omitted, never null) — byte-for-byte parity with the py/js brokers,
+	// which always emit "slots": [].
+	Slots []Slot `json:"slots"`
+}
+
+// MarshalJSON renders Snapshot with a guaranteed non-null "slots" field:
+// a nil Slots slice becomes [] rather than null. Mirrors py/js, which
+// always emit "slots": []. The alias type avoids infinite recursion.
+func (s Snapshot) MarshalJSON() ([]byte, error) {
+	type alias Snapshot
+	a := alias(s)
+	if a.Slots == nil {
+		a.Slots = []Slot{}
+	}
+	return json.Marshal(a)
 }
 
 // Slot is one entry in Snapshot.Slots. The firmware caps the rendered

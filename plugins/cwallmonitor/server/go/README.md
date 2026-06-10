@@ -36,7 +36,7 @@ cwm-mcp --version
 
 ## Configure
 
-Create `~/.config/claude-wall-monitor/cwm.toml`:
+Create `~/.config/cwallmonitor/cwm.toml`:
 
 ```toml
 [server]
@@ -69,7 +69,7 @@ level = "INFO"
 ```
 
 **Legacy compatibility**: if `cwm.toml` is missing, `cwm-mcp` falls back to
-`~/.config/claude-wall-monitor/service.toml` (same schema), so existing
+`~/.config/cwallmonitor/service.toml` (same schema), so existing
 `service-go` users don't need to move files.
 
 ## Register with MCP-aware CLIs
@@ -229,7 +229,7 @@ diagnostic questions about your wall monitor.
 
 ## Per-device control plane
 
-Per-device state lives under `~/.config/claude-wall-monitor/devices/`,
+Per-device state lives under `~/.config/cwallmonitor/devices/`,
 one `<device_id>.toml` per device. Reads and writes are flock-serialised
 so leader and follower processes can both operate safely.
 

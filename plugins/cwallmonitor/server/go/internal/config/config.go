@@ -20,13 +20,13 @@ import (
 // exist, Load() falls back to LegacyPath for users still on the older
 // service-go installation.
 const (
-	DefaultPath = "~/.config/claude-wall-monitor/cwm.toml"
-	LegacyPath  = "~/.config/claude-wall-monitor/service.toml"
-	DevicesDir  = "~/.config/claude-wall-monitor/devices"
+	DefaultPath = "~/.config/cwallmonitor/cwm.toml"
+	LegacyPath  = "~/.config/cwallmonitor/service.toml"
+	DevicesDir  = "~/.config/cwallmonitor/devices"
 	// FirmwareDir holds binaries served by GET /firmware/<name>. The
 	// publish_firmware MCP tool copies the .bin here and the device
 	// downloads from there after a pending OTA promotion.
-	FirmwareDir = "~/.config/claude-wall-monitor/firmware"
+	FirmwareDir = "~/.config/cwallmonitor/firmware"
 )
 
 // DevicesPath returns the absolute path to the per-device registry
@@ -328,7 +328,7 @@ func defaults() *Config {
 		},
 		Pricing: Pricing{
 			URL:       "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
-			CachePath: "~/.config/claude-wall-monitor/pricing-cache.json",
+			CachePath: "~/.config/cwallmonitor/pricing-cache.json",
 			TTLHours:  24,
 		},
 		Security: Security{

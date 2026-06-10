@@ -52,6 +52,44 @@ test("Negative vector: lowercased nonce", { skip }, () => {
   }
 });
 
+test("percent-encoded path signs the DECODED form", { skip }, () => {
+  const v = data.vectors.find((x) => x.name === "percent-encoded-path-signs-decoded");
+  assert.ok(v, "percent-encoded-path-signs-decoded vector present");
+  // Signing the decoded path reproduces expected_hex...
+  const decoded = auth.computeSignature(
+    Buffer.from(v.psk_utf8, "utf8"),
+    v.method, v.path, v.timestamp, v.nonce, v.device ?? "", v.config_version ?? "",
+  );
+  assert.equal(decoded, v.expected_hex);
+  // ...and decoding the raw wire path yields the same value (this is the
+  // canonicalization the server performs).
+  assert.equal(decodeURIComponent(v.raw_path_on_wire), v.path);
+  // Signing the still-encoded form gives the WRONG hash the contract pins.
+  const raw = auth.computeSignature(
+    Buffer.from(v.psk_utf8, "utf8"),
+    v.method, v.raw_path_on_wire, v.timestamp, v.nonce, v.device ?? "", v.config_version ?? "",
+  );
+  assert.equal(raw, v.raw_path_must_not_be_signed);
+  assert.notEqual(decoded, raw);
+});
+
+test("reject_vectors: non-ASCII auth header value is detectable pre-HMAC", { skip }, () => {
+  const rv = data.reject_vectors || [];
+  const v = rv.find((x) => x.name === "non-ascii-auth-header-value");
+  assert.ok(v, "non-ascii-auth-header-value reject vector present");
+  // The wire value carries non-ASCII bytes (latin-1-decoded by Node's http
+  // parser). Mirror that decode and assert at least one char is > 0x7f, which
+  // is exactly what the server's authHeadersAreASCII guard tests.
+  const asSeen = Buffer.from(v.header_value_hex, "hex").toString("latin1");
+  let hasNonAscii = false;
+  for (let i = 0; i < asSeen.length; i++) if (asSeen.charCodeAt(i) > 0x7f) hasNonAscii = true;
+  assert.equal(hasNonAscii, true);
+  // A pure-ASCII value must NOT be flagged.
+  let asciiClean = true;
+  for (let i = 0; i < "ab12cd34".length; i++) if ("ab12cd34".charCodeAt(i) > 0x7f) asciiClean = false;
+  assert.equal(asciiClean, true);
+});
+
 test("v1 form is no longer reproduced (bump regression test)", { skip }, () => {
   for (const v of data.negative_vectors) {
     if (!v.v1_expected_hex_rejected_now || !v.v2_expected_hex) continue;

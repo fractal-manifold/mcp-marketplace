@@ -7,10 +7,10 @@ import { join } from "node:path";
 
 import TOML from "@iarna/toml";
 
-export const DEFAULT_PATH = "~/.config/claude-wall-monitor/cwm.toml";
-export const LEGACY_PATH = "~/.config/claude-wall-monitor/service.toml";
-export const DEVICES_DIR = "~/.config/claude-wall-monitor/devices";
-export const FIRMWARE_DIR = "~/.config/claude-wall-monitor/firmware";
+export const DEFAULT_PATH = "~/.config/cwallmonitor/cwm.toml";
+export const LEGACY_PATH = "~/.config/cwallmonitor/service.toml";
+export const DEVICES_DIR = "~/.config/cwallmonitor/devices";
+export const FIRMWARE_DIR = "~/.config/cwallmonitor/firmware";
 
 export function expandUser(p) {
   if (!p) return p;
@@ -61,7 +61,7 @@ function defaults() {
     // disk with an embedded fallback so $ works offline.
     pricing: {
       url: "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
-      cache_path: "~/.config/claude-wall-monitor/pricing-cache.json",
+      cache_path: "~/.config/cwallmonitor/pricing-cache.json",
       ttl_hours: 24,
     },
     security: { max_timestamp_skew_seconds: 60, nonce_cache_ttl_seconds: 300 },
