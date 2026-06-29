@@ -137,7 +137,16 @@ export class Registry {
       const dev = this._loadLocked(id);
       if (active.channel !== undefined && active.channel !== null) dev.channel = normalizeChannel(active.channel);
       delete active.channel; // channel is device-level, not part of the config payload
-      dev.active = { payload: active, lastSeen: dev.active ? dev.active.lastSeen : null };
+      // Carry over device-reported OTA state from the existing active record:
+      // firmware_version (the running image the device last reported) and
+      // min_secure_version (the anti-rollback floor). The provisioning payload
+      // leaves these zero, so a wholesale replace would reset the floor to 0 and
+      // weaken anti-rollback until the device next reports. lastSeen is
+      // device-observation state too, so keep it (matches Go/Py).
+      const prev = dev.active;
+      active.firmware_version = prev && prev.payload ? prev.payload.firmware_version : "";
+      active.min_secure_version = prev && prev.payload ? prev.payload.min_secure_version : 0;
+      dev.active = { payload: active, lastSeen: prev ? prev.lastSeen : null };
       dev.pending = null;
       this._saveLocked(dev);
       return dev;

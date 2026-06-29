@@ -131,6 +131,9 @@ test("replaceActive converges active, clears pending, preserves metadata (#8)", 
     const reg = new Registry(tmp);
     reg.register("abcdef0c", { ..._testing.emptyPayload(), broker_url: "http://old", psk_hex: "aa".repeat(32), city: "Madrid", channel: "dev" });
     reg.setPending("abcdef0c", { ..._testing.emptyPayload(), city: "Barcelona" });
+    // Device-reported OTA state that a re-provision must NOT discard.
+    reg.setActiveFirmwareVersion("abcdef0c", "1.2.3");
+    reg.bumpMinSV("abcdef0c", 7);
 
     const dev = reg.replaceActive("abcdef0c", { ..._testing.emptyPayload(), broker_url: "http://new", psk_hex: "bb".repeat(32), city: "Sevilla" });
     assert.equal(dev.pending, null);
@@ -139,6 +142,8 @@ test("replaceActive converges active, clears pending, preserves metadata (#8)", 
     assert.equal(dev.active.payload.city, "Sevilla");
     assert.equal(dev.active.payload.version, 1);
     assert.equal(dev.channel, "dev"); // device metadata preserved
+    assert.equal(dev.active.payload.firmware_version, "1.2.3"); // OTA state preserved
+    assert.equal(dev.active.payload.min_secure_version, 7); // anti-rollback floor kept
 
     const d2 = reg.setPending("abcdef0c", { ..._testing.emptyPayload(), city: "Bilbao" });
     assert.ok(d2.pending);

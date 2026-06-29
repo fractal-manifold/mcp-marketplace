@@ -360,6 +360,13 @@ func TestReplaceActive_ConvergesAndPreservesMetadata(t *testing.T) {
 	if _, err := r.SetPending(testID, ConfigPayload{City: "Barcelona"}); err != nil {
 		t.Fatalf("SetPending: %v", err)
 	}
+	// Device-reported OTA state that a re-provision must NOT discard.
+	if err := r.SetActiveFirmwareVersion(testID, "1.2.3", nil); err != nil {
+		t.Fatalf("SetActiveFirmwareVersion: %v", err)
+	}
+	if err := r.BumpMinSV(testID, 7); err != nil {
+		t.Fatalf("BumpMinSV: %v", err)
+	}
 
 	dev, err := r.ReplaceActive(testID, ConfigPayload{
 		PSKHex: newPSK, BrokerURL: "http://new", City: "Sevilla",
@@ -369,6 +376,12 @@ func TestReplaceActive_ConvergesAndPreservesMetadata(t *testing.T) {
 	}
 	if dev.Pending != nil {
 		t.Fatalf("Pending not cleared: %+v", dev.Pending)
+	}
+	if dev.Active.FirmwareVersion != "1.2.3" {
+		t.Errorf("firmware_version lost: %q, want 1.2.3", dev.Active.FirmwareVersion)
+	}
+	if dev.Active.MinSecureVersion != 7 {
+		t.Errorf("min_secure_version reset: %d, want 7 (anti-rollback weakened)", dev.Active.MinSecureVersion)
 	}
 	if dev.Active.PSKHex != newPSK || dev.Active.BrokerURL != "http://new" || dev.Active.City != "Sevilla" {
 		t.Errorf("Active not replaced: %+v", dev.Active.ConfigPayload)

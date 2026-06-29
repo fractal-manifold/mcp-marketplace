@@ -634,7 +634,16 @@ func (r *Registry) ReplaceActive(deviceID string, active ConfigPayload, channel 
 		if err != nil {
 			return err
 		}
-		dev.Active = Active{ConfigPayload: active}
+		// Carry over device-reported OTA state from the existing active record:
+		// FirmwareVersion (the running image the device last reported) and
+		// MinSecureVersion (the anti-rollback floor). The provisioning payload
+		// leaves these zero, so a wholesale replace would reset the floor to 0
+		// and weaken anti-rollback until the device next reports. LastSeen is
+		// device-observation state too, so keep it rather than reset freshness.
+		prev := dev.Active
+		active.FirmwareVersion = prev.FirmwareVersion
+		active.MinSecureVersion = prev.MinSecureVersion
+		dev.Active = Active{ConfigPayload: active, LastSeen: prev.LastSeen}
 		dev.Pending = nil
 		if len(channel) > 0 {
 			dev.Channel = normalizeChannel(channel[0])

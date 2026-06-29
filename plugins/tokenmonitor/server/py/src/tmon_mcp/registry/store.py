@@ -515,7 +515,17 @@ class Registry:
         active.version = 1
         with self._with_lock(device_id):
             dev = self._load_locked(device_id)
-            dev.active = Active(payload=active)
+            # Carry over device-reported OTA state from the existing active
+            # record: firmware_version (the running image the device last
+            # reported) and min_secure_version (the anti-rollback floor). The
+            # provisioning payload leaves these zero, so a wholesale replace
+            # would reset the floor to 0 and weaken anti-rollback until the
+            # device next reports. last_seen is device-observation state too, so
+            # keep it rather than reset freshness.
+            prev = dev.active
+            active.firmware_version = prev.payload.firmware_version
+            active.min_secure_version = prev.payload.min_secure_version
+            dev.active = Active(payload=active, last_seen=prev.last_seen)
             dev.pending = None
             if channel is not None:
                 dev.channel = normalize_channel(channel)

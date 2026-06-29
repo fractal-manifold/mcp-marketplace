@@ -87,6 +87,9 @@ def test_replace_active_converges_and_preserves_metadata(tmp_path: Path):
         channel="dev",
     )
     reg.set_pending("abcdef0a", ConfigPayload(city="Barcelona"))
+    # Device-reported OTA state that a re-provision must NOT discard.
+    reg.set_active_firmware_version("abcdef0a", "1.2.3")
+    reg.bump_min_sv("abcdef0a", 7)
 
     dev = reg.replace_active(
         "abcdef0a",
@@ -98,6 +101,8 @@ def test_replace_active_converges_and_preserves_metadata(tmp_path: Path):
     assert dev.active.payload.city == "Sevilla"
     assert dev.active.payload.version == 1
     assert dev.channel == "dev"  # metadata preserved
+    assert dev.active.payload.firmware_version == "1.2.3"  # OTA state preserved
+    assert dev.active.payload.min_secure_version == 7  # anti-rollback floor kept
 
     dev2 = reg.set_pending("abcdef0a", ConfigPayload(city="Bilbao"))
     assert dev2.pending is not None
