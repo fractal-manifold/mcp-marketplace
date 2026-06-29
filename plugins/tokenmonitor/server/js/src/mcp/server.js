@@ -718,7 +718,11 @@ async function provisionTool(deps, args) {
     try { deps.registry.register(deviceID, regPayload); out.registered = true; }
     catch (e) {
       if (/already exists/.test(e.message)) {
-        try { deps.registry.setPending(deviceID, regPayload); out.reregistered = true; }
+        // Re-provision (device wiped + re-paired): converge active config in
+        // place — the device already applied it and proved presence via the
+        // pairing code. Queueing a pending left a stuck, undecryptable update.
+        // Preserves device metadata. See #8.
+        try { deps.registry.replaceActive(deviceID, regPayload); out.reregistered = true; }
         catch (e2) { out.note = `re-register failed: ${e2.message}`; }
       } else {
         out.note = `device provisioned but registry write failed: ${e.message}`;

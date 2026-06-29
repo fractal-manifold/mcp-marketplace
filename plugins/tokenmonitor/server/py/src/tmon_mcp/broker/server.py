@@ -921,7 +921,7 @@ def _pending_payload_json(p) -> str:
         wire["autorotate_interval_s"] = int(p.autorotate_interval_s)
     # firmware/config_sync.c reads "theme_mode" from the decrypted blob
     # and writes it to KEY_THEME_MD. Omitting it here would silently
-    # no-op /wall-monitor:theme switches.
+    # no-op /tokenmonitor:theme switches.
     if getattr(p, "theme_mode", ""):
         wire["theme_mode"] = p.theme_mode
     if p.pet_enabled is not None:

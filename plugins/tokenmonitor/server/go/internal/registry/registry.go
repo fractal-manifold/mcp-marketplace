@@ -601,6 +601,53 @@ func (r *Registry) SetPending(deviceID string, update ConfigPayload) (*Device, e
 	return out, err
 }
 
+// ReplaceActive overwrites a device's active config in place, preserving ALL
+// device-level metadata (serial, SKU, channel, OTA tombstones, reported
+// settings, …) and clearing any pending update. Version is reset to 1.
+//
+// Unlike SetPending, this is for a physical RE-PROVISION (the user re-ran
+// /tokenmonitor:configure after wiping NVS): the device has ALREADY applied the
+// new broker_url+psk locally and proved physical presence with the pairing code,
+// so the broker must simply converge its active record. Queueing a pending here
+// (the old behaviour) left an update the wiped device could neither decrypt (it
+// is sealed with the OLD psk) nor promote (the device reports config version 0,
+// never matching the pending's version) — a perpetual, stuck pending. See #8.
+//
+// The device must already exist (ErrNotFound bubbles up; callers register new
+// devices via Register).
+func (r *Registry) ReplaceActive(deviceID string, active ConfigPayload, channel ...string) (*Device, error) {
+	if !ValidDeviceID(deviceID) {
+		return nil, fmt.Errorf("registry: invalid device_id %q", deviceID)
+	}
+	if active.PSKHex == "" || active.BrokerURL == "" {
+		return nil, errors.New("registry: replace requires psk_hex and broker_url")
+	}
+	if _, err := hex.DecodeString(active.PSKHex); err != nil || len(active.PSKHex) != 64 {
+		return nil, errors.New("registry: psk_hex must be 64 lowercase hex chars")
+	}
+	active.PSKHex = strings.ToLower(active.PSKHex)
+	active.Version = 1
+
+	var out *Device
+	err := r.withLock(deviceID, func(p string) error {
+		dev, err := r.loadLocked(p)
+		if err != nil {
+			return err
+		}
+		dev.Active = Active{ConfigPayload: active}
+		dev.Pending = nil
+		if len(channel) > 0 {
+			dev.Channel = normalizeChannel(channel[0])
+		}
+		if err := r.saveLocked(dev, p); err != nil {
+			return err
+		}
+		out = dev
+		return nil
+	})
+	return out, err
+}
+
 // ReportedSettings carries the device-owned display settings a device reports
 // via POST /device/{id}/settings (see compat/SETTINGS_REPORT.md). Each field
 // is a pointer so a nil means "device did not report this — leave it".

@@ -492,6 +492,36 @@ class Registry:
             self._save_locked(dev)
             return dev
 
+    def replace_active(
+        self, device_id: str, active: ConfigPayload, channel: str | None = None
+    ) -> Device:
+        """Overwrite a device's active config in place, preserving ALL
+        device-level metadata (serial, hw_sku, channel, OTA tombstones, …) and
+        clearing any pending. Version resets to 1.
+
+        For a physical RE-PROVISION (user re-ran /tokenmonitor:configure after
+        wiping NVS): the device has already applied the new broker_url+psk and
+        proved presence with the pairing code, so converge the active record
+        rather than queue a pending the wiped device can neither decrypt (sealed
+        with the old psk) nor promote (it reports config version 0). Mirror of Go
+        ReplaceActive. See #8. Device must already exist (NotFound bubbles up)."""
+        if not valid_device_id(device_id):
+            raise RegistryError(f"registry: invalid device_id {device_id!r}")
+        if not active.psk_hex or not active.broker_url:
+            raise RegistryError("registry: replace requires psk_hex and broker_url")
+        if len(active.psk_hex) != 64 or not re.fullmatch(r"[0-9a-fA-F]{64}", active.psk_hex):
+            raise RegistryError("registry: psk_hex must be 64 lowercase hex chars")
+        active.psk_hex = active.psk_hex.lower()
+        active.version = 1
+        with self._with_lock(device_id):
+            dev = self._load_locked(device_id)
+            dev.active = Active(payload=active)
+            dev.pending = None
+            if channel is not None:
+                dev.channel = normalize_channel(channel)
+            self._save_locked(dev)
+            return dev
+
     def set_pending(self, device_id: str, update: ConfigPayload) -> Device:
         if not valid_device_id(device_id):
             raise RegistryError(f"registry: invalid device_id {device_id!r}")

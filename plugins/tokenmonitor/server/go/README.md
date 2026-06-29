@@ -316,7 +316,7 @@ and serve HTTP on port 80:
   `{"ok":true,"device_id":"…","next":"rebooting"}` and the device
   reboots into BOOT_READY after a short delay.
 
-The `/wall-monitor:configure` Claude Code skill drives this end-to-end
+The `/tokenmonitor:configure` Claude Code skill drives this end-to-end
 via `tokenmonitor_discover_devices` + `tokenmonitor_provision`.
 
 ## Modes & flags

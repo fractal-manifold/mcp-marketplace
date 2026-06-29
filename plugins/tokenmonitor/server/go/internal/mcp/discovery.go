@@ -364,10 +364,12 @@ func handleProvision(d Deps) server.ToolHandlerFunc {
 				registered = true
 			case strings.Contains(err.Error(), "already exists"):
 				// Device was re-provisioned (e.g. user wiped NVS and started
-				// over). Queue a pending update so the new PSK/URL flows
-				// through the rotation safety net instead of silently
-				// stomping the existing record.
-				if _, perr := d.Registry.SetPending(deviceID, reg); perr != nil {
+				// over). The device has ALREADY applied the new broker_url+psk
+				// locally and proved presence with the pairing code, so converge
+				// the active config in place rather than queuing a pending the
+				// wiped device can neither decrypt nor promote. Preserves
+				// device-level metadata (serial, SKU, channel, …). See #8.
+				if _, perr := d.Registry.ReplaceActive(deviceID, reg); perr != nil {
 					registryErr = fmt.Errorf("re-register failed: %w", perr)
 				} else {
 					reregistered = true

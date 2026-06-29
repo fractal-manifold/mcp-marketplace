@@ -812,7 +812,7 @@ func pendingPayloadJSON(p registry.ConfigPayload) ([]byte, error) {
 	if p.ThemeMode != "" {
 		// firmware/config_sync.c reads "theme_mode" from the decrypted
 		// blob and writes it to KEY_THEME_MD. Omitting it here would
-		// silently no-op /wall-monitor:theme switches.
+		// silently no-op /tokenmonitor:theme switches.
 		wire["theme_mode"] = p.ThemeMode
 	}
 	if p.PetEnabled != nil {

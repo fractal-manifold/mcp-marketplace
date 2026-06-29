@@ -125,6 +125,39 @@ test("register then set_pending workflow", () => {
   }
 });
 
+test("replaceActive converges active, clears pending, preserves metadata (#8)", () => {
+  const tmp = mkdtempSync(join(tmpdir(), "tmon-reg-"));
+  try {
+    const reg = new Registry(tmp);
+    reg.register("abcdef0c", { ..._testing.emptyPayload(), broker_url: "http://old", psk_hex: "aa".repeat(32), city: "Madrid", channel: "dev" });
+    reg.setPending("abcdef0c", { ..._testing.emptyPayload(), city: "Barcelona" });
+
+    const dev = reg.replaceActive("abcdef0c", { ..._testing.emptyPayload(), broker_url: "http://new", psk_hex: "bb".repeat(32), city: "Sevilla" });
+    assert.equal(dev.pending, null);
+    assert.equal(dev.active.payload.broker_url, "http://new");
+    assert.equal(dev.active.payload.psk_hex, "bb".repeat(32));
+    assert.equal(dev.active.payload.city, "Sevilla");
+    assert.equal(dev.active.payload.version, 1);
+    assert.equal(dev.channel, "dev"); // device metadata preserved
+
+    const d2 = reg.setPending("abcdef0c", { ..._testing.emptyPayload(), city: "Bilbao" });
+    assert.ok(d2.pending);
+    assert.equal(d2.pending.payload.version, 2);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("replaceActive requires an existing device (#8)", () => {
+  const tmp = mkdtempSync(join(tmpdir(), "tmon-reg-"));
+  try {
+    const reg = new Registry(tmp);
+    assert.throws(() => reg.replaceActive("abcdef0d", { ..._testing.emptyPayload(), broker_url: "http://x", psk_hex: "bb".repeat(32) }));
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("psksFor returns pending when distinct", () => {
   const tmp = mkdtempSync(join(tmpdir(), "tmon-reg-"));
   try {

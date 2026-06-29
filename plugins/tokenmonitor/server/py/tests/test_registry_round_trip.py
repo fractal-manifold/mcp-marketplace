@@ -76,6 +76,40 @@ def test_register_and_set_pending(tmp_path: Path):
     assert dev3.pending is None
 
 
+def test_replace_active_converges_and_preserves_metadata(tmp_path: Path):
+    """Issue #8: re-provision overwrites active in place, clears pending, resets
+    version to 1, and preserves device-level metadata (channel). A later pending
+    resumes at v2."""
+    reg = Registry(str(tmp_path))
+    reg.register(
+        "abcdef0a",
+        ConfigPayload(broker_url="http://old", psk_hex="aa" * 32, city="Madrid"),
+        channel="dev",
+    )
+    reg.set_pending("abcdef0a", ConfigPayload(city="Barcelona"))
+
+    dev = reg.replace_active(
+        "abcdef0a",
+        ConfigPayload(broker_url="http://new", psk_hex="bb" * 32, city="Sevilla"),
+    )
+    assert dev.pending is None
+    assert dev.active.payload.broker_url == "http://new"
+    assert dev.active.payload.psk_hex == "bb" * 32
+    assert dev.active.payload.city == "Sevilla"
+    assert dev.active.payload.version == 1
+    assert dev.channel == "dev"  # metadata preserved
+
+    dev2 = reg.set_pending("abcdef0a", ConfigPayload(city="Bilbao"))
+    assert dev2.pending is not None
+    assert dev2.pending.payload.version == 2
+
+
+def test_replace_active_requires_existing(tmp_path: Path):
+    reg = Registry(str(tmp_path))
+    with pytest.raises(Exception):
+        reg.replace_active("abcdef0b", ConfigPayload(broker_url="http://x", psk_hex="bb" * 32))
+
+
 def test_psks_for_returns_pending_when_distinct(tmp_path: Path):
     reg = Registry(str(tmp_path))
     reg.register("abcdef02", ConfigPayload(broker_url="http://x", psk_hex="aa" * 32))

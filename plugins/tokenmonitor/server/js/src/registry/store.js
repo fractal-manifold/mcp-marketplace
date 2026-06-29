@@ -117,6 +117,33 @@ export class Registry {
     });
   }
 
+  // replaceActive overwrites a device's active config in place, preserving ALL
+  // device-level metadata (serialNumber, hwSku, channel, blockedFirmwareVersion,
+  // …) and clearing any pending. Version resets to 1. For a physical
+  // re-provision (user re-ran /tokenmonitor:configure after wiping NVS): the
+  // device already applied the new broker_url+psk and proved presence with the
+  // pairing code, so converge active rather than queue a pending the wiped
+  // device can neither decrypt (sealed with the old psk) nor promote (it reports
+  // config version 0). Mirror of Go ReplaceActive. See #8. Device must exist.
+  replaceActive(id, active) {
+    if (!validDeviceID(id)) throw new RegistryError(`registry: invalid device_id ${JSON.stringify(id)}`);
+    if (!active.psk_hex || !active.broker_url) throw new RegistryError("registry: replace requires psk_hex and broker_url");
+    if (active.psk_hex.length !== 64 || !/^[0-9a-fA-F]{64}$/.test(active.psk_hex)) {
+      throw new RegistryError("registry: psk_hex must be 64 lowercase hex chars");
+    }
+    active.psk_hex = active.psk_hex.toLowerCase();
+    active.version = 1;
+    return this._withLock(id, () => {
+      const dev = this._loadLocked(id);
+      if (active.channel !== undefined && active.channel !== null) dev.channel = normalizeChannel(active.channel);
+      delete active.channel; // channel is device-level, not part of the config payload
+      dev.active = { payload: active, lastSeen: dev.active ? dev.active.lastSeen : null };
+      dev.pending = null;
+      this._saveLocked(dev);
+      return dev;
+    });
+  }
+
   setPending(id, update) {
     if (!validDeviceID(id)) throw new RegistryError(`registry: invalid device_id ${JSON.stringify(id)}`);
     if (update.psk_hex) {

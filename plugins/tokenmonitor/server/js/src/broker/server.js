@@ -768,7 +768,7 @@ function pendingPayloadJSON(p) {
   if (p.autorotate_interval_s != null) wire.autorotate_interval_s = p.autorotate_interval_s;
   // firmware/config_sync.c reads "theme_mode" from the decrypted blob
   // and writes it to KEY_THEME_MD. Omitting it here would silently
-  // no-op /wall-monitor:theme switches.
+  // no-op /tokenmonitor:theme switches.
   if (p.theme_mode) wire.theme_mode = p.theme_mode;
   if (p.pet_enabled != null) wire.pet_enabled = !!p.pet_enabled;
   if (p.pet_species != null) wire.pet_species = Number(p.pet_species);

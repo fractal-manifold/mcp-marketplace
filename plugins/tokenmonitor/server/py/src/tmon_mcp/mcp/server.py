@@ -935,7 +935,11 @@ async def _provision(deps: Deps, args: dict) -> dict:
             msg = str(e)
             if "already exists" in msg:
                 try:
-                    deps.registry.set_pending(device_id, reg_payload)
+                    # Re-provision (device wiped + re-paired): converge the active
+                    # config in place — the device already applied it and proved
+                    # presence via the pairing code. Queueing a pending here left
+                    # a stuck, undecryptable update. Preserves metadata. See #8.
+                    deps.registry.replace_active(device_id, reg_payload)
                     out["reregistered"] = True
                 except Exception as e2:
                     out["note"] = f"re-register failed: {e2}"

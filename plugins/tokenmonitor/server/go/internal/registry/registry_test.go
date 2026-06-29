@@ -346,6 +346,56 @@ func TestSetPending_BumpsVersionAndMerges(t *testing.T) {
 	}
 }
 
+// TestReplaceActive_ConvergesAndPreservesMetadata covers issue #8: a physical
+// re-provision must overwrite the active config (not queue a stuck pending),
+// clear any existing pending, reset version to 1, and preserve device-level
+// metadata (here: the OTA channel). A subsequent pending then resumes at v2.
+func TestReplaceActive_ConvergesAndPreservesMetadata(t *testing.T) {
+	r := newReg(t)
+	if _, err := r.Register(testID, ConfigPayload{
+		PSKHex: testPSK, BrokerURL: "http://old", City: "Madrid",
+	}, "dev"); err != nil { // channel=dev is device-level metadata
+		t.Fatalf("Register: %v", err)
+	}
+	if _, err := r.SetPending(testID, ConfigPayload{City: "Barcelona"}); err != nil {
+		t.Fatalf("SetPending: %v", err)
+	}
+
+	dev, err := r.ReplaceActive(testID, ConfigPayload{
+		PSKHex: newPSK, BrokerURL: "http://new", City: "Sevilla",
+	})
+	if err != nil {
+		t.Fatalf("ReplaceActive: %v", err)
+	}
+	if dev.Pending != nil {
+		t.Fatalf("Pending not cleared: %+v", dev.Pending)
+	}
+	if dev.Active.PSKHex != newPSK || dev.Active.BrokerURL != "http://new" || dev.Active.City != "Sevilla" {
+		t.Errorf("Active not replaced: %+v", dev.Active.ConfigPayload)
+	}
+	if dev.Active.Version != 1 {
+		t.Errorf("Active.Version = %d, want 1", dev.Active.Version)
+	}
+	if dev.Channel != "dev" {
+		t.Errorf("device metadata (channel) lost: %q, want dev", dev.Channel)
+	}
+
+	dev, err = r.SetPending(testID, ConfigPayload{City: "Bilbao"})
+	if err != nil {
+		t.Fatalf("SetPending after replace: %v", err)
+	}
+	if dev.Pending == nil || dev.Pending.Version != 2 {
+		t.Errorf("post-replace pending version wrong: %+v", dev.Pending)
+	}
+}
+
+func TestReplaceActive_RequiresExisting(t *testing.T) {
+	r := newReg(t)
+	if _, err := r.ReplaceActive(testID, ConfigPayload{PSKHex: newPSK, BrokerURL: "http://new"}); err == nil {
+		t.Fatal("ReplaceActive on missing device should error")
+	}
+}
+
 func TestSetPending_NoOpDropsPending(t *testing.T) {
 	r := newReg(t)
 	if _, err := r.Register(testID, ConfigPayload{
