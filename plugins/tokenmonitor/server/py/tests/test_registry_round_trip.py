@@ -1,0 +1,272 @@
+"""Validate the registry against compat/registry/golden/*.toml round-trip."""
+
+from __future__ import annotations
+
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+
+from tmon_mcp.registry.store import (
+    ConfigPayload,
+    Device,
+    ProviderSet,
+    Registry,
+    _device_from_toml,
+)
+
+
+def _find_compat(rel: str) -> Path:
+    """Walk up to the authoritative monorepo `compat/<rel>` (see
+    test_auth_vectors._find_compat for why the walk skips the partial
+    server/compat/ runtime slice)."""
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        cand = parent / "compat" / rel
+        if cand.exists():
+            return cand
+    pytest.skip(f"compat/{rel} not available (standalone checkout)", allow_module_level=True)
+
+
+GOLDEN_DIR = _find_compat("registry/golden")
+
+
+def test_golden_round_trips_via_python_writer():
+    src = GOLDEN_DIR / "ab12cd34.toml"
+    dev = _device_from_toml(src.read_text())
+    re_serialised = dev.to_toml()
+    dev2 = _device_from_toml(re_serialised)
+    # Compare semantic equality (not byte equality — TOML writers can differ on quoting).
+    assert dev2.device_id == dev.device_id
+    assert dev2.active.payload.broker_url == dev.active.payload.broker_url
+    assert dev2.active.payload.psk_hex == dev.active.payload.psk_hex
+    assert dev2.active.payload.version == dev.active.payload.version
+    assert dev2.active.payload.city == dev.active.payload.city
+    assert dev2.active.payload.br_day == dev.active.payload.br_day
+    assert dev2.active.payload.br_night == dev.active.payload.br_night
+    assert dev2.active.payload.vol == dev.active.payload.vol
+    # The legacy [active.providers] bool table migrates to provider_modes
+    # (true→auto, false→disabled) and survives the round-trip.
+    assert dev.active.payload.providers is None  # dropped after migration
+    assert vars(dev.active.payload.provider_modes) == {"claude": "auto", "codex": "disabled", "gemini": "disabled"}
+    assert vars(dev2.active.payload.provider_modes) == vars(dev.active.payload.provider_modes)
+    assert dev2.active.payload.theme_mode == dev.active.payload.theme_mode
+    assert (dev2.pending is None) == (dev.pending is None)
+    if dev.pending is not None:
+        assert dev2.pending.payload.version == dev.pending.payload.version
+        assert dev2.pending.payload.broker_url == dev.pending.payload.broker_url
+        assert dev2.pending.payload.psk_hex == dev.pending.payload.psk_hex
+        assert dev2.pending.payload.theme_mode == dev.pending.payload.theme_mode
+        assert vars(dev.pending.payload.provider_modes) == {"claude": "auto", "codex": "auto", "gemini": "disabled"}
+
+
+def test_register_and_set_pending(tmp_path: Path):
+    reg = Registry(str(tmp_path))
+    dev = reg.register("abcdef01", ConfigPayload(broker_url="http://example", psk_hex="aa" * 32, city="X"))
+    assert dev.active.payload.version == 1
+    # Set pending: city only
+    dev2 = reg.set_pending("abcdef01", ConfigPayload(city="Y"))
+    assert dev2.pending is not None
+    assert dev2.pending.payload.version == 2
+    assert dev2.pending.payload.city == "Y"
+    # Set pending: no-op (same city as current pending) → version still bumps and is then dropped if equal to active
+    # Equivalent to active → drops pending
+    dev3 = reg.set_pending("abcdef01", ConfigPayload(city="X"))
+    assert dev3.pending is None
+
+
+def test_psks_for_returns_pending_when_distinct(tmp_path: Path):
+    reg = Registry(str(tmp_path))
+    reg.register("abcdef02", ConfigPayload(broker_url="http://x", psk_hex="aa" * 32))
+    reg.set_pending("abcdef02", ConfigPayload(psk_hex="bb" * 32))
+    active, pending = reg.psks_for("abcdef02")
+    assert active == bytes.fromhex("aa" * 32)
+    assert pending == bytes.fromhex("bb" * 32)
+
+
+def test_theme_mode_only_bumps_pending(tmp_path: Path):
+    reg = Registry(str(tmp_path))
+    reg.register("abcdef04", ConfigPayload(broker_url="http://x", psk_hex="aa" * 32, theme_mode="day"))
+    dev = reg.set_pending("abcdef04", ConfigPayload(theme_mode="night"))
+    assert dev.pending is not None
+    assert dev.pending.payload.version == 2
+    assert dev.pending.payload.theme_mode == "night"
+    # No-op: pending equal to active drops pending.
+    dev2 = reg.set_pending("abcdef04", ConfigPayload(theme_mode="day"))
+    assert dev2.pending is None
+
+
+def test_maybe_promote_theme_only_with_active_psk(tmp_path: Path):
+    reg = Registry(str(tmp_path))
+    reg.register("abcdef05", ConfigPayload(broker_url="http://x", psk_hex="aa" * 32, theme_mode="day"))
+    reg.set_pending("abcdef05", ConfigPayload(theme_mode="night"))
+    # No PSK rotation pending; active-PSK signature must promote.
+    promoted = reg.maybe_promote("abcdef05", observed_version=2, used_pending_psk=False)
+    assert promoted is True
+    dev = reg.load("abcdef05")
+    assert dev.pending is None
+    assert dev.active.payload.theme_mode == "night"
+
+
+def test_maybe_promote_rotation_still_requires_pending_psk(tmp_path: Path):
+    reg = Registry(str(tmp_path))
+    reg.register("abcdef06", ConfigPayload(broker_url="http://x", psk_hex="aa" * 32))
+    reg.set_pending("abcdef06", ConfigPayload(psk_hex="bb" * 32))
+    assert reg.maybe_promote("abcdef06", observed_version=2, used_pending_psk=False) is False
+
+
+def test_maybe_promote(tmp_path: Path):
+    reg = Registry(str(tmp_path))
+    reg.register("abcdef03", ConfigPayload(broker_url="http://x", psk_hex="aa" * 32))
+    reg.set_pending("abcdef03", ConfigPayload(psk_hex="bb" * 32, city="Z"))
+    promoted = reg.maybe_promote("abcdef03", observed_version=2, used_pending_psk=True)
+    assert promoted is True
+    dev = reg.load("abcdef03")
+    assert dev.pending is None
+    assert dev.active.payload.psk_hex == "bb" * 32
+    assert dev.active.payload.city == "Z"
+
+
+def test_report_settings_updates_active_and_pending_no_version_bump(tmp_path: Path):
+    reg = Registry(str(tmp_path))
+    reg.register(
+        "abcdef07",
+        ConfigPayload(broker_url="http://x", psk_hex="aa" * 32, city="X", theme_mode="day"),
+    )
+    # Queue an operator config change (city) so a Pending exists.
+    reg.set_pending("abcdef07", ConfigPayload(city="Y"))
+    active_v = reg.load("abcdef07").active.payload.version
+    pending_v = reg.load("abcdef07").pending.payload.version
+
+    # Device reports its user-set display settings, with clamping + an unknown
+    # theme that must be ignored. theme_mode "rainbow" is not applied.
+    dev = reg.report_settings(
+        "abcdef07",
+        theme_mode="rainbow",
+        br_day=200,   # clamps to 100
+        br_night=45,
+        vol=255,      # clamps to 100
+    )
+    # Active updated, version unchanged, operator-owned City untouched.
+    assert dev.active.payload.version == active_v
+    assert dev.active.payload.theme_mode == "day"  # rainbow ignored
+    assert dev.active.payload.br_day == 100
+    assert dev.active.payload.br_night == 45
+    assert dev.active.payload.vol == 100
+    assert dev.active.payload.city == "X"
+    # Pending mirrored too (so promotion won't re-introduce stale values),
+    # its version unchanged, its operator-owned City untouched.
+    assert dev.pending is not None
+    assert dev.pending.payload.version == pending_v
+    assert dev.pending.payload.theme_mode == "day"
+    assert dev.pending.payload.br_day == 100
+    assert dev.pending.payload.br_night == 45
+    assert dev.pending.payload.city == "Y"
+
+    # A valid theme is applied; persists across reload.
+    reg.report_settings("abcdef07", theme_mode="night")
+    dev2 = reg.load("abcdef07")
+    assert dev2.active.payload.theme_mode == "night"
+    assert dev2.active.payload.br_day == 100
+    assert dev2.active.payload.version == active_v
+
+
+def test_report_settings_pet_fields(tmp_path: Path):
+    reg = Registry(str(tmp_path))
+    reg.register("abcdef07", ConfigPayload(broker_url="http://x", psk_hex="aa" * 32))
+
+    dev = reg.report_settings(
+        "abcdef07",
+        pet_enabled=True,
+        pet_species=2,
+        pet_name="Sparky the very long pet name",  # truncates to 15
+    )
+    assert dev.active.payload.pet_enabled is True
+    assert dev.active.payload.pet_species == 2
+    assert dev.active.payload.pet_name == "Sparky the very"
+
+    # Out-of-range species clamps to 9.
+    dev = reg.report_settings("abcdef07", pet_species=42)
+    assert dev.active.payload.pet_species == 9
+
+    # Absent pet_species (None) leaves the stored value untouched.
+    dev = reg.report_settings("abcdef07", pet_name="Rex")
+    assert dev.active.payload.pet_species == 9
+    assert dev.active.payload.pet_name == "Rex"
+
+    # Survives reload from disk.
+    dev2 = reg.load("abcdef07")
+    assert dev2.active.payload.pet_species == 9
+    assert dev2.active.payload.pet_name == "Rex"
+    assert dev2.active.payload.pet_enabled is True
+
+
+def test_set_active_firmware_version_persists_only_on_change(tmp_path: Path):
+    """The /sync handler persists X-Tmon-Fw-Version into
+    Active.payload.firmware_version so ota.decide() stops re-staging the same
+    release after a canary revert. Empty values are no-ops; the file is
+    re-written only on an actual change."""
+    reg = Registry(str(tmp_path))
+    reg.register("abcdef08", ConfigPayload(broker_url="http://x", psk_hex="aa" * 32))
+    fpath = tmp_path / "abcdef08.toml"
+
+    # Empty header is ignored — no firmware_version recorded.
+    reg.set_active_firmware_version("abcdef08", "")
+    assert reg.load("abcdef08").active.payload.firmware_version == ""
+
+    # First non-empty report is persisted across reload.
+    reg.set_active_firmware_version("abcdef08", "0.9.0")
+    assert reg.load("abcdef08").active.payload.firmware_version == "0.9.0"
+
+    # Unchanged report does NOT re-write the file (only-on-change).
+    mtime_before = fpath.stat().st_mtime_ns
+    reg.set_active_firmware_version("abcdef08", "0.9.0")
+    assert fpath.stat().st_mtime_ns == mtime_before
+    assert reg.load("abcdef08").active.payload.firmware_version == "0.9.0"
+
+    # A changed report (e.g. after a canary revert to the older build) updates.
+    reg.set_active_firmware_version("abcdef08", "0.8.0")
+    assert reg.load("abcdef08").active.payload.firmware_version == "0.8.0"
+
+    # Unknown device is a silent no-op (no file created, no raise).
+    reg.set_active_firmware_version("ffffffff", "0.9.0")
+    assert not (tmp_path / "ffffffff.toml").exists()
+
+
+def test_set_blocked_firmware_version_round_trips(tmp_path: Path):
+    """The revert tombstone setter persists through disk, is only-on-change,
+    clears on empty, and ignores unknown devices."""
+    reg = Registry(str(tmp_path))
+    reg.register("abcdef08", ConfigPayload(broker_url="http://x", psk_hex="aa" * 32))
+
+    reg.set_blocked_firmware_version("abcdef08", "0.9.1")
+    assert reg.load("abcdef08").blocked_firmware_version == "0.9.1"
+    # Survives reload (persisted to TOML).
+    assert "blocked_firmware_version" in (tmp_path / "abcdef08.toml").read_text()
+
+    # Clear with empty string.
+    reg.set_blocked_firmware_version("abcdef08", "")
+    assert reg.load("abcdef08").blocked_firmware_version == ""
+
+    # Unknown device is a silent no-op.
+    reg.set_blocked_firmware_version("ffffffff", "0.9.1")
+    assert not (tmp_path / "ffffffff.toml").exists()
+
+
+def test_set_active_firmware_version_clears_stale_tombstone(tmp_path: Path):
+    """A revert tombstone is cleared on /sync once the device reports a version
+    STRICTLY NEWER than the blocked one (a fixed release landed); a report
+    <= the tombstone leaves it in place."""
+    reg = Registry(str(tmp_path))
+    reg.register("abcdef08", ConfigPayload(broker_url="http://x", psk_hex="aa" * 32))
+    reg.set_blocked_firmware_version("abcdef08", "0.9.1")
+
+    # Device still on the blocked version → tombstone stays.
+    reg.set_active_firmware_version("abcdef08", "0.9.1")
+    assert reg.load("abcdef08").blocked_firmware_version == "0.9.1"
+
+    # Device reaches a newer version (the fix) → tombstone cleared.
+    reg.set_active_firmware_version("abcdef08", "0.9.2")
+    assert reg.load("abcdef08").blocked_firmware_version == ""
+    assert reg.load("abcdef08").active.payload.firmware_version == "0.9.2"

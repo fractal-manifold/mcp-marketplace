@@ -1,0 +1,909 @@
+"""Per-device TOML registry with flock(2) interprocess safety.
+
+Wire-compatible with tokenmonitor-mcp/internal/registry/registry.go (BurntSushi/toml).
+"""
+
+from __future__ import annotations
+
+import errno
+import fcntl
+import os
+import re
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+import tomli_w
+import tomllib
+
+# v2 adds serial_number, hw_sku, firmware_manifest_*, min_secure_version.
+# v3 adds device.channel (release track: "" / "stable" vs "dev") — a
+# device-level attribute (like serial_number / hw_sku), NOT a config
+# payload field. The firmware never sees it; the broker uses it only to
+# pick which GitHub asset to fetch. v0/v1/v2 files load with channel=""
+# (== stable) and are re-serialised as v3 on the next save.
+SCHEMA_VERSION = 3
+
+_DEVICE_ID_RE = re.compile(r"^[0-9a-f]{8}$")
+
+
+def valid_device_id(device_id: str) -> bool:
+    return bool(_DEVICE_ID_RE.fullmatch(device_id))
+
+
+def normalize_channel(c: str | None) -> str:
+    """Canonicalise a release-channel string.
+
+    Trim + lowercase, kept verbatim. "" means AUTO (the track is derived from
+    the serial: dev unit -> dev, production -> stable). "stable" / "dev" are
+    explicit pins that override the serial, distinct from auto. Mirror of JS
+    normalizeChannel.
+    """
+    return str(c or "").strip().lower()
+
+
+def serial_is_dev(serial: str | None) -> bool:
+    """Report whether a factory serial denotes a DEVELOPMENT unit.
+
+    Mirror of the firmware's tmon_serial_is_dev(): true iff the FAC field is
+    "DEV". The canonical 24-char serial is
+    "CWM-<SKU2>-<FAC3>-<YYWW4>-<SEQ6>-<C1>" (FAC is the 3rd dash-separated
+    field); a blank-eFuse dev unit falls back to "DEV-<device_id>". Both the
+    SIM serial and the tmon_dev_sn override bake FAC="DEV", so all dev paths
+    land here. Case-insensitive; empty/unparseable -> False (treated as a
+    production/stable unit). Wire-identical across runtimes.
+    """
+    s = str(serial or "").strip().upper()
+    if not s:
+        return False
+    if s.startswith("DEV-"):
+        return True
+    parts = s.split("-")
+    return len(parts) >= 3 and parts[2] == "DEV"
+
+
+def effective_channel(dev: "Device | None") -> str:
+    """Return the device's PRIMARY release track for display.
+
+    An explicit channel override wins; otherwise derived from the serial
+    (dev unit -> "dev", production -> "stable"). For OTA routing use
+    candidate_channels — a dev unit consumes BOTH tracks. Mirror of JS
+    effectiveChannel.
+    """
+    if dev is not None and dev.channel:
+        return dev.channel
+    if dev is not None and serial_is_dev(dev.serial_number):
+        return "dev"
+    return "stable"
+
+
+def candidate_channels(dev: "Device | None") -> list[str]:
+    """Return the release tracks the OTA loop must consider for a device.
+
+    Newest-wins across them. A dev unit (or a dev override) tracks the UNION
+    of stable + dev so it never misses a stable build that is newer than the
+    current dev tip (by SemVer, a final X.Y.Z is newer than X.Y.Z-dev.<ts>).
+    A production unit, or an explicit stable override, tracks stable only.
+    Mirror of JS candidateChannels.
+    """
+    override = dev.channel if dev is not None else ""
+    if override == "stable":
+        return ["stable"]
+    if override == "dev" or (dev is not None and serial_is_dev(dev.serial_number)):
+        return ["stable", "dev"]
+    return ["stable"]
+
+
+class RegistryError(Exception):
+    pass
+
+
+class NotFound(RegistryError):
+    pass
+
+
+@dataclass
+class ProviderSet:
+    """Legacy per-provider enable bool. Read for migration only — folded
+    into ProviderModeSet on load and never written again. Mirror of the Go
+    ProviderSet."""
+
+    claude: bool = False
+    codex: bool = False
+    gemini: bool = False
+
+    def to_dict(self) -> dict:
+        return {"claude": self.claude, "codex": self.codex, "gemini": self.gemini}
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "ProviderSet | None":
+        if d is None:
+            return None
+        return cls(claude=bool(d.get("claude")), codex=bool(d.get("codex")), gemini=bool(d.get("gemini")))
+
+
+# Per-provider mode that replaced the enable bool. "auto" trusts the
+# broker's credential detection; "subscription" / "api_key" are device-side
+# display overrides; "disabled" hides the provider. Mirror of Go.
+PROVIDER_MODES = ("disabled", "auto", "subscription", "api_key")
+
+
+def provider_mode_enabled(m: str | None) -> bool:
+    return m is not None and m != "" and m != "disabled"
+
+
+def valid_provider_mode(s: str) -> bool:
+    return s in PROVIDER_MODES
+
+
+def provider_mode_from_bool(b: bool) -> str:
+    return "auto" if b else "disabled"
+
+
+@dataclass
+class ProviderModeSet:
+    claude: str = "disabled"
+    codex: str = "disabled"
+    gemini: str = "disabled"
+
+    def to_dict(self) -> dict:
+        return {"claude": self.claude, "codex": self.codex, "gemini": self.gemini}
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "ProviderModeSet | None":
+        if d is None:
+            return None
+        return cls(claude=str(d.get("claude", "")), codex=str(d.get("codex", "")), gemini=str(d.get("gemini", "")))
+
+    @classmethod
+    def from_provider_set(cls, p: "ProviderSet | None") -> "ProviderModeSet | None":
+        if p is None:
+            return None
+        return cls(
+            claude=provider_mode_from_bool(p.claude),
+            codex=provider_mode_from_bool(p.codex),
+            gemini=provider_mode_from_bool(p.gemini),
+        )
+
+
+@dataclass
+class ConfigPayload:
+    version: int = 0
+    broker_url: str = ""
+    psk_hex: str = ""
+    city: str = ""
+    br_day: int | None = None
+    br_night: int | None = None
+    vol: int | None = None
+    # providers is the legacy bool set — read for migration only, never
+    # written (from_toml_dict folds it into provider_modes). provider_modes
+    # is the live per-provider mode triple.
+    providers: ProviderSet | None = None
+    provider_modes: ProviderModeSet | None = None
+    autorotate_enabled: bool | None = None
+    autorotate_interval_s: int | None = None
+    theme_mode: str = ""
+    # Virtual pet — device-owned display settings, synced exactly like
+    # theme_mode / brightness. pet_enabled: None = "no change" (default
+    # true on-device). pet_species: enum 0..9 (cat..ghost); None = "no
+    # change" / not picked yet, so no sentinel is stored. pet_name: up to
+    # 15 chars; "" = use the species default name. See SETTINGS_REPORT.md.
+    pet_enabled: bool | None = None
+    pet_species: int | None = None
+    pet_name: str = ""
+    # Per-device override of the Gemini model list surfaced as
+    # /usage/gemini slots. None = "no opinion" (use global default);
+    # empty list = "clear the override". Max 3 entries.
+    gemini_models: list[str] | None = None
+    # Diagnostic log upload toggle (NVS key tmon_log_en). None = "no
+    # change"; dev units default on and factory units default off
+    # on-device, so this is how an operator opts a production unit in.
+    log_enabled: bool | None = None
+    # OTA staging fields. The firmware's config_sync only arms the
+    # on-device tmon_ota_* NVS keys when all three are present and
+    # well-formed; empty strings mean "no firmware update" and travel
+    # alongside any other config change.
+    firmware_url: str = ""
+    firmware_sha256: str = ""
+    firmware_version: str = ""
+    # Schema v2: signed manifest envelope. The firmware verifies the
+    # Ed25519 signature over the canonical manifest BEFORE downloading
+    # the .bin. Both fields travel inside the AES-CTR pending blob.
+    firmware_manifest_b64: str = ""
+    firmware_manifest_sig_b64: str = ""
+    # Schema v2: anti-rollback floor mirrored from the device's
+    # tmon_min_sv NVS key. Packed 8.8.16 = major.minor.patch.
+    min_secure_version: int = 0
+
+    def to_toml_dict(self) -> dict:
+        d: dict = {"version": int(self.version)}
+        if self.broker_url:
+            d["broker_url"] = self.broker_url
+        if self.psk_hex:
+            d["psk_hex"] = self.psk_hex
+        if self.city:
+            d["city"] = self.city
+        if self.br_day is not None:
+            d["br_day"] = int(self.br_day)
+        if self.br_night is not None:
+            d["br_night"] = int(self.br_night)
+        if self.vol is not None:
+            d["vol"] = int(self.vol)
+        # provider_modes is canonical; the legacy providers bool table is
+        # never written (load migrates it).
+        if self.provider_modes is not None:
+            d["provider_modes"] = self.provider_modes.to_dict()
+        if self.autorotate_enabled is not None:
+            d["autorotate_enabled"] = bool(self.autorotate_enabled)
+        if self.autorotate_interval_s is not None:
+            d["autorotate_interval_s"] = int(self.autorotate_interval_s)
+        if self.theme_mode:
+            d["theme_mode"] = str(self.theme_mode)
+        if self.pet_enabled is not None:
+            d["pet_enabled"] = bool(self.pet_enabled)
+        if self.pet_species is not None:
+            d["pet_species"] = int(self.pet_species)
+        if self.pet_name:
+            d["pet_name"] = str(self.pet_name)
+        if self.gemini_models is not None and len(self.gemini_models) > 0:
+            d["gemini_models"] = [str(m) for m in self.gemini_models]
+        if self.log_enabled is not None:
+            d["log_enabled"] = bool(self.log_enabled)
+        if self.firmware_url:
+            d["firmware_url"] = self.firmware_url
+        if self.firmware_sha256:
+            d["firmware_sha256"] = self.firmware_sha256
+        if self.firmware_version:
+            d["firmware_version"] = self.firmware_version
+        if self.firmware_manifest_b64:
+            d["firmware_manifest_b64"] = self.firmware_manifest_b64
+        if self.firmware_manifest_sig_b64:
+            d["firmware_manifest_sig_b64"] = self.firmware_manifest_sig_b64
+        if self.min_secure_version:
+            d["min_secure_version"] = int(self.min_secure_version)
+        return d
+
+    @classmethod
+    def from_toml_dict(cls, d: dict | None) -> "ConfigPayload":
+        d = d or {}
+        return cls(
+            version=int(d.get("version", 0)),
+            broker_url=str(d.get("broker_url", "")),
+            psk_hex=str(d.get("psk_hex", "")),
+            city=str(d.get("city", "")),
+            br_day=int(d["br_day"]) if "br_day" in d else None,
+            br_night=int(d["br_night"]) if "br_night" in d else None,
+            vol=int(d["vol"]) if "vol" in d else None,
+            # Canonical field is provider_modes; fold any legacy providers
+            # bool table into it and drop the bool so it is never re-emitted.
+            providers=None,
+            provider_modes=(
+                ProviderModeSet.from_dict(d.get("provider_modes"))
+                if d.get("provider_modes") is not None
+                else ProviderModeSet.from_provider_set(ProviderSet.from_dict(d.get("providers")))
+            ),
+            autorotate_enabled=d["autorotate_enabled"] if "autorotate_enabled" in d else None,
+            autorotate_interval_s=int(d["autorotate_interval_s"]) if "autorotate_interval_s" in d else None,
+            theme_mode=str(d.get("theme_mode", "")),
+            pet_enabled=bool(d["pet_enabled"]) if "pet_enabled" in d else None,
+            pet_species=int(d["pet_species"]) if "pet_species" in d else None,
+            pet_name=str(d.get("pet_name", "")),
+            gemini_models=[str(m) for m in d["gemini_models"]] if "gemini_models" in d else None,
+            log_enabled=bool(d["log_enabled"]) if "log_enabled" in d else None,
+            firmware_url=str(d.get("firmware_url", "")),
+            firmware_sha256=str(d.get("firmware_sha256", "")),
+            firmware_version=str(d.get("firmware_version", "")),
+            firmware_manifest_b64=str(d.get("firmware_manifest_b64", "")),
+            firmware_manifest_sig_b64=str(d.get("firmware_manifest_sig_b64", "")),
+            min_secure_version=int(d.get("min_secure_version", 0)),
+        )
+
+
+def _iso_now() -> datetime:
+    return datetime.now(tz=timezone.utc)
+
+
+@dataclass
+class Active:
+    payload: ConfigPayload = field(default_factory=ConfigPayload)
+    last_seen: datetime | None = None
+
+
+@dataclass
+class Pending:
+    payload: ConfigPayload = field(default_factory=ConfigPayload)
+    created_at: datetime = field(default_factory=_iso_now)
+
+
+@dataclass
+class Device:
+    device_id: str
+    # Schema v2 — factory identity reported by the device via
+    # X-Tmon-Serial / X-Tmon-Sku headers on /sync. Empty until the device
+    # is seen with a v2 firmware. NEVER authoritative — the eFuse
+    # wins.
+    serial_number: str = ""
+    hw_sku: str = ""
+    # Schema v3 — OTA release track. "" / "stable" both mean the stable
+    # track (the key is OMITTED on disk in that case); "dev" means the
+    # rolling dev tag. Device-level (a sibling of hw_sku), NOT part of the
+    # config payload. Always stored canonical via normalize_channel.
+    channel: str = ""
+    # Per-device OTA revert tombstone: a firmware version the AUTO-discovery
+    # loop (ota.decide) must NOT re-stage. tokenmonitor_revert writes the
+    # version the device is being reverted FROM here, so a canary the device
+    # rolled back is not immediately re-announced (the device reports the old
+    # version, active=old, decide() sees published > active and would otherwise
+    # re-stage the exact bad release). Only the auto path honours it — manual
+    # set_device_pending / publish targeted at the device still override.
+    # Cleared on /sync once the device reports a version STRICTLY NEWER than the
+    # tombstone. Device-level (sibling of channel), NOT in the config payload.
+    # Mirror of go/js blocked_firmware_version.
+    blocked_firmware_version: str = ""
+    active: Active = field(default_factory=Active)
+    pending: Pending | None = None
+
+    def to_toml(self) -> str:
+        doc: dict = {
+            "schema_version": SCHEMA_VERSION,
+            "device_id": self.device_id,
+        }
+        if self.serial_number:
+            doc["serial_number"] = self.serial_number
+        if self.hw_sku:
+            doc["hw_sku"] = self.hw_sku
+        if self.channel:
+            doc["channel"] = self.channel
+        if self.blocked_firmware_version:
+            doc["blocked_firmware_version"] = self.blocked_firmware_version
+        doc["active"] = self.active.payload.to_toml_dict()
+        if self.active.last_seen:
+            doc["active"]["last_seen"] = self.active.last_seen
+        if self.pending is not None:
+            p = self.pending.payload.to_toml_dict()
+            p["created_at"] = self.pending.created_at
+            doc["pending"] = p
+        return tomli_w.dumps(doc)
+
+
+def _device_from_toml(text: str) -> Device:
+    d = tomllib.loads(text)
+    schema = int(d.get("schema_version", 0))
+    # v0 = freshly-decoded zero value. v1 is the pre-serial schema, v2 is
+    # pre-channel — all migrated transparently: serial / sku / channel
+    # stay empty/default until populated. Next save bumps to SCHEMA_VERSION.
+    if schema not in (0, 1, 2, SCHEMA_VERSION):
+        raise RegistryError(f"registry: schema {schema}, expected {SCHEMA_VERSION}")
+    device_id = str(d.get("device_id", ""))
+    active_d = d.get("active") or {}
+    active = Active(payload=ConfigPayload.from_toml_dict(active_d))
+    if "last_seen" in active_d:
+        ls = active_d["last_seen"]
+        active.last_seen = ls if isinstance(ls, datetime) else _parse_iso(str(ls))
+    pending = None
+    if "pending" in d:
+        p_d = d["pending"]
+        pending = Pending(
+            payload=ConfigPayload.from_toml_dict(p_d),
+            created_at=(p_d["created_at"] if isinstance(p_d.get("created_at"), datetime) else _parse_iso(str(p_d.get("created_at", "")))),
+        )
+    return Device(
+        device_id=device_id,
+        serial_number=str(d.get("serial_number", "")),
+        hw_sku=str(d.get("hw_sku", "")),
+        channel=normalize_channel(d.get("channel")),
+        blocked_firmware_version=str(d.get("blocked_firmware_version", "")),
+        active=active,
+        pending=pending,
+    )
+
+
+def _parse_iso(s: str) -> datetime:
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+class Registry:
+    """Per-device TOML store. Locking via flock on sibling .lock file."""
+
+    def __init__(self, devices_dir: str) -> None:
+        if not devices_dir:
+            raise ValueError("registry: empty directory")
+        self._dir = Path(devices_dir)
+        self._dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._proc_lock = threading.Lock()
+
+    @property
+    def dir(self) -> str:
+        return str(self._dir)
+
+    def _path(self, device_id: str) -> Path:
+        return self._dir / f"{device_id}.toml"
+
+    class _FileLock:
+        def __init__(self, path: Path) -> None:
+            self._path = path
+            self._fd: int | None = None
+
+        def __enter__(self) -> "Registry._FileLock":
+            self._fd = os.open(str(self._path), os.O_CREAT | os.O_RDWR, 0o644)
+            fcntl.flock(self._fd, fcntl.LOCK_EX)
+            return self
+
+        def __exit__(self, *_exc) -> None:
+            if self._fd is not None:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+                os.close(self._fd)
+                self._fd = None
+
+    def _with_lock(self, device_id: str):
+        lock_path = self._dir / f"{device_id}.toml.lock"
+        return self._FileLock(lock_path)
+
+    def load(self, device_id: str) -> Device:
+        if not valid_device_id(device_id):
+            raise RegistryError(f"registry: invalid device_id {device_id!r}")
+        with self._with_lock(device_id):
+            return self._load_locked(device_id)
+
+    def _load_locked(self, device_id: str) -> Device:
+        path = self._path(device_id)
+        try:
+            text = path.read_text()
+        except FileNotFoundError as e:
+            raise NotFound(f"registry: device {device_id} not found") from e
+        return _device_from_toml(text)
+
+    def _save_locked(self, dev: Device) -> None:
+        if not valid_device_id(dev.device_id):
+            raise RegistryError(f"registry: invalid device_id {dev.device_id!r}")
+        path = self._path(dev.device_id)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        # 0o600: device PSKs live here in plaintext. See compat/SECURITY.md.
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, dev.to_toml().encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+
+    def register(self, device_id: str, active: ConfigPayload, channel: str = "") -> Device:
+        if not valid_device_id(device_id):
+            raise RegistryError(f"registry: invalid device_id {device_id!r}")
+        if not active.psk_hex or not active.broker_url:
+            raise RegistryError("registry: register requires psk_hex and broker_url")
+        if len(active.psk_hex) != 64 or not re.fullmatch(r"[0-9a-fA-F]{64}", active.psk_hex):
+            raise RegistryError("registry: psk_hex must be 64 lowercase hex chars")
+        active.psk_hex = active.psk_hex.lower()
+        active.version = 1
+        # Release channel is a device-level attribute, NOT part of the
+        # config payload. Mirror of JS register() pulling `channel` off
+        # the incoming payload.
+        ch = normalize_channel(channel)
+        with self._with_lock(device_id):
+            try:
+                self._load_locked(device_id)
+                raise RegistryError(f"registry: device {device_id} already exists")
+            except NotFound:
+                pass
+            dev = Device(device_id=device_id, channel=ch, active=Active(payload=active))
+            self._save_locked(dev)
+            return dev
+
+    def set_pending(self, device_id: str, update: ConfigPayload) -> Device:
+        if not valid_device_id(device_id):
+            raise RegistryError(f"registry: invalid device_id {device_id!r}")
+        if update.psk_hex:
+            if len(update.psk_hex) != 64 or not re.fullmatch(r"[0-9a-fA-F]{64}", update.psk_hex):
+                raise RegistryError("registry: psk_hex must be 64 lowercase hex chars")
+            update.psk_hex = update.psk_hex.lower()
+        with self._with_lock(device_id):
+            dev = self._load_locked(device_id)
+            base = dev.pending.payload if dev.pending else dev.active.payload
+            merged = _merge_payload(base, update)
+            next_version = dev.active.payload.version + 1
+            if dev.pending and dev.pending.payload.version >= next_version:
+                next_version = dev.pending.payload.version + 1
+            merged.version = next_version
+            if _payload_equivalent(merged, dev.active.payload):
+                dev.pending = None
+            else:
+                dev.pending = Pending(payload=merged, created_at=_iso_now())
+            self._save_locked(dev)
+            return dev
+
+    def report_settings(
+        self,
+        device_id: str,
+        *,
+        theme_mode: str | None = None,
+        br_day: int | None = None,
+        br_night: int | None = None,
+        vol: int | None = None,
+        autorotate_enabled: bool | None = None,
+        autorotate_interval_s: int | None = None,
+        pet_enabled: bool | None = None,
+        pet_species: int | None = None,
+        pet_name: str | None = None,
+    ) -> Device:
+        """Apply device-reported display settings to the stored config WITHOUT
+        bumping the version. The device owns these fields (the user sets them on
+        the screen), so the broker mirrors them into Active — and into a queued
+        Pending, if any, so an in-flight OTA/config change does not re-introduce
+        the stale value on promotion. See compat/SETTINGS_REPORT.md."""
+        if not valid_device_id(device_id):
+            raise RegistryError(f"registry: invalid device_id {device_id!r}")
+        with self._with_lock(device_id):
+            dev = self._load_locked(device_id)
+            changed = _apply_reported(
+                dev.active.payload, theme_mode, br_day, br_night, vol,
+                autorotate_enabled, autorotate_interval_s,
+                pet_enabled, pet_species, pet_name,
+            )
+            if dev.pending is not None:
+                changed = _apply_reported(
+                    dev.pending.payload, theme_mode, br_day, br_night, vol,
+                    autorotate_enabled, autorotate_interval_s,
+                    pet_enabled, pet_species, pet_name,
+                ) or changed
+            if changed:
+                self._save_locked(dev)
+            return dev
+
+    def maybe_promote(self, device_id: str, observed_version: int, used_pending_psk: bool) -> bool:
+        if not valid_device_id(device_id):
+            raise RegistryError(f"registry: invalid device_id {device_id!r}")
+        with self._with_lock(device_id):
+            try:
+                dev = self._load_locked(device_id)
+            except NotFound:
+                return False
+            if dev.pending is None or observed_version != dev.pending.payload.version:
+                return False
+            # Allow promotion without a pending-PSK signature only when
+            # the rotation does not actually change the PSK. Otherwise
+            # theme-only / city-only / brightness-only pending updates
+            # would never clear from the registry.
+            if not used_pending_psk and dev.pending.payload.psk_hex != dev.active.payload.psk_hex:
+                return False
+            dev.active = Active(payload=dev.pending.payload, last_seen=_iso_now())
+            dev.pending = None
+            self._save_locked(dev)
+            return True
+
+    def touch(self, device_id: str) -> None:
+        if not valid_device_id(device_id):
+            return
+        with self._with_lock(device_id):
+            try:
+                dev = self._load_locked(device_id)
+            except NotFound:
+                return
+            dev.active.last_seen = _iso_now()
+            self._save_locked(dev)
+
+    def set_serial(self, device_id: str, serial: str, sku: str) -> None:
+        """Persist X-Tmon-Serial / X-Tmon-Sku reported by the device.
+
+        Non-destructive: empty strings preserve existing values so a v2
+        broker rendezvousing with a v1 firmware doesn't lose the
+        serial it already knew. Unknown devices are silently ignored
+        (the headers arrived alongside an authenticated request).
+        """
+        if not valid_device_id(device_id):
+            return
+        with self._with_lock(device_id):
+            try:
+                dev = self._load_locked(device_id)
+            except NotFound:
+                return
+            changed = False
+            if serial and serial != dev.serial_number:
+                dev.serial_number = serial
+                changed = True
+            if sku and sku != dev.hw_sku:
+                dev.hw_sku = sku
+                changed = True
+            if changed:
+                self._save_locked(dev)
+
+    def set_active_firmware_version(self, device_id: str, fw_version: str) -> None:
+        """Persist the firmware version the device reports running
+        (X-Tmon-Fw-Version) into Active.payload.firmware_version.
+
+        This is what ota.decide() keys off ("from"), so persisting it fixes
+        auto-discovery re-staging the same release after a canary revert (the
+        in-memory-only path forgot the running version on restart). Empty
+        values are ignored; the file is re-written only on an actual change
+        (bounded churn under a 60s poll). Unknown devices are ignored.
+        """
+        if not valid_device_id(device_id):
+            return
+        if not fw_version:
+            return
+        from ..ota import pack_semver  # lazy: avoid import cycle (ota → registry)
+
+        with self._with_lock(device_id):
+            try:
+                dev = self._load_locked(device_id)
+            except NotFound:
+                return
+            # Clear a stale revert tombstone once the device has moved on to a
+            # version STRICTLY NEWER than the blocked one (a fixed release
+            # landed). Guarded by pack_semver so unparseable reports never
+            # touch it. Computed independently of the only-on-change guard so
+            # a clear still persists even if the running version is unchanged.
+            clear_blocked = False
+            if dev.blocked_firmware_version:
+                got = pack_semver(fw_version)
+                blk = pack_semver(dev.blocked_firmware_version)
+                if got is not None and blk is not None and got > blk:
+                    clear_blocked = True
+            if dev.active.payload.firmware_version == fw_version and not clear_blocked:
+                return
+            dev.active.payload.firmware_version = fw_version
+            if clear_blocked:
+                dev.blocked_firmware_version = ""
+            self._save_locked(dev)
+
+    def set_blocked_firmware_version(self, device_id: str, version: str) -> None:
+        """Record (or clear, when version is "") the per-device OTA revert
+        tombstone — a firmware version the auto-discovery loop must not
+        re-stage. Written by tokenmonitor_revert with the version the device is
+        being reverted FROM. Only-on-change; unknown devices ignored. Mirror of
+        go/js stores.
+        """
+        if not valid_device_id(device_id):
+            return
+        with self._with_lock(device_id):
+            try:
+                dev = self._load_locked(device_id)
+            except NotFound:
+                return
+            if dev.blocked_firmware_version != version:
+                dev.blocked_firmware_version = version
+                self._save_locked(dev)
+
+    def set_channel(self, device_id: str, channel: str) -> None:
+        """Persist the device's OTA release track ("" / "stable" vs "dev").
+
+        Device-level (like set_serial), applied immediately — it only
+        steers which GitHub asset the OTA loop fetches; the firmware
+        never sees it. The value is canonicalised via normalize_channel;
+        the file is re-written only when the channel actually changes.
+        Unknown devices are silently ignored. Mirror of JS setChannel.
+        """
+        if not valid_device_id(device_id):
+            return
+        norm = normalize_channel(channel)
+        with self._with_lock(device_id):
+            try:
+                dev = self._load_locked(device_id)
+            except NotFound:
+                return
+            if norm != dev.channel:
+                dev.channel = norm
+                self._save_locked(dev)
+
+    def bump_min_sv(self, device_id: str, sv: int) -> None:
+        """Monotonic anti-rollback floor. Never lowers."""
+        if not valid_device_id(device_id):
+            return
+        with self._with_lock(device_id):
+            try:
+                dev = self._load_locked(device_id)
+            except NotFound:
+                return
+            if sv <= dev.active.payload.min_secure_version:
+                return
+            dev.active.payload.min_secure_version = int(sv)
+            self._save_locked(dev)
+
+    def psks_for(self, device_id: str) -> tuple[bytes | None, bytes | None]:
+        dev = self.load(device_id)
+        active = bytes.fromhex(dev.active.payload.psk_hex) if dev.active.payload.psk_hex else None
+        pending = None
+        if (
+            dev.pending is not None
+            and dev.pending.payload.psk_hex
+            and dev.pending.payload.psk_hex != dev.active.payload.psk_hex
+        ):
+            pending = bytes.fromhex(dev.pending.payload.psk_hex)
+        return active, pending
+
+    def list_device_ids(self) -> list[str]:
+        """Return device_id slugs found on disk, sorted ascending.
+
+        Cheaper than ``list`` for callers that only need IDs (e.g. the
+        mDNS advertiser populating the TXT ``devs=`` record). Parse
+        failures on individual files don't abort the scan.
+        """
+        out: list[str] = []
+        for entry in sorted(self._dir.iterdir()):
+            name = entry.name
+            if not entry.is_file() or not name.endswith(".toml"):
+                continue
+            device_id = name[:-5]
+            if not valid_device_id(device_id):
+                continue
+            out.append(device_id)
+        return out
+
+    def list(self) -> list[Device]:
+        out: list[Device] = []
+        for entry in sorted(self._dir.iterdir()):
+            name = entry.name
+            if not entry.is_file() or not name.endswith(".toml"):
+                continue
+            device_id = name[:-5]
+            if not valid_device_id(device_id):
+                continue
+            try:
+                out.append(self.load(device_id))
+            except Exception:
+                continue
+        return out
+
+
+def _apply_reported(
+    p: ConfigPayload,
+    theme_mode: str | None,
+    br_day: int | None,
+    br_night: int | None,
+    vol: int | None,
+    autorotate_enabled: bool | None,
+    autorotate_interval_s: int | None,
+    pet_enabled: bool | None = None,
+    pet_species: int | None = None,
+    pet_name: str | None = None,
+) -> bool:
+    """Overlay reported device-owned fields onto a payload, clamping numeric
+    ranges and ignoring an unknown theme_mode. Returns True if anything changed.
+    Operator-owned fields are never touched."""
+    changed = False
+
+    def _clamp(v: int, lo: int, hi: int) -> int:
+        return lo if v < lo else hi if v > hi else v
+
+    if theme_mode in ("day", "night", "auto"):
+        if p.theme_mode != theme_mode:
+            p.theme_mode = theme_mode
+            changed = True
+    if br_day is not None:
+        v = _clamp(int(br_day), 10, 100)
+        if p.br_day != v:
+            p.br_day = v
+            changed = True
+    if br_night is not None:
+        v = _clamp(int(br_night), 5, 100)
+        if p.br_night != v:
+            p.br_night = v
+            changed = True
+    if vol is not None:
+        v = _clamp(int(vol), 0, 100)
+        if p.vol != v:
+            p.vol = v
+            changed = True
+    if autorotate_enabled is not None:
+        b = bool(autorotate_enabled)
+        if p.autorotate_enabled != b:
+            p.autorotate_enabled = b
+            changed = True
+    if autorotate_interval_s is not None:
+        v = _clamp(int(autorotate_interval_s), 1, 300)
+        if p.autorotate_interval_s != v:
+            p.autorotate_interval_s = v
+            changed = True
+    if pet_enabled is not None:
+        b = bool(pet_enabled)
+        if p.pet_enabled != b:
+            p.pet_enabled = b
+            changed = True
+    if pet_species is not None:
+        # Clamp to the species enum 0..9 like every other numeric. Absence
+        # (None) is handled by the caller — the device omits the field until
+        # it has picked a species, so no sentinel is stored.
+        v = _clamp(int(pet_species), 0, 9)
+        if p.pet_species != v:
+            p.pet_species = v
+            changed = True
+    if pet_name is not None:
+        name = str(pet_name)[:15]
+        if p.pet_name != name:
+            p.pet_name = name
+            changed = True
+    return changed
+
+
+def _merge_payload(base: ConfigPayload, upd: ConfigPayload) -> ConfigPayload:
+    out = ConfigPayload(
+        version=base.version,
+        broker_url=upd.broker_url or base.broker_url,
+        psk_hex=upd.psk_hex or base.psk_hex,
+        city=upd.city or base.city,
+        br_day=upd.br_day if upd.br_day is not None and upd.br_day != 0 else base.br_day,
+        br_night=upd.br_night if upd.br_night is not None and upd.br_night != 0 else base.br_night,
+        vol=upd.vol if upd.vol is not None else base.vol,
+        providers=None,
+        provider_modes=(
+            upd.provider_modes
+            if upd.provider_modes is not None
+            else (ProviderModeSet.from_provider_set(upd.providers) if upd.providers is not None else base.provider_modes)
+        ),
+        autorotate_enabled=upd.autorotate_enabled if upd.autorotate_enabled is not None else base.autorotate_enabled,
+        autorotate_interval_s=upd.autorotate_interval_s if upd.autorotate_interval_s is not None else base.autorotate_interval_s,
+        theme_mode=upd.theme_mode or base.theme_mode,
+        pet_enabled=upd.pet_enabled if upd.pet_enabled is not None else base.pet_enabled,
+        pet_species=upd.pet_species if upd.pet_species is not None else base.pet_species,
+        pet_name=upd.pet_name or base.pet_name,
+        gemini_models=list(upd.gemini_models) if upd.gemini_models is not None else base.gemini_models,
+        log_enabled=upd.log_enabled if upd.log_enabled is not None else base.log_enabled,
+        firmware_url=upd.firmware_url or base.firmware_url,
+        firmware_sha256=upd.firmware_sha256 or base.firmware_sha256,
+        firmware_version=upd.firmware_version or base.firmware_version,
+        firmware_manifest_b64=upd.firmware_manifest_b64 or base.firmware_manifest_b64,
+        firmware_manifest_sig_b64=upd.firmware_manifest_sig_b64 or base.firmware_manifest_sig_b64,
+        # min_secure_version is monotonic — never lowers.
+        min_secure_version=max(upd.min_secure_version, base.min_secure_version),
+    )
+    return out
+
+
+def _payload_equivalent(a: ConfigPayload, b: ConfigPayload) -> bool:
+    if (
+        a.broker_url != b.broker_url
+        or a.psk_hex != b.psk_hex
+        or a.city != b.city
+        or a.br_day != b.br_day
+        or a.br_night != b.br_night
+        or a.vol != b.vol
+    ):
+        return False
+    if (a.provider_modes is None) != (b.provider_modes is None):
+        return False
+    if a.provider_modes is not None and (
+        a.provider_modes.claude != b.provider_modes.claude
+        or a.provider_modes.codex != b.provider_modes.codex
+        or a.provider_modes.gemini != b.provider_modes.gemini
+    ):
+        return False
+    if (a.autorotate_enabled is None) != (b.autorotate_enabled is None):
+        return False
+    if a.autorotate_enabled is not None and a.autorotate_enabled != b.autorotate_enabled:
+        return False
+    if (a.autorotate_interval_s is None) != (b.autorotate_interval_s is None):
+        return False
+    if a.autorotate_interval_s is not None and a.autorotate_interval_s != b.autorotate_interval_s:
+        return False
+    if a.theme_mode != b.theme_mode:
+        return False
+    if (a.pet_enabled is None) != (b.pet_enabled is None):
+        return False
+    if a.pet_enabled is not None and a.pet_enabled != b.pet_enabled:
+        return False
+    if (a.pet_species is None) != (b.pet_species is None):
+        return False
+    if a.pet_species is not None and a.pet_species != b.pet_species:
+        return False
+    if a.pet_name != b.pet_name:
+        return False
+    am = a.gemini_models or []
+    bm = b.gemini_models or []
+    if am != bm:
+        return False
+    if (a.log_enabled is None) != (b.log_enabled is None):
+        return False
+    if a.log_enabled is not None and a.log_enabled != b.log_enabled:
+        return False
+    if (
+        a.firmware_url != b.firmware_url
+        or a.firmware_sha256 != b.firmware_sha256
+        or a.firmware_version != b.firmware_version
+        or a.firmware_manifest_b64 != b.firmware_manifest_b64
+        or a.firmware_manifest_sig_b64 != b.firmware_manifest_sig_b64
+        or a.min_secure_version != b.min_secure_version
+    ):
+        return False
+    return True

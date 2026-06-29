@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "cwm-mcp": {
-      "command": "sh",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/server/cwm-mcp"]
-    }
-  }
-}
