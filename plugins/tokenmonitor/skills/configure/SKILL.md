@@ -85,19 +85,25 @@ Resolve only the broker URL before asking the user anything else:
   registry + device NVS only; the user never has to memorise or pick
   one. Pass `psk_hex` only if reproducing a known key (e.g. migrating
   a device between brokers).
-- **city** — optional, but recommended (drives ambient weather).
-  Default to nothing and let the user fill it in later via
-  `tokenmonitor_set_device_pending` if they don't want to think about
-  it now. **If you do set it, it MUST geocode**: the device feeds the
-  string verbatim to Open-Meteo, whose `name=` parameter takes a single
-  place name — a comma-separated descriptor like `"Pinto, Madrid, Spain"`
-  returns zero results and the device silently uses default coordinates.
-  Pass a **bare town name** (`"Pinto"`, `"Getafe"`), and verify it
-  resolves first with
-  `curl -s "https://geocoding-api.open-meteo.com/v1/search?name=<city>&count=1&language=es&format=json"`
-  (non-empty `results[]`). See the [[settings]] skill's "City —
-  geocoding pre-check" for the full normalisation / nearest-city
-  fallback procedure.
+- **city** — **ASK the user** for their city during setup (it drives the
+  ambient weather widget). Pose a short free-text question, e.g. "¿En qué
+  ciudad está el dispositivo? (para el tiempo en pantalla)". The user may
+  decline / leave it blank — that's fine, omit `city` and they can set it
+  later via `tokenmonitor_set_device_pending` or on-device Settings.
+  **Whatever they give, it MUST geocode before you send it**: the device
+  feeds the string verbatim to Open-Meteo, whose `name=` parameter takes a
+  single place name — a comma-separated descriptor like
+  `"Torrevieja, España"` or `"Pinto, Madrid, Spain"` is unreliable and can
+  return zero results, leaving the device on default coordinates. So:
+    1. Strip to a **bare town name** (`"Torrevieja"`, `"Pinto"`,
+       `"Getafe"`) — drop the province/country the user may have typed.
+    2. Verify it resolves with
+       `curl -s "https://geocoding-api.open-meteo.com/v1/search?name=<city>&count=1&language=es&format=json"`
+       (non-empty `results[]`); show the user the matched
+       `name, admin1, country` to confirm it's the right place.
+    3. Pass the bare name as `city` in the provision call.
+  See the [[settings]] skill's "City — geocoding pre-check" for the full
+  normalisation / nearest-city fallback procedure.
 - **brightness / volume** — only ask if the user volunteers
   preferences. Defaults on the device are sensible.
 - **theme / pet** — optional display preferences, also changeable later
@@ -187,6 +193,31 @@ expected `active_broker_url` and a recent `last_seen`. If `last_seen`
 stays empty after 60 s, the device is not reaching the broker — check
 firewall on the laptop, double-check the chosen broker_url, or run
 `tokenmonitor_recent_logs` to look for 401s (PSK mismatch).
+
+### 6. Tell the user what they can tune later
+
+Once the device is online, **tell the user what they can change from
+here** so they know the device is customisable. Keep it short — a few
+bullets — and mention both ways to change them: the on-device **Settings**
+panel (long-press the mascot on the dashboard) and remotely via the
+**`/tokenmonitor:settings`** skill (driven from Claude Code). Cover at
+least:
+
+- **City** — the ambient weather location (if they skipped it at setup).
+- **Brightness** — separate **day** and **night** levels.
+- **Alert volume** — or mute.
+- **Providers & mode** — enable/disable Claude / Codex / Gemini, and set
+  each one's mode: **Auto**, **Subscription** (plan/quota usage) or
+  **API key** (pay-as-you-go spend).
+- **Auto-rotation** — when 2+ providers are on, cycle the active one every
+  N seconds (or freeze on one).
+- **Virtual pet** — show/hide it, change species, or rename it.
+- **Theme** — Day / Night / Auto (follows the city's sunrise/sunset).
+- **Broker URL / passphrase** — advanced; rarely needed.
+
+If the user expresses any of these preferences in the same breath, apply
+them right away with `tokenmonitor_set_device_pending` rather than making
+them ask again.
 
 ## Tools used (in order)
 
