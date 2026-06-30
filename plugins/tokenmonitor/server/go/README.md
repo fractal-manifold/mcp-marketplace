@@ -146,20 +146,21 @@ Or persist it globally in `~/.codex/config.toml`:
 mcp_tool_call_review = false
 ```
 
-### Gemini CLI
+### Antigravity CLI (`agy`)
+
+The Gemini CLI was retired on 2026-06-18 and replaced by the Antigravity
+CLI (`agy`). `agy` has no `gemini mcp add` equivalent — MCP servers are
+registered through its **extension** mechanism (the same `tokenmonitor`
+plugin the marketplace ships):
 
 ```sh
-gemini mcp add -s user --trust tokenmonitor-mcp "$(command -v tokenmonitor-mcp)"
+agy extensions install tokenmonitor
 ```
 
-- `-s user` writes to `~/.gemini/settings.json` (global). Without it the
-  default scope is `project` and Gemini would write to
-  `<cwd>/.gemini/settings.json`, which is rarely what you want for a
-  host-level utility.
-- `--trust` suppresses the per-call confirmation prompt — the server is
-  local-only and behind HMAC auth, the prompt is just friction.
-
-Verify with `gemini mcp list`; the server should report `✓ Connected`.
+This drops the extension under `~/.gemini/antigravity-cli/extensions/`
+(OAuth still lives at the unchanged `~/.gemini/oauth_creds.json`). Restart
+`agy` afterwards so it picks up the new extension. See `website/plugin.html`
+for the end-user install flow.
 
 ## Coexistence with an existing broker
 
@@ -223,7 +224,7 @@ diagnostic questions about your wall monitor.
 | `tokenmonitor_provision_hint` | The laptop's LAN IPv4 addresses + the configured port, formatted as `http://…` URLs to paste into the device's captive portal. |
 | `tokenmonitor_list_devices`   | Every device in the local registry, with active config version, whether a pending update is queued, last seen, providers enabled. |
 | `tokenmonitor_register_device`| Register an existing device — needed once for any device originally provisioned through the captive portal. Args: `device_id` (8 hex), `broker_url`, `psk_hex` (64 hex), optional `city`/`br_day`/`br_night`/`vol`. |
-| `tokenmonitor_set_device_pending` | Stage a pending config change. Args (all optional except `device_id`): `broker_url`, `psk_hex`, `city`, `br_day`, `br_night`, `vol`, `provider_claude`, `provider_codex`, `provider_gemini`, `autorotate_enabled`, `autorotate_interval_s`. The device applies it within ~60 s under candidate/rollback. |
+| `tokenmonitor_set_device_pending` | Stage a pending config change. Args (all optional except `device_id`): `broker_url`, `psk_hex`, `city`, `br_day`, `br_night`, `vol`, `provider_claude`, `provider_codex`, `provider_antigravity` (legacy alias: `provider_gemini`), `autorotate_enabled`, `autorotate_interval_s`. The device applies it within ~60 s under candidate/rollback. |
 | `tokenmonitor_discover_devices` | Scan the local network via mDNS (`_tmon._tcp.local.`) for devices in BOOT_NEEDS_CONFIG. Default 4 s scan, max 15 s. Returns `device_id`, `fw`, `ipv4`, `provision_url`. The pairing code is **not** returned — it lives only on the device's screen. |
 | `tokenmonitor_provision`      | POST `/provision` on a discovered device with the 6-digit pairing code the user reads off the screen plus the broker URL, PSK hex, and any optional config. On success the device persists to NVS and reboots; if `broker_url + psk_hex` are supplied this tool also registers/queues the device in the local registry. |
 

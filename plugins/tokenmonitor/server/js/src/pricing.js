@@ -37,6 +37,10 @@ export const FALLBACK_PRICES = {
   "gemini-2.5-pro":          { input: 1.25e-6, output: 10e-6,  cache_read: 0.31e-6,  cache_creation: 0 },
   "gemini-2.5-flash":        { input: 0.3e-6,  output: 2.5e-6, cache_read: 0.075e-6, cache_creation: 0 },
   "gemini-3-flash-preview":  { input: 0.3e-6,  output: 2.5e-6, cache_read: 0.075e-6, cache_creation: 0 },
+  // Antigravity defaults (agy). Prefix-matched so effort suffixes
+  // (-low/-medium/-high) resolve to the same rate.
+  "gemini-3.5-flash":        { input: 0.3e-6,  output: 2.5e-6, cache_read: 0.075e-6, cache_creation: 0 },
+  "gemini-3.1-pro":          { input: 1.25e-6, output: 10e-6,  cache_read: 0.31e-6,  cache_creation: 0 },
 };
 
 // Normalise a LiteLLM entry (USD-per-token fields) to our shape. LiteLLM

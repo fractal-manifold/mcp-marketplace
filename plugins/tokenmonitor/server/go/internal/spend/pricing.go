@@ -43,6 +43,10 @@ var FallbackPrices = map[string]Rate{
 	"gemini-2.5-pro":         {1.25e-6, 10e-6, 0.31e-6, 0},
 	"gemini-2.5-flash":       {0.3e-6, 2.5e-6, 0.075e-6, 0},
 	"gemini-3-flash-preview": {0.3e-6, 2.5e-6, 0.075e-6, 0},
+	// Antigravity (agy) Gemini-family models. Effort-suffixed ids
+	// (gemini-3.5-flash-low etc.) resolve by prefix in rate_for.
+	"gemini-3.5-flash":       {0.3e-6, 2.5e-6, 0.075e-6, 0},
+	"gemini-3.1-pro":         {1.25e-6, 10e-6, 0.31e-6, 0},
 }
 
 // PriceTable is an immutable snapshot of model rates plus provenance.

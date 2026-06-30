@@ -200,11 +200,12 @@ func buildUsageCache(cfg *config.Config, logger *log.Logger) *usage.Cache {
 	if cfg.Codex.Enabled {
 		fetchers[usage.ProviderCodex] = &usage.CodexFetcher{AuthPath: cfg.CodexAuthPath()}
 	}
-	if cfg.Gemini.Enabled {
-		fetchers[usage.ProviderGemini] = &usage.GeminiFetcher{
-			CredsPath:    cfg.GeminiCredsPath(),
-			ProjectsPath: cfg.GeminiProjectsPath(),
-			Models:       cfg.GeminiModels(),
+	if cfg.Antigravity.Enabled {
+		// The Antigravity quota probe reads agy's consumer token from the OS
+		// keyring (the old creds_path/projects_path files are no longer used).
+		fetchers[usage.ProviderAntigravity] = &usage.AntigravityFetcher{
+			KeyringService: cfg.Antigravity.KeyringService,
+			Models:         cfg.AntigravityModels(),
 		}
 	}
 	ttl := time.Duration(cfg.Usage.CacheTTLSeconds) * time.Second
@@ -223,13 +224,13 @@ func buildSpendCache(cfg *config.Config, logger *log.Logger) *spend.Cache {
 	return spend.BuildCache(spend.SpendConfig{
 		Enabled:          cfg.Spend.Enabled,
 		CacheTTLSeconds:  cfg.Spend.CacheTTLSeconds,
-		ClaudeProjects:   cfg.ClaudeProjectsPath(),
-		CodexSessions:    cfg.CodexSessionsPath(),
-		GeminiTmp:        cfg.GeminiTmpPath(),
-		ClaudeCredsPath:  cfg.OAuthPath(),
-		CodexAuthPath:    cfg.CodexAuthPath(),
-		CodexEnabled:     cfg.Codex.Enabled,
-		GeminiEnabled:    cfg.Gemini.Enabled,
+		ClaudeProjects:    cfg.ClaudeProjectsPath(),
+		CodexSessions:     cfg.CodexSessionsPath(),
+		AntigravityConv:   cfg.AntigravityConvPath(),
+		ClaudeCredsPath:   cfg.OAuthPath(),
+		CodexAuthPath:     cfg.CodexAuthPath(),
+		CodexEnabled:      cfg.Codex.Enabled,
+		AntigravityEnabled: cfg.Antigravity.Enabled,
 		PricingURL:       cfg.Pricing.URL,
 		PricingCachePath: cfg.PricingCachePath(),
 		PricingTTLHours:  cfg.Pricing.TTLHours,

@@ -54,7 +54,7 @@ func providerNames(p *registry.ProviderModeSet) []string {
 		out = append(out, "codex")
 	}
 	if p.Gemini.Enabled() {
-		out = append(out, "gemini")
+		out = append(out, "antigravity")
 	}
 	return out
 }
@@ -113,7 +113,7 @@ func pendingChanges(active, pending registry.ConfigPayload) []string {
 		diffs = append(diffs, "pet_name")
 	}
 	if pending.GeminiModels != nil && !stringSliceEqual(active.GeminiModels, pending.GeminiModels) {
-		diffs = append(diffs, "gemini_models")
+		diffs = append(diffs, "antigravity_models")
 	}
 	if pending.LogEnabled != nil {
 		if active.LogEnabled == nil || *active.LogEnabled != *pending.LogEnabled {
@@ -320,8 +320,13 @@ func handleSetDevicePending(d Deps) server.ToolHandlerFunc {
 		}
 		anySupplied := false
 		for _, k := range []string{
-			"provider_claude", "provider_codex", "provider_gemini",
-			"provider_mode_claude", "provider_mode_codex", "provider_mode_gemini",
+			"provider_claude", "provider_codex",
+
+			"provider_antigravity", "provider_gemini",
+
+			"provider_mode_claude", "provider_mode_codex",
+
+			"provider_mode_antigravity", "provider_mode_gemini",
 		} {
 			if _, ok := anyProv[k]; ok {
 				anySupplied = true
@@ -356,7 +361,20 @@ func handleSetDevicePending(d Deps) server.ToolHandlerFunc {
 			if err := apply(&base.Codex, "provider_codex", "provider_mode_codex"); err != nil {
 				return mcp.NewToolResultErrorFromErr("providers", err), nil
 			}
-			if err := apply(&base.Gemini, "provider_gemini", "provider_mode_gemini"); err != nil {
+			// Antigravity (formerly Gemini): prefer the new arg names, fall back
+			// to the deprecated gemini-named args for older automation.
+			agBool, agMode := "provider_antigravity", "provider_mode_antigravity"
+			if _, ok := anyProv[agBool]; !ok {
+				if _, ok2 := anyProv["provider_gemini"]; ok2 {
+					agBool = "provider_gemini"
+				}
+			}
+			if _, ok := anyProv[agMode]; !ok {
+				if _, ok2 := anyProv["provider_mode_gemini"]; ok2 {
+					agMode = "provider_mode_gemini"
+				}
+			}
+			if err := apply(&base.Gemini, agBool, agMode); err != nil {
 				return mcp.NewToolResultErrorFromErr("providers", err), nil
 			}
 			update.ProviderModes = &base
@@ -405,10 +423,14 @@ func handleSetDevicePending(d Deps) server.ToolHandlerFunc {
 		// gemini_models: comma-separated list. Empty string clears the
 		// override (signalled by an empty-but-non-nil slice; mergePayload
 		// then replaces the stored list).
-		if raw, ok := req.GetArguments()["gemini_models"]; ok {
+		modelsKey := "antigravity_models"
+		if _, ok := req.GetArguments()[modelsKey]; !ok {
+			modelsKey = "gemini_models" // deprecated alias
+		}
+		if raw, ok := req.GetArguments()[modelsKey]; ok {
 			models := parseGeminiModels(fmt.Sprint(raw))
 			if len(models) > 3 {
-				return mcp.NewToolResultError("gemini_models must list at most 3 entries"), nil
+				return mcp.NewToolResultError(modelsKey + " must list at most 3 entries"), nil
 			}
 			if models == nil {
 				models = []string{}

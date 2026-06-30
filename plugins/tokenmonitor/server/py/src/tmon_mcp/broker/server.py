@@ -1,5 +1,6 @@
 """HTTP broker: /credentials, /credentials/codex, /device/<id>/sync,
-/firmware-logs, /usage/{claude,codex,gemini}.
+/firmware-logs, /usage/{claude,codex,antigravity} (deprecated "gemini" alias
+accepted), /spend/{claude,codex} (antigravity not implemented).
 
 Wire-compatible with tokenmonitor-mcp/internal/broker/server.go.
 """
@@ -395,9 +396,11 @@ async def _handle_credentials_codex(req: web.Request) -> web.Response:
             pass
 
 
-def _device_gemini_models(reg: Registry, device_id: str) -> list[str]:
-    """Return the per-device Gemini model override (pending first, then
-    active). Empty list when no override is configured.
+def _device_antigravity_models(reg: Registry, device_id: str) -> list[str]:
+    """Return the per-device Antigravity model override (pending first, then
+    active). Empty list when no override is configured. The registry field is
+    still named gemini_models (internal, pre-rename) — only the wire/provider
+    key migrated.
     """
     try:
         dev = reg.load(device_id)
@@ -431,25 +434,30 @@ async def _handle_usage(req: web.Request) -> web.Response:
         if not ok:
             status_to_record = err_resp.status
             return err_resp
+        # HMAC was verified against the literal path above; only now fold the
+        # deprecated "gemini" wire alias onto the canonical "antigravity" key
+        # for cache/fetcher lookup. Old firmware that signs /usage/gemini keeps
+        # working; new firmware uses /usage/antigravity directly.
+        provider = usage.canonical_provider(provider)
         if usage_cache is None:
             status_to_record = 503
             return _error(503, "usage disabled (no providers configured)")
 
-        # Per-device Gemini override: when the device has a non-empty
-        # gemini_models list, bypass the cache and fetch with that
-        # slice. Token cache inside the GeminiFetcher is preserved, so
-        # this is only one extra upstream round-trip per poll.
+        # Per-device Antigravity override: when the device has a non-empty
+        # model list, bypass the cache and fetch with that slice. The token
+        # cache inside the AntigravityFetcher is preserved, so this is only
+        # one extra upstream round-trip per poll.
         reg: registry.Registry | None = req.app.get("registry")
         device_id = req.headers.get("X-Tmon-Device", "")
         if (
-            provider == usage.PROVIDER_GEMINI
+            provider == usage.PROVIDER_ANTIGRAVITY
             and reg is not None
             and device_id
             and registry.valid_device_id(device_id)
         ):
-            models = _device_gemini_models(reg, device_id)
+            models = _device_antigravity_models(reg, device_id)
             if models:
-                gem = usage_cache.gemini_fetcher() if hasattr(usage_cache, "gemini_fetcher") else None
+                gem = usage_cache.antigravity_fetcher() if hasattr(usage_cache, "antigravity_fetcher") else None
                 if gem is not None:
                     try:
                         snap = await gem.fetch_with_models(http, models)
@@ -517,7 +525,9 @@ async def _handle_spend(req: web.Request) -> web.Response:
         if not ok:
             status_to_record = err_resp.status
             return err_resp
-        if provider not in (spend.PROVIDER_CLAUDE, spend.PROVIDER_CODEX, spend.PROVIDER_GEMINI):
+        # Canonicalize the deprecated "gemini" alias AFTER HMAC verification.
+        provider = spend.canonical_provider(provider)
+        if provider not in (spend.PROVIDER_CLAUDE, spend.PROVIDER_CODEX, spend.PROVIDER_ANTIGRAVITY):
             status_to_record = 404
             return _error(404, "unknown spend provider")
         if spend_cache is None:
@@ -909,12 +919,27 @@ def _pending_payload_json(p) -> str:
     # never disagree (enabled == mode is neither "" nor "disabled").
     if p.provider_modes is not None:
         pm = p.provider_modes
-        wire["provider_modes"] = {"claude": pm.claude, "codex": pm.codex, "gemini": pm.gemini}
 
         def _en(m: str) -> bool:
             return m not in ("", "disabled")
 
-        wire["providers"] = {"claude": _en(pm.claude), "codex": _en(pm.codex), "gemini": _en(pm.gemini)}
+        # Dual-emit the Antigravity provider under BOTH the new "antigravity"
+        # key and the deprecated "gemini" key. Firmware after the rename reads
+        # "antigravity"; deployed firmware still reads "gemini". Both derive
+        # from the same provider_modes.gemini field so they never disagree.
+        # Drop the "gemini" key once the fleet has updated.
+        wire["provider_modes"] = {
+            "claude": pm.claude,
+            "codex": pm.codex,
+            "antigravity": pm.gemini,
+            "gemini": pm.gemini,
+        }
+        wire["providers"] = {
+            "claude": _en(pm.claude),
+            "codex": _en(pm.codex),
+            "antigravity": _en(pm.gemini),
+            "gemini": _en(pm.gemini),
+        }
     if p.autorotate_enabled is not None:
         wire["autorotate_enabled"] = bool(p.autorotate_enabled)
     if p.autorotate_interval_s is not None:
@@ -932,9 +957,13 @@ def _pending_payload_json(p) -> str:
         wire["pet_name"] = str(p.pet_name)
     gm = getattr(p, "gemini_models", None)
     if gm is not None and len(gm) > 0:
-        # firmware/config_sync.c reads "gemini_models" as a CSV string
-        # and writes it to NVS key tmon_gem_mdls.
-        wire["gemini_models"] = ",".join(str(m) for m in gm)
+        # Dual-emit the per-device model override CSV under the new
+        # "antigravity_models" key and the deprecated "gemini_models" key.
+        # firmware/config_sync.c (post-rename) reads "antigravity_models";
+        # deployed firmware reads "gemini_models".
+        csv = ",".join(str(m) for m in gm)
+        wire["antigravity_models"] = csv
+        wire["gemini_models"] = csv
     if getattr(p, "log_enabled", None) is not None:
         # firmware/config_sync.c reads "log_enabled" → NVS key tmon_log_en.
         wire["log_enabled"] = bool(p.log_enabled)

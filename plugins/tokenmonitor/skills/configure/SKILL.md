@@ -117,7 +117,7 @@ Resolve only the broker URL before asking the user anything else:
       dashboard, `false` hides it. Device default is `true` (shown). Pass
       `false` only if the user explicitly doesn't want it.
 - **providers** — REQUIRED. The device tracks usage from one or more of
-  Claude, Codex and Gemini; only the ones enabled here are polled and
+  Claude, Codex and Antigravity; only the ones enabled here are polled and
   shown on the dashboard. Default selection rules:
     - **Claude is always pre-selected.** If this skill is running at
       all, it is running inside Claude Code (this plugin only exists as
@@ -126,23 +126,28 @@ Resolve only the broker URL before asking the user anything else:
     - **Codex** → pre-select if `~/.codex/auth.json` exists, or
       `~/.config/codex/` exists, or `OPENAI_API_KEY` is set in the
       environment.
-    - **Gemini** → pre-select if `~/.gemini/oauth_creds.json` exists,
-      or `~/.config/gemini-cli/` exists, or `GEMINI_API_KEY` /
-      `GOOGLE_API_KEY` are set.
+    - **Antigravity** → pre-select if the `agy` binary is on `PATH`, or
+      `~/.gemini/antigravity-cli/` exists, or
+      `~/.gemini/oauth_creds.json` exists (the OAuth file is shared with
+      the old Gemini CLI and still used), or `GEMINI_API_KEY` /
+      `GOOGLE_API_KEY` are set. (Antigravity is Google's successor to the
+      Gemini CLI; it still runs the Gemini-family models.)
 
   Then call `AskUserQuestion` with `multiSelect: true`, pre-marking
-  Claude plus whichever of Codex/Gemini were detected, with options:
+  Claude plus whichever of Codex/Antigravity were detected, with options:
     - "Claude (Claude Code)"
     - "Codex (OpenAI)"
-    - "Gemini (Google)"
+    - "Antigravity (Google)"
 
   The user can still uncheck Claude if they really want to (e.g. they
   use Claude Code for other work but don't want it tracked on the
   device). Require at least one provider selected.
 
-  Send `provider_claude`, `provider_codex`, `provider_gemini` flags
+  Send `provider_claude`, `provider_codex`, `provider_antigravity` flags
   (`true` for selected, omit for not-selected — the broker treats the
   absence as "keep current", which on a fresh provision means disabled).
+  The legacy `provider_gemini` flag is still accepted as an alias, but
+  prefer `provider_antigravity`.
 
 - **rotation** — `tokenmonitor_provision` does NOT accept rotation
   fields (its schema is `additionalProperties: false`; passing them
@@ -159,7 +164,7 @@ Resolve only the broker URL before asking the user anything else:
 Call `tokenmonitor_provision` with the values from steps 1–3 (do not
 pass `psk_hex` — let the broker generate it; do pass each selected
 provider as `provider_claude=true` / `provider_codex=true` /
-`provider_gemini=true`; pass `theme_mode` / `pet_enabled` only if the
+`provider_antigravity=true`; pass `theme_mode` / `pet_enabled` only if the
 user expressed a preference, otherwise omit them so the device defaults
 stand). Expected return on success:
 
@@ -206,7 +211,7 @@ least:
 - **City** — the ambient weather location (if they skipped it at setup).
 - **Brightness** — separate **day** and **night** levels.
 - **Alert volume** — or mute.
-- **Providers & mode** — enable/disable Claude / Codex / Gemini, and set
+- **Providers & mode** — enable/disable Claude / Codex / Antigravity, and set
   each one's mode: **Auto**, **Subscription** (plan/quota usage) or
   **API key** (pay-as-you-go spend).
 - **Auto-rotation** — when 2+ providers are on, cycle the active one every

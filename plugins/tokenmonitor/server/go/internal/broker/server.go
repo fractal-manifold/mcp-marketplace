@@ -546,6 +546,11 @@ func handleUsage(cfg *config.Config, nonceCache *auth.NonceCache, logger *log.Lo
 	if !verifyCredentialRequest(cfg, nonceCache, logger, reg, w, r, "/usage/"+provider) {
 		return
 	}
+	// HMAC was verified against the literal path above; only now fold the
+	// deprecated "gemini" wire alias onto the canonical "antigravity" key
+	// for cache/fetcher lookup. Old firmware that signs /usage/gemini keeps
+	// working; new firmware uses /usage/antigravity directly.
+	provider = usage.CanonicalProvider(provider)
 	if usageCache == nil {
 		writeError(w, http.StatusServiceUnavailable, "usage disabled (no providers configured)")
 		return
@@ -554,15 +559,14 @@ func handleUsage(cfg *config.Config, nonceCache *auth.NonceCache, logger *log.Lo
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 
-	// Per-device Gemini override: when the device's registry record has
-	// a non-empty gemini_models list, bypass the shared cache so we
-	// serve the requested model slice. The token cache inside the
-	// GeminiFetcher is still reused, so this is only one extra
-	// upstream round-trip per poll.
+	// Per-device Antigravity override: when the device's registry record
+	// has a non-empty model list, bypass the shared cache so we serve the
+	// requested model slice. The token cache inside the AntigravityFetcher
+	// is still reused, so this is only one extra upstream round-trip per poll.
 	deviceID := r.Header.Get("X-Tmon-Device")
-	if provider == usage.ProviderGemini && reg != nil && deviceID != "" && registry.ValidDeviceID(deviceID) {
+	if provider == usage.ProviderAntigravity && reg != nil && deviceID != "" && registry.ValidDeviceID(deviceID) {
 		if models := deviceGeminiModels(reg, deviceID); len(models) > 0 {
-			if gf, ok := usageCache.GeminiFetcher(); ok {
+			if gf, ok := usageCache.AntigravityFetcher(); ok {
 				snap, ferr := gf.FetchWithModels(ctx, models)
 				if ferr != nil {
 					writeUsageError(w, ferr)
@@ -630,7 +634,9 @@ func handleSpend(cfg *config.Config, nonceCache *auth.NonceCache, logger *log.Lo
 	if !verifyCredentialRequest(cfg, nonceCache, logger, reg, w, r, "/spend/"+provider) {
 		return
 	}
-	if provider != spend.ProviderClaude && provider != spend.ProviderCodex && provider != spend.ProviderGemini {
+	// Canonicalize the deprecated "gemini" alias AFTER HMAC verification.
+	provider = spend.CanonicalProvider(provider)
+	if provider != spend.ProviderClaude && provider != spend.ProviderCodex && provider != spend.ProviderAntigravity {
 		writeError(w, http.StatusNotFound, "unknown spend provider")
 		return
 	}
@@ -792,15 +798,22 @@ func pendingPayloadJSON(p registry.ConfigPayload) ([]byte, error) {
 	// from before the mode split only understands the bool map. Both are
 	// derived from the same ProviderModes source so they never disagree.
 	if pm := p.ProviderModes; pm != nil {
+		// Dual-emit the Antigravity provider under BOTH the new "antigravity"
+		// key and the deprecated "gemini" key. Firmware after the rename reads
+		// "antigravity"; deployed firmware still reads "gemini". Both derive
+		// from the same ProviderModeSet field so they never disagree. Drop the
+		// "gemini" key once the fleet has updated.
 		wire["provider_modes"] = map[string]string{
-			"claude": string(pm.Claude),
-			"codex":  string(pm.Codex),
-			"gemini": string(pm.Gemini),
+			"claude":      string(pm.Claude),
+			"codex":       string(pm.Codex),
+			"antigravity": string(pm.Gemini),
+			"gemini":      string(pm.Gemini),
 		}
 		wire["providers"] = map[string]bool{
-			"claude": pm.Claude.Enabled(),
-			"codex":  pm.Codex.Enabled(),
-			"gemini": pm.Gemini.Enabled(),
+			"claude":      pm.Claude.Enabled(),
+			"codex":       pm.Codex.Enabled(),
+			"antigravity": pm.Gemini.Enabled(),
+			"gemini":      pm.Gemini.Enabled(),
 		}
 	}
 	if p.AutorotateEnabled != nil {
@@ -825,13 +838,15 @@ func pendingPayloadJSON(p registry.ConfigPayload) ([]byte, error) {
 		wire["pet_name"] = p.PetName
 	}
 	if len(p.GeminiModels) > 0 {
-		// firmware/config_sync.c reads "gemini_models" as a CSV string
-		// and writes it to NVS key tmon_gem_mdls. The device uses it
-		// purely as a hint for /usage/gemini polling (the broker also
-		// looks at the registry override directly); persisting it on
-		// device makes the override observable in Settings and survive
-		// broker restarts before the next sync.
-		wire["gemini_models"] = strings.Join(p.GeminiModels, ",")
+		// Dual-emit the per-device model override CSV under the new
+		// "antigravity_models" key and the deprecated "gemini_models" key.
+		// firmware/config_sync.c (post-rename) reads "antigravity_models";
+		// deployed firmware reads "gemini_models". The broker also consults
+		// the registry override directly; persisting it on device makes the
+		// override observable in Settings and survive broker restarts.
+		csv := strings.Join(p.GeminiModels, ",")
+		wire["antigravity_models"] = csv
+		wire["gemini_models"] = csv
 	}
 	if p.LogEnabled != nil {
 		// firmware/config_sync.c reads "log_enabled" and writes NVS key

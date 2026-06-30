@@ -1,6 +1,6 @@
 ---
 name: theme
-description: tokenmonitor plugin — switch a TokenMonitor device between Day, Night and Auto themes remotely. Each provider (Claude / Codex / Gemini) has its own brand-tinted palette in both Day and Night flavours; Auto follows the sunrise/sunset of the configured city. Use this when the user says "switch the wall monitor to night mode", "make it dark", "use the day theme", "let it follow the sun", "change the theme on device X", or anything similar.
+description: tokenmonitor plugin — switch a TokenMonitor device between Day, Night and Auto themes remotely. Each provider (Claude / Codex / Antigravity) has its own brand-tinted palette in both Day and Night flavours; Auto follows the sunrise/sunset of the configured city. Use this when the user says "switch the wall monitor to night mode", "make it dark", "use the day theme", "let it follow the sun", "change the theme on device X", or anything similar.
 ---
 
 # /tokenmonitor:theme
@@ -90,7 +90,7 @@ promoted config` log line.
   threshold.
 
 Each provider keeps its own brand-tinted Day and Night palette, so
-switching the active provider (Claude / Codex / Gemini) also shifts
+switching the active provider (Claude / Codex / Antigravity) also shifts
 the colours within the current mode — that is independent of this
 skill.
 

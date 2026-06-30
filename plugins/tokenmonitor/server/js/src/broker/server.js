@@ -282,23 +282,28 @@ async function handleUsage({ cfg, cache, state, registry, logger, usageCache, pr
   const rs = { s: 200 };
   res.on("close", () => { try { state.recordRequest(req.socket.remoteAddress || "", rs.s); } catch {} });
   if (!verifyForPath({ cfg, cache, registry, logger }, req, res, `/usage/${provider}`, rs)) return;
+  // HMAC was verified against the literal path above; only now fold the
+  // deprecated "gemini" wire alias onto the canonical "antigravity" key for
+  // cache/fetcher lookup. Old firmware that signs /usage/gemini keeps working;
+  // new firmware uses /usage/antigravity directly.
+  provider = usage.canonicalProvider(provider);
   if (!usageCache) { rs.s = 503; return writeError(res, 503, "usage disabled (no providers configured)"); }
 
-  // Per-device Gemini override: bypass the shared cache and fetch the
-  // requested model slice. Token cache inside the GeminiFetcher is
+  // Per-device Antigravity override: bypass the shared cache and fetch the
+  // requested model slice. Token cache inside the AntigravityFetcher is
   // preserved.
   try {
     const deviceID = req.headers["x-tmon-device"] || "";
     if (
-      provider === "gemini" &&
+      provider === usage.PROVIDER_ANTIGRAVITY &&
       registry &&
       deviceID &&
       validDeviceID(deviceID) &&
-      typeof usageCache.geminiFetcher === "function"
+      typeof usageCache.antigravityFetcher === "function"
     ) {
       const models = deviceGeminiModels(registry, deviceID);
       if (models.length > 0) {
-        const gf = usageCache.geminiFetcher();
+        const gf = usageCache.antigravityFetcher();
         if (gf) {
           const snap = await gf.fetchWithModels(models);
           snap.fetched_at_unix = Math.floor(Date.now() / 1000);
@@ -355,7 +360,9 @@ async function handleSpend({ cfg, cache, state, registry, logger, spendCache, pr
   const rs = { s: 200 };
   res.on("close", () => { try { state.recordRequest(req.socket.remoteAddress || "", rs.s); } catch {} });
   if (!verifyForPath({ cfg, cache, registry, logger }, req, res, `/spend/${provider}`, rs)) return;
-  if (provider !== "claude" && provider !== "codex" && provider !== "gemini") {
+  // Canonicalize the deprecated "gemini" alias AFTER HMAC verification.
+  provider = spend.canonicalProvider(provider);
+  if (provider !== spend.PROVIDER_CLAUDE && provider !== spend.PROVIDER_CODEX && provider !== spend.PROVIDER_ANTIGRAVITY) {
     rs.s = 404; return writeError(res, 404, "unknown spend provider");
   }
   if (!spendCache) { rs.s = 501; return writeError(res, 501, "spend disabled"); }
@@ -760,9 +767,14 @@ function pendingPayloadJSON(p) {
   // never disagree. (enabled == mode is neither "" nor "disabled".)
   if (p.provider_modes) {
     const pm = p.provider_modes;
-    wire.provider_modes = { claude: pm.claude, codex: pm.codex, gemini: pm.gemini };
+    // Dual-emit the Antigravity provider under BOTH the new "antigravity" key
+    // and the deprecated "gemini" key. Firmware after the rename reads
+    // "antigravity"; deployed firmware still reads "gemini". Both derive from
+    // the same source so they never disagree. Drop "gemini" once the fleet has
+    // updated. Mirror of Go pendingPayloadJSON.
+    wire.provider_modes = { claude: pm.claude, codex: pm.codex, antigravity: pm.gemini, gemini: pm.gemini };
     const en = (m) => m != null && m !== "" && m !== "disabled";
-    wire.providers = { claude: en(pm.claude), codex: en(pm.codex), gemini: en(pm.gemini) };
+    wire.providers = { claude: en(pm.claude), codex: en(pm.codex), antigravity: en(pm.gemini), gemini: en(pm.gemini) };
   }
   if (p.autorotate_enabled != null) wire.autorotate_enabled = p.autorotate_enabled;
   if (p.autorotate_interval_s != null) wire.autorotate_interval_s = p.autorotate_interval_s;
@@ -774,9 +786,13 @@ function pendingPayloadJSON(p) {
   if (p.pet_species != null) wire.pet_species = Number(p.pet_species);
   if (p.pet_name) wire.pet_name = String(p.pet_name);
   if (Array.isArray(p.gemini_models) && p.gemini_models.length > 0) {
-    // firmware/config_sync.c reads "gemini_models" as a CSV string and
-    // writes it to NVS key tmon_gem_mdls.
-    wire.gemini_models = p.gemini_models.map(String).join(",");
+    // Dual-emit the per-device model override CSV under the new
+    // "antigravity_models" key and the deprecated "gemini_models" key.
+    // firmware/config_sync.c (post-rename) reads "antigravity_models";
+    // deployed firmware reads "gemini_models". Mirror of Go pendingPayloadJSON.
+    const csv = p.gemini_models.map(String).join(",");
+    wire.antigravity_models = csv;
+    wire.gemini_models = csv;
   }
   if (p.log_enabled != null) wire.log_enabled = !!p.log_enabled;  // → NVS tmon_log_en
   // OTA staging fields. All-or-nothing: the firmware ignores the bundle

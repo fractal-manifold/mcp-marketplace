@@ -65,10 +65,26 @@ type Slot struct {
 
 // Provider names served at /usage/{name}.
 const (
-	ProviderClaude = "claude"
-	ProviderCodex  = "codex"
+	ProviderClaude      = "claude"
+	ProviderCodex       = "codex"
+	ProviderAntigravity = "antigravity"
+	// ProviderGemini is the DEPRECATED pre-rename wire string for the
+	// Antigravity provider (Google retired the Gemini CLI 2026-06-18).
+	// Deployed firmware still polls /usage/gemini and signs that exact
+	// path, so the broker keeps it as an alias: CanonicalProvider maps it
+	// to ProviderAntigravity AFTER the HMAC check, never before.
 	ProviderGemini = "gemini"
 )
+
+// CanonicalProvider folds the deprecated "gemini" wire alias onto the
+// canonical "antigravity" provider key used for cache/fetcher lookup. Call
+// it only AFTER verifying the request signature against the original path.
+func CanonicalProvider(p string) string {
+	if p == ProviderGemini {
+		return ProviderAntigravity
+	}
+	return p
+}
 
 // Standardised errors. The broker maps these to HTTP statuses; tests
 // assert on the sentinel rather than the message.
@@ -206,15 +222,15 @@ func (c *Cache) Get(ctx context.Context, provider string) (Snapshot, error) {
 	return snap, err
 }
 
-// GeminiFetcher returns the cached GeminiFetcher when one is wired up,
-// for the broker's per-device override path. Returns (nil, false) when
-// Gemini is disabled or wired with a non-Gemini fetcher (tests).
-func (c *Cache) GeminiFetcher() (*GeminiFetcher, bool) {
-	f, ok := c.fetchers[ProviderGemini]
+// AntigravityFetcher returns the cached AntigravityFetcher when one is
+// wired up, for the broker's per-device override path. Returns (nil, false)
+// when Antigravity is disabled or wired with a different fetcher (tests).
+func (c *Cache) AntigravityFetcher() (*AntigravityFetcher, bool) {
+	f, ok := c.fetchers[ProviderAntigravity]
 	if !ok {
 		return nil, false
 	}
-	gf, ok := f.(*GeminiFetcher)
+	gf, ok := f.(*AntigravityFetcher)
 	return gf, ok
 }
 

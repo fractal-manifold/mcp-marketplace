@@ -21,9 +21,22 @@ from .pricing import Pricing, PriceTable
 
 PROVIDER_CLAUDE = "claude"
 PROVIDER_CODEX = "codex"
+PROVIDER_ANTIGRAVITY = "antigravity"
+# PROVIDER_GEMINI is the DEPRECATED pre-rename wire alias. No spend fetcher is
+# registered for Antigravity (the Gemini-CLI JSONL chat logs are gone; the
+# Antigravity CLI writes a proto+SQLite trajectory store with no recoverable
+# per-turn token counts yet — see the 2026-06-30 spike). /spend/antigravity
+# therefore returns the not-implemented error -> the device renders "--" with
+# no stale dollars. Re-enable when a token source lands.
 PROVIDER_GEMINI = "gemini"
 
 MAX_MODELS = 8  # mirrors TMON_SPEND_MAX_MODELS
+
+
+def canonical_provider(p: str) -> str:
+    """Fold the deprecated "gemini" wire alias onto the canonical "antigravity"
+    key. Call only AFTER HMAC verification of the original request path."""
+    return PROVIDER_ANTIGRAVITY if p == PROVIDER_GEMINI else p
 
 
 class SpendError(Exception):
@@ -329,6 +342,12 @@ def codex_records(path: str) -> list[Record]:
 
 # ---------------------------------------------------------------------------
 # Gemini — ~/.gemini/tmp/<project>/chats/session-*.jsonl (per-message)
+#
+# DEAD parser, kept for reference: the Gemini-CLI chat-log JSONL source is gone
+# (the CLI was retired 2026-06-18) and the Antigravity CLI's proto+SQLite
+# trajectory store has no recoverable per-turn token counts yet. No spend
+# fetcher is registered for Antigravity (mirrors Go's spend.go). Re-register
+# this under PROVIDER_ANTIGRAVITY when a token source lands.
 # ---------------------------------------------------------------------------
 
 
@@ -604,17 +623,12 @@ def build_cache(cfg, logger=None) -> Cache | None:
             has_sub=lambda: codex_has_subscription(cfg.codex_auth_path_abs()),
             pricing=pricing,
         )
-    if cfg.gemini.enabled:
-        fetchers[PROVIDER_GEMINI] = ProviderSpend(
-            root=cfg.gemini_tmp_path_abs(),
-            match=lambda n: n.startswith("session-") and n.endswith(".jsonl"),
-            parse=gemini_records,
-            # Always $ for Gemini: free Code-Assist and a paid tier both write
-            # the same local oauth_creds.json, so they can't be told apart
-            # without a remote call. Default to computed $ rather than guess.
-            has_sub=lambda: False,
-            pricing=pricing,
-        )
+    # Antigravity spend is intentionally NOT wired: the Gemini-CLI chat-log
+    # JSONL source is gone, and the Antigravity CLI's proto+SQLite trajectory
+    # store has no recoverable per-turn token counts yet (spike 2026-06-30).
+    # With no fetcher, /spend/antigravity (and the /spend/gemini alias) returns
+    # NotImplementedProvider -> the device renders "--" with no stale dollars.
+    # gemini_records is kept for when a token source lands.
     ttl = cfg.spend.cache_ttl_seconds or 300
     if logger:
         logger.info(f"spend: providers={sorted(fetchers)} cache_ttl={ttl}s")

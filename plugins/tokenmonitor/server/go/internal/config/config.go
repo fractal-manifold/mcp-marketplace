@@ -42,8 +42,14 @@ type Config struct {
 	Auth        Auth        `toml:"auth"`
 	Credentials Credentials `toml:"credentials"`
 	Codex       Codex       `toml:"codex"`
-	Gemini      Gemini      `toml:"gemini"`
-	Usage       Usage       `toml:"usage"`
+	Antigravity Antigravity `toml:"antigravity"`
+	// Gemini is the DEPRECATED pre-rename alias for [antigravity]. Google
+	// retired the Gemini CLI (2026-06-18) in favour of the Antigravity CLI
+	// (`agy`); the provider was renamed accordingly. A legacy tokenmonitor.toml
+	// with a [gemini] section is still honoured — Load() merges it into
+	// Antigravity when the new section is absent.
+	Gemini Gemini `toml:"gemini"`
+	Usage  Usage  `toml:"usage"`
 	Spend       Spend       `toml:"spend"`
 	Pricing     Pricing     `toml:"pricing"`
 	Security    Security    `toml:"security"`
@@ -72,40 +78,59 @@ type Codex struct {
 	AuthPath string `toml:"auth_path"`
 }
 
-// Gemini configures the loadCodeAssist usage probe. CredsPath points at
-// the Gemini CLI's oauth_creds.json; ProjectsPath at its projects.json
-// (used to derive a cloudaicompanionProject — any of the user's projects
-// works). Both are optional; loadCodeAssist accepts an empty project.
+// Antigravity configures the grouped weekly-quota probe for the Antigravity
+// CLI (`agy`, the successor to the retired Gemini CLI). The broker reads agy's
+// consumer OAuth token from the OS keyring (READ-ONLY — agy keeps it fresh)
+// and POSTs to the canary cloudcode-pa host; the quota RPC requires that
+// keyring token (the old oauth_creds.json token is rejected there). Verified
+// end-to-end via a live capture of agy 1.0.13 (2026-06-30).
 //
-// Models is the ordered list of Gemini model IDs the broker surfaces in
-// the `slots` array on /usage/gemini. Max 3 entries — the firmware only
-// renders that many cards. Empty falls back to DefaultGeminiModels.
-type Gemini struct {
-	Enabled      bool     `toml:"enabled"`
-	CredsPath    string   `toml:"creds_path"`
-	ProjectsPath string   `toml:"projects_path"`
-	Models       []string `toml:"models"`
+// KeyringService is the libsecret service name agy stores its token under
+// (`secret-tool lookup service <name>`); default "gemini".
+//
+// CredsPath / ProjectsPath are DEPRECATED leftovers from the old
+// loadCodeAssist-only probe (oauth_creds.json + projects.json). They are no
+// longer read — the keyring token is the only source — but kept in the struct
+// so a legacy tokenmonitor.toml parses without error.
+//
+// Models is the (now ignored) per-model list. The quota is grouped (Gemini
+// Models / Claude+GPT), not per-model, so it no longer affects the result; the
+// field is retained for config back-compat and the per-device override path.
+type Antigravity struct {
+	Enabled        bool     `toml:"enabled"`
+	KeyringService string   `toml:"keyring_service"`
+	CredsPath      string   `toml:"creds_path"`
+	ProjectsPath   string   `toml:"projects_path"`
+	Models         []string `toml:"models"`
 }
 
-// DefaultGeminiModels is what the broker exposes when [gemini].models is
-// empty. Pro is the headline model users care most about; Flash is the
-// high-volume bucket that burns the fastest.
-var DefaultGeminiModels = []string{"gemini-2.5-pro", "gemini-2.5-flash"}
+// Gemini is the DEPRECATED pre-rename config shape, kept structurally
+// identical so a legacy [gemini] section unmarshals and can be merged into
+// Antigravity in Load().
+type Gemini = Antigravity
 
-// MaxGeminiModels caps the number of model slots the broker emits — the
+// DefaultAntigravityModels is what the broker exposes when
+// [antigravity].models is empty. The Antigravity CLI's quota buckets are
+// keyed by model ID (e.g. gemini-3.5-flash-low); we surface the Flash and
+// Pro families — prefix matching tolerates the effort suffix (-low/-medium/
+// -high) Google appends. Verified model IDs: gemini-3.5-flash-{low,medium,
+// high}, gemini-3.1-pro-{low,high} (agy 1.0.13, 2026-06-30).
+var DefaultAntigravityModels = []string{"gemini-3.5-flash", "gemini-3.1-pro"}
+
+// MaxAntigravityModels caps the number of model slots the broker emits — the
 // firmware dashboard has 3 fixed card slots (large/large/small) and
 // ignores anything past index 2.
-const MaxGeminiModels = 3
+const MaxAntigravityModels = 3
 
-// GeminiModels returns the configured list, clamped to MaxGeminiModels.
-// An empty config returns DefaultGeminiModels.
-func (c *Config) GeminiModels() []string {
-	src := c.Gemini.Models
+// AntigravityModels returns the configured list, clamped to
+// MaxAntigravityModels. An empty config returns DefaultAntigravityModels.
+func (c *Config) AntigravityModels() []string {
+	src := c.Antigravity.Models
 	if len(src) == 0 {
-		src = DefaultGeminiModels
+		src = DefaultAntigravityModels
 	}
-	if len(src) > MaxGeminiModels {
-		src = src[:MaxGeminiModels]
+	if len(src) > MaxAntigravityModels {
+		src = src[:MaxAntigravityModels]
 	}
 	out := make([]string, len(src))
 	copy(out, src)
@@ -127,7 +152,11 @@ type Spend struct {
 	ClaudeProjectsPath   string `toml:"claude_projects_path"`
 	ClaudeStatsCachePath string `toml:"claude_stats_cache_path"`
 	CodexSessionsPath    string `toml:"codex_sessions_path"`
-	GeminiTmpPath        string `toml:"gemini_tmp_path"`
+	// AntigravityConvPath is the Antigravity CLI's conversation trajectory
+	// store. GeminiTmpPath is the DEPRECATED pre-rename key, merged into it
+	// in Load() so a legacy tokenmonitor.toml keeps working.
+	AntigravityConvPath string `toml:"antigravity_conversations_path"`
+	GeminiTmpPath       string `toml:"gemini_tmp_path"`
 }
 
 // Pricing is the model price table used to turn tokens into USD. Source of
@@ -222,19 +251,24 @@ func (c *Config) CodexAuthPath() string {
 	return expandUser(c.Codex.AuthPath)
 }
 
-func (c *Config) GeminiCredsPath() string {
-	return expandUser(c.Gemini.CredsPath)
+func (c *Config) AntigravityCredsPath() string {
+	return expandUser(c.Antigravity.CredsPath)
 }
 
-func (c *Config) GeminiProjectsPath() string {
-	return expandUser(c.Gemini.ProjectsPath)
+func (c *Config) AntigravityProjectsPath() string {
+	return expandUser(c.Antigravity.ProjectsPath)
 }
 
 func (c *Config) ClaudeProjectsPath() string   { return expandUser(c.Spend.ClaudeProjectsPath) }
 func (c *Config) ClaudeStatsCachePath() string { return expandUser(c.Spend.ClaudeStatsCachePath) }
 func (c *Config) CodexSessionsPath() string    { return expandUser(c.Spend.CodexSessionsPath) }
-func (c *Config) GeminiTmpPath() string        { return expandUser(c.Spend.GeminiTmpPath) }
-func (c *Config) PricingCachePath() string     { return expandUser(c.Pricing.CachePath) }
+
+// AntigravityConvPath is the per-conversation SQLite trajectory store the
+// Antigravity CLI writes (~/.gemini/antigravity-cli/conversations). It
+// replaces the dead Gemini-CLI chat-log path; the legacy gemini_tmp_path is
+// merged into it in Load() for back-compat.
+func (c *Config) AntigravityConvPath() string { return expandUser(c.Spend.AntigravityConvPath) }
+func (c *Config) PricingCachePath() string    { return expandUser(c.Pricing.CachePath) }
 
 func expandUser(p string) string {
 	if strings.HasPrefix(p, "~/") {
@@ -274,6 +308,13 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse %s: %w", resolved, err)
 	}
 
+	// Back-compat: a legacy tokenmonitor.toml uses [gemini] / gemini_tmp_path
+	// (pre-rename, before the Gemini CLI → Antigravity CLI migration). If the
+	// new [antigravity] section was not provided, fold the deprecated values
+	// forward so existing installs keep working. We detect "provided" by a
+	// non-zero deprecated section against the still-default new one.
+	mergeLegacyGemini(cfg, raw)
+
 	switch {
 	case cfg.Auth.Passphrase != "":
 		if len(cfg.Auth.Passphrase) < 8 {
@@ -298,6 +339,36 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// mergeLegacyGemini folds a deprecated pre-rename [gemini] section /
+// gemini_tmp_path forward into the canonical Antigravity fields when the new
+// keys are absent. Detection uses TOML metadata (key presence) so we don't
+// confuse "not provided" with "set to a zero value".
+func mergeLegacyGemini(cfg *Config, raw []byte) {
+	var probe Config
+	md, err := toml.Decode(string(raw), &probe)
+	if err != nil {
+		return // a parse error is reported by the caller's Unmarshal
+	}
+	if !md.IsDefined("antigravity") && md.IsDefined("gemini") {
+		// Adopt the legacy section, but keep default paths when the legacy
+		// entry left them empty.
+		cfg.Antigravity.Enabled = cfg.Gemini.Enabled
+		if cfg.Gemini.CredsPath != "" {
+			cfg.Antigravity.CredsPath = cfg.Gemini.CredsPath
+		}
+		if cfg.Gemini.ProjectsPath != "" {
+			cfg.Antigravity.ProjectsPath = cfg.Gemini.ProjectsPath
+		}
+		if len(cfg.Gemini.Models) > 0 {
+			cfg.Antigravity.Models = cfg.Gemini.Models
+		}
+	}
+	if !md.IsDefined("spend", "antigravity_conversations_path") &&
+		md.IsDefined("spend", "gemini_tmp_path") && cfg.Spend.GeminiTmpPath != "" {
+		cfg.Spend.AntigravityConvPath = cfg.Spend.GeminiTmpPath
+	}
+}
+
 func defaults() *Config {
 	return &Config{
 		Server: Server{Bind: "127.0.0.1", Port: 8765},
@@ -308,11 +379,17 @@ func defaults() *Config {
 			Enabled:  false,
 			AuthPath: "~/.codex/auth.json",
 		},
-		Gemini: Gemini{
-			Enabled:      false,
+		Antigravity: Antigravity{
+			Enabled: false,
+			// OS keyring service holding agy's consumer OAuth token (the quota
+			// RPC requires it; the oauth_creds.json token is rejected there).
+			// Read via `secret-tool lookup service <name>`.
+			KeyringService: "gemini",
+			// CredsPath/ProjectsPath are deprecated and no longer read; kept
+			// only so a legacy tokenmonitor.toml still parses.
 			CredsPath:    "~/.gemini/oauth_creds.json",
 			ProjectsPath: "~/.gemini/projects.json",
-			// Models left nil so GeminiModels() returns the default —
+			// Models left nil so AntigravityModels() returns the default —
 			// keeps the zero value useful for tests that don't load TOML.
 		},
 		Usage: Usage{
@@ -324,7 +401,7 @@ func defaults() *Config {
 			ClaudeProjectsPath:   "~/.claude/projects",
 			ClaudeStatsCachePath: "~/.claude/stats-cache.json",
 			CodexSessionsPath:    "~/.codex/sessions",
-			GeminiTmpPath:        "~/.gemini/tmp",
+			AntigravityConvPath:  "~/.gemini/antigravity-cli/conversations",
 		},
 		Pricing: Pricing{
 			URL:       "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
@@ -370,20 +447,23 @@ oauth_path = "~/.claude/.credentials.json"
 enabled = false
 auth_path = "~/.codex/auth.json"
 
-[gemini]
-# Enable if you also use the Gemini CLI. The broker reads the OAuth creds
-# the CLI writes, refreshes the access token in memory when needed (never
-# writing back to avoid racing the CLI), and asks cloudcode-pa for the
-# tier. Free tier returns no usage signal; paid tier returns credits.
+[antigravity]
+# Enable if you also use the Antigravity CLI (agy, the successor to the
+# retired Gemini CLI). The broker reads agy's consumer OAuth token from the
+# OS keyring (READ-ONLY — agy keeps it fresh while it runs) and asks the
+# canary cloudcode-pa host for the grouped weekly quota (Gemini Models /
+# Claude+GPT). (A legacy [gemini] section is still accepted and merged here.)
 enabled = false
-creds_path = "~/.gemini/oauth_creds.json"
-projects_path = "~/.gemini/projects.json"
-# Models exposed as dashboard cards (max 3). Default is Pro + Flash.
-# Each entry is a Gemini model ID; prefix matches are tolerated so
-# "gemini-2.5-flash" also resolves "gemini-2.5-flash-002" if Google
-# rotates suffixes. Per-device overrides live in the registry under
-# gemini_models (pushed through /device/<id>/sync).
-# models = ["gemini-2.5-pro", "gemini-2.5-flash"]
+# libsecret service name agy stores its token under
+# (secret-tool lookup service <name>). Default "gemini".
+keyring_service = "gemini"
+# creds_path / projects_path are DEPRECATED and no longer read (the keyring
+# token is the only source); kept so a legacy config still parses.
+# creds_path = "~/.gemini/oauth_creds.json"
+# projects_path = "~/.gemini/projects.json"
+# models is DEPRECATED — the quota is grouped (Gemini Models / Claude+GPT),
+# not per-model, so this no longer affects the output. Retained for back-compat.
+# models = ["gemini-3.5-flash", "gemini-3.1-pro"]
 
 [usage]
 # How long the broker caches each provider's /usage payload before

@@ -22,10 +22,27 @@ import (
 
 // Provider names served at /spend/{name}.
 const (
-	ProviderClaude = "claude"
-	ProviderCodex  = "codex"
+	ProviderClaude      = "claude"
+	ProviderCodex       = "codex"
+	ProviderAntigravity = "antigravity"
+	// ProviderGemini is the DEPRECATED pre-rename wire alias. No spend
+	// fetcher is registered for Antigravity (the Gemini-CLI JSONL chat logs
+	// are gone; the Antigravity CLI writes a proto+SQLite trajectory store
+	// with no recoverable per-turn token counts yet — see the 2026-06-30
+	// spike). /spend/antigravity therefore returns ErrNotImpl → the device
+	// renders "--" with no stale dollars. Re-enable when a token source lands.
 	ProviderGemini = "gemini"
 )
+
+// CanonicalProvider folds the deprecated "gemini" wire alias onto the
+// canonical "antigravity" key. Call only AFTER HMAC verification of the
+// original request path.
+func CanonicalProvider(p string) string {
+	if p == ProviderGemini {
+		return ProviderAntigravity
+	}
+	return p
+}
 
 // MaxModels mirrors TMON_SPEND_MAX_MODELS in the firmware.
 const MaxModels = 8
@@ -754,11 +771,14 @@ type SpendConfig struct {
 	CacheTTLSeconds    int
 	ClaudeProjects     string
 	CodexSessions      string
-	GeminiTmp          string
+	// AntigravityConv is the Antigravity CLI conversation trajectory-store
+	// path. Plumbed for the future spend parser; unused while spend is
+	// deferred (no fetcher registered — see ProviderGemini).
+	AntigravityConv    string
 	ClaudeCredsPath    string
 	CodexAuthPath      string
 	CodexEnabled       bool
-	GeminiEnabled      bool
+	AntigravityEnabled bool
 	PricingURL         string
 	PricingCachePath   string
 	PricingTTLHours    int
@@ -791,19 +811,14 @@ func BuildCache(c SpendConfig, logger Logger) *Cache {
 			fileCache: newFileRecordCache(),
 		}
 	}
-	if c.GeminiEnabled {
-		fetchers[ProviderGemini] = &providerSpend{
-			root:      c.GeminiTmp,
-			match:     func(n string) bool { return strings.HasPrefix(n, "session-") && strings.HasSuffix(n, ".jsonl") },
-			parse:     geminiRecords,
-			// Always $ for Gemini: free Code-Assist and a paid tier both write
-			// the same local oauth_creds.json, so they can't be told apart
-			// without a remote call. Default to computed $ rather than guess.
-			hasSub: func() bool { return false },
-			pricing:   pricing,
-			fileCache: newFileRecordCache(),
-		}
-	}
+	// Antigravity spend is intentionally NOT wired: the Gemini-CLI chat-log
+	// JSONL source is gone, and the Antigravity CLI's proto+SQLite
+	// trajectory store has no recoverable per-turn token counts yet (spike
+	// 2026-06-30). With no fetcher, /spend/antigravity returns ErrNotImpl →
+	// the device renders "--" with no stale dollars. geminiRecords is kept
+	// for when a token source lands (re-register under ProviderAntigravity).
+	_ = c.AntigravityEnabled
+	_ = c.AntigravityConv
 	ttl := time.Duration(c.CacheTTLSeconds) * time.Second
 	if ttl <= 0 {
 		ttl = 300 * time.Second

@@ -49,21 +49,40 @@ class Codex:
 
 
 # Default ordered list of model IDs the broker exposes as `slots` on
-# /usage/gemini when [gemini].models is unset. Pro is the headline model
-# users care most about; Flash is the high-volume bucket.
-DEFAULT_GEMINI_MODELS = ["gemini-2.5-pro", "gemini-2.5-flash"]
+# /usage/antigravity when [antigravity].models is unset. The Antigravity CLI
+# (`agy`, the successor to the retired Gemini CLI) keys its quota buckets by
+# model ID (e.g. gemini-3.5-flash-low); we surface the Flash and Pro families
+# — prefix matching tolerates the effort suffix (-low/-medium/-high) Google
+# appends. Verified model IDs (agy 1.0.13, 2026-06-30):
+# gemini-3.5-flash-{low,medium,high}, gemini-3.1-pro-{low,high}.
+DEFAULT_ANTIGRAVITY_MODELS = ["gemini-3.5-flash", "gemini-3.1-pro"]
 
 # The firmware dashboard has 3 fixed card slots (large/large/small).
 # Slots beyond this index are ignored on device.
-MAX_GEMINI_MODELS = 3
+MAX_ANTIGRAVITY_MODELS = 3
 
 
 @dataclass
-class Gemini:
+class Antigravity:
+    """Config for the loadCodeAssist usage probe of the Antigravity CLI
+    (`agy`, the successor to the retired Gemini CLI). creds_path points at
+    the CLI's oauth_creds.json (still under ~/.gemini/, shared with the
+    legacy layout); projects_path at its projects.json. Both optional."""
+
     enabled: bool = False
     creds_path: str = "~/.gemini/oauth_creds.json"
     projects_path: str = "~/.gemini/projects.json"
+    # OS keyring service holding agy's consumer OAuth token (the quota RPC
+    # requires it; the oauth_creds.json token is rejected there). Read via
+    # `secret-tool lookup service <name>`. Verified via live capture 2026-06-30.
+    keyring_service: str = "gemini"
     models: list[str] = field(default_factory=list)
+
+
+# Gemini is the DEPRECATED pre-rename alias for Antigravity, kept structurally
+# identical so a legacy [gemini] section unmarshals and can be merged into the
+# canonical Antigravity fields in load().
+Gemini = Antigravity
 
 
 @dataclass
@@ -82,7 +101,11 @@ class Spend:
     claude_projects_path: str = "~/.claude/projects"
     claude_stats_cache_path: str = "~/.claude/stats-cache.json"
     codex_sessions_path: str = "~/.codex/sessions"
-    gemini_tmp_path: str = "~/.gemini/tmp"
+    # antigravity_conversations_path is the Antigravity CLI's per-conversation
+    # SQLite trajectory store. gemini_tmp_path is the DEPRECATED pre-rename key,
+    # merged into it in load() so a legacy tokenmonitor.toml keeps working.
+    antigravity_conversations_path: str = "~/.gemini/antigravity-cli/conversations"
+    gemini_tmp_path: str = ""
 
 
 @dataclass
@@ -165,6 +188,10 @@ class Config:
     auth: Auth = field(default_factory=Auth)
     credentials: Credentials = field(default_factory=Credentials)
     codex: Codex = field(default_factory=Codex)
+    antigravity: Antigravity = field(default_factory=Antigravity)
+    # gemini is the DEPRECATED pre-rename alias for [antigravity]. A legacy
+    # tokenmonitor.toml with a [gemini] section is still honoured — load()
+    # merges it into antigravity when the new section is absent.
     gemini: Gemini = field(default_factory=Gemini)
     usage: Usage = field(default_factory=Usage)
     spend: Spend = field(default_factory=Spend)
@@ -184,11 +211,11 @@ class Config:
     def codex_auth_path_abs(self) -> str:
         return str(Path(self.codex.auth_path).expanduser())
 
-    def gemini_creds_path_abs(self) -> str:
-        return str(Path(self.gemini.creds_path).expanduser())
+    def antigravity_creds_path_abs(self) -> str:
+        return str(Path(self.antigravity.creds_path).expanduser())
 
-    def gemini_projects_path_abs(self) -> str:
-        return str(Path(self.gemini.projects_path).expanduser())
+    def antigravity_projects_path_abs(self) -> str:
+        return str(Path(self.antigravity.projects_path).expanduser())
 
     def claude_projects_path_abs(self) -> str:
         return str(Path(self.spend.claude_projects_path).expanduser())
@@ -199,19 +226,19 @@ class Config:
     def codex_sessions_path_abs(self) -> str:
         return str(Path(self.spend.codex_sessions_path).expanduser())
 
-    def gemini_tmp_path_abs(self) -> str:
-        return str(Path(self.spend.gemini_tmp_path).expanduser())
+    def antigravity_conversations_path_abs(self) -> str:
+        return str(Path(self.spend.antigravity_conversations_path).expanduser())
 
     def pricing_cache_path_abs(self) -> str:
         return str(Path(self.pricing.cache_path).expanduser())
 
-    def gemini_models(self) -> list[str]:
-        """Return the configured model list, clamped to MAX_GEMINI_MODELS.
+    def antigravity_models(self) -> list[str]:
+        """Return the configured model list, clamped to MAX_ANTIGRAVITY_MODELS.
 
-        Empty config falls back to DEFAULT_GEMINI_MODELS so the device
-        always sees at least Pro + Flash."""
-        src = self.gemini.models or DEFAULT_GEMINI_MODELS
-        return list(src[:MAX_GEMINI_MODELS])
+        Empty config falls back to DEFAULT_ANTIGRAVITY_MODELS so the device
+        always sees at least Flash + Pro."""
+        src = self.antigravity.models or DEFAULT_ANTIGRAVITY_MODELS
+        return list(src[:MAX_ANTIGRAVITY_MODELS])
 
 
 def _section(raw: dict, name: str, target: object) -> None:
@@ -219,6 +246,33 @@ def _section(raw: dict, name: str, target: object) -> None:
     for key, value in sect.items():
         if hasattr(target, key):
             setattr(target, key, value)
+
+
+def _merge_legacy_gemini(cfg: Config, raw: dict) -> None:
+    """Fold a deprecated pre-rename [gemini] section / gemini_tmp_path forward
+    into the canonical Antigravity fields when the new keys are absent.
+
+    Mirrors Go config.mergeLegacyGemini: a legacy tokenmonitor.toml (written
+    before the Gemini CLI -> Antigravity CLI migration) used [gemini] and
+    spend.gemini_tmp_path. If the new [antigravity] section was not provided,
+    adopt the deprecated values so existing installs keep working. Detection
+    uses key presence in the raw TOML so "not provided" is not confused with
+    "set to a zero value"."""
+    if "antigravity" not in raw and "gemini" in raw:
+        cfg.antigravity.enabled = cfg.gemini.enabled
+        if cfg.gemini.creds_path:
+            cfg.antigravity.creds_path = cfg.gemini.creds_path
+        if cfg.gemini.projects_path:
+            cfg.antigravity.projects_path = cfg.gemini.projects_path
+        if cfg.gemini.models:
+            cfg.antigravity.models = cfg.gemini.models
+    spend_raw = raw.get("spend") or {}
+    if (
+        "antigravity_conversations_path" not in spend_raw
+        and "gemini_tmp_path" in spend_raw
+        and cfg.spend.gemini_tmp_path
+    ):
+        cfg.spend.antigravity_conversations_path = cfg.spend.gemini_tmp_path
 
 
 def load(path: str | None = None) -> Config:
@@ -238,6 +292,7 @@ def load(path: str | None = None) -> Config:
     _section(raw, "auth", cfg.auth)
     _section(raw, "credentials", cfg.credentials)
     _section(raw, "codex", cfg.codex)
+    _section(raw, "antigravity", cfg.antigravity)
     _section(raw, "gemini", cfg.gemini)
     _section(raw, "usage", cfg.usage)
     _section(raw, "spend", cfg.spend)
@@ -261,6 +316,8 @@ def load(path: str | None = None) -> Config:
         OTAKey(key_id=str(k.get("key_id", "")), pubkey_b64=str(k.get("pubkey_b64", "")))
         for k in (ota_raw.get("keys") or [])
     ]
+
+    _merge_legacy_gemini(cfg, raw)
 
     if cfg.auth.psk_passphrase:
         if len(cfg.auth.psk_passphrase) < 8:

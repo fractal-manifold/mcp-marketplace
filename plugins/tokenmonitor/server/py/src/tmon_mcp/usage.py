@@ -1,7 +1,9 @@
 """Per-provider usage fetchers + TTL cache.
 
 Wire-compatible with tokenmonitor-mcp Go internal/usage. See compat/USAGE_WIRE.md
-for the JSON shape served at /usage/{claude,codex,gemini}.
+for the JSON shape served at /usage/{claude,codex,antigravity}. The deprecated
+"gemini" path is still accepted as an alias (canonical_provider) for firmware
+deployed before the Gemini CLI -> Antigravity CLI rename.
 """
 
 from __future__ import annotations
@@ -9,22 +11,36 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import re
+import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Awaitable, Callable, Protocol
 
 import aiohttp
 
 from . import creds
-from .gemini_oauth_client import resolve_gemini_oauth_client
 
 log = logging.getLogger("tmon_mcp.usage")
 
 PROVIDER_CLAUDE = "claude"
 PROVIDER_CODEX = "codex"
+PROVIDER_ANTIGRAVITY = "antigravity"
+# PROVIDER_GEMINI is the DEPRECATED pre-rename wire string for the Antigravity
+# provider (Google retired the Gemini CLI 2026-06-18). Deployed firmware still
+# polls /usage/gemini and signs that exact path, so the broker keeps it as an
+# alias: canonical_provider() maps it to PROVIDER_ANTIGRAVITY AFTER the HMAC
+# check, never before.
 PROVIDER_GEMINI = "gemini"
+
+
+def canonical_provider(p: str) -> str:
+    """Fold the deprecated "gemini" wire alias onto the canonical
+    "antigravity" provider key used for cache/fetcher lookup. Call only AFTER
+    verifying the request signature against the original path."""
+    return PROVIDER_ANTIGRAVITY if p == PROVIDER_GEMINI else p
 
 
 class UsageError(Exception):
@@ -132,12 +148,12 @@ class Cache:
     def providers(self) -> list[str]:
         return sorted(self._fetchers.keys())
 
-    def gemini_fetcher(self) -> "GeminiFetcher | None":
-        """Return the wired GeminiFetcher for the per-device override
-        path. None when Gemini is disabled or a different fetcher
+    def antigravity_fetcher(self) -> "AntigravityFetcher | None":
+        """Return the wired AntigravityFetcher for the per-device override
+        path. None when Antigravity is disabled or a different fetcher
         was injected (tests)."""
-        f = self._fetchers.get(PROVIDER_GEMINI)
-        return f if isinstance(f, GeminiFetcher) else None
+        f = self._fetchers.get(PROVIDER_ANTIGRAVITY)
+        return f if isinstance(f, AntigravityFetcher) else None
 
     async def get(self, session: aiohttp.ClientSession, provider: str) -> Snapshot:
         fetcher = self._fetchers.get(provider)
@@ -375,70 +391,97 @@ def _codex_eta(win: dict) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Gemini
+# Antigravity (agy, successor to the retired Gemini CLI)
 # ---------------------------------------------------------------------------
 
 
-GEMINI_CODE_ASSIST = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
-GEMINI_USER_QUOTA = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota"
-GEMINI_TOKEN_URL = "https://oauth2.googleapis.com/token"
-# Gemini only has a daily quota — no weekly window. We surface the
-# Pro bucket (the headline model users care about most) as session
-# (24h) and leave weekly empty so the device hides that card.
-GEMINI_SESSION_FALLBACK = 86400
-GEMINI_SESSION_MODEL = "gemini-2.5-pro"
+# Antigravity's grouped weekly quota is served from the `daily-` CANARY host,
+# not prod cloudcode-pa (prod 403s the quota RPC). Verified end-to-end via a
+# mitmproxy capture of agy 1.0.13 (2026-06-30) — see the project memory
+# "agy-antigravity-cli-format" for the full recipe.
+ANTIGRAVITY_HOST = "https://daily-cloudcode-pa.googleapis.com/v1internal:"
+GEMINI_CODE_ASSIST = ANTIGRAVITY_HOST + "loadCodeAssist"
+GEMINI_USER_QUOTA = ANTIGRAVITY_HOST + "retrieveUserQuotaSummary"
+# retrieveUserQuotaSummary is a PRIVATE API gated on the registered client
+# User-Agent: without it Google returns 403 PERMISSION_DENIED; with agy's exact
+# UA it returns 200. Send it on every call.
+ANTIGRAVITY_UA = "antigravity/cli/1.0.13 (aidev_client; os_type=linux; arch=amd64)"
+# Antigravity quota is a WEEKLY per-group limit (Gemini Models / Claude+GPT);
+# there is no daily/session window, so the device hides the session card.
+ANTIGRAVITY_WEEKLY = 604800
+# OS keyring service under which agy stores its consumer OAuth token. The token
+# is a JSON value {token:{access_token,refresh_token,expiry},…}; only the
+# access_token is read here (agy keeps it fresh while it runs).
+ANTIGRAVITY_KEYRING_SERVICE = "gemini"
+
+
+def _read_keyring_token(service: str) -> dict | None:
+    """Pull agy's consumer OAuth token from the OS keyring (libsecret) via
+    `secret-tool`. The quota RPC requires THIS token — the gemini-cli token in
+    oauth_creds.json authenticates loadCodeAssist but is rejected (403) by the
+    quota endpoint. Returns the inner token object, or None on any failure (no
+    secret-tool, locked/empty keyring, bad JSON) so the fetcher degrades to "--"
+    rather than crashing. Verified via live capture 2026-06-30."""
+    try:
+        proc = subprocess.run(
+            ["secret-tool", "lookup", "service", service],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    try:
+        d = json.loads(proc.stdout)
+    except Exception:
+        return None
+    tok = d.get("token") if isinstance(d, dict) else None
+    return tok if isinstance(tok, dict) else None
+
+
+def _parse_iso_ms(iso: str) -> int:
+    """Parse an RFC3339 timestamp to epoch milliseconds, or 0 if unparseable
+    (mirrors JS Date.parse(...) || 0)."""
+    if not iso:
+        return 0
+    try:
+        t = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except Exception:
+        return 0
+    return int(t.astimezone(timezone.utc).timestamp() * 1000)
 
 
 @dataclass
-class GeminiFetcher:
-    creds_path: str
-    projects_path: str
-    # Ordered list of model IDs to expose as Snapshot.slots. Empty falls
-    # back to the single Pro bucket; first matched model is mirrored
-    # into session_pct for legacy firmware.
+class AntigravityFetcher:
+    keyring_service: str = ANTIGRAVITY_KEYRING_SERVICE
+    # models/models_for are retained for call-site compatibility with the
+    # per-device override path; the quota is now grouped (Gemini Models /
+    # Claude+GPT), not per-model, so they no longer affect the result.
     models: list[str] = field(default_factory=list)
-    # Optional per-request hook (e.g. honour a per-device override
-    # stored in the registry). When set, supersedes `models`.
     models_for: Callable[[], list[str]] | None = None
     _cached_token: tuple[str, int] = field(default=("", 0))  # (token, expires_at_ms)
 
-    def _models(self) -> list[str]:
-        if self.models_for is not None:
-            m = self.models_for()
-            if m:
-                return list(m)
-        if self.models:
-            return list(self.models)
-        return [GEMINI_SESSION_MODEL]
-
     async def fetch_with_models(self, session: aiohttp.ClientSession, models: list[str]) -> Snapshot:
-        """Like fetch() but uses the supplied model list (e.g. a per-device
-        override) instead of self.models / self.models_for. Token cache is
-        reused — concurrent-safe because the model list is passed through
-        the call stack, not written onto the instance."""
-        return await self._fetch_internal(session, models)
+        """Grouped quota ignores the per-device model slice; kept for call-site
+        compat with the per-device override path in the broker."""
+        return await self._fetch_internal(session)
 
     async def fetch(self, session: aiohttp.ClientSession) -> Snapshot:
-        return await self._fetch_internal(session, self._models())
+        return await self._fetch_internal(session)
 
-    async def _fetch_internal(self, session: aiohttp.ClientSession, models: list[str]) -> Snapshot:
-        token = await self._token(session)
-        body: dict = {
-            "metadata": {
-                "ideType": "IDE_UNSPECIFIED",
-                "platform": "PLATFORM_UNSPECIFIED",
-                "pluginType": "GEMINI",
-            },
-        }
-        proj = self._active_project()
-        if proj:
-            body["cloudaicompanionProject"] = proj
-            body["metadata"]["duetProject"] = proj
+    async def _fetch_internal(self, session: aiohttp.ClientSession) -> Snapshot:
+        token = self._token()
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "User-Agent": ANTIGRAVITY_UA,
         }
+        # agy sends exactly this: ideType ANTIGRAVITY, no pluginType. The
+        # response carries cloudaicompanionProject, used for the quota call.
+        body = {"metadata": {"ideType": "ANTIGRAVITY"}}
         try:
             async with session.post(GEMINI_CODE_ASSIST, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
                 if resp.status == 401:
@@ -452,8 +495,9 @@ class GeminiFetcher:
             raise Transport(str(e)) from e
 
         snap = Snapshot(
-            session_window_seconds=GEMINI_SESSION_FALLBACK,
-            weekly_window_seconds=0,
+            # Weekly-only quota: hide the session/daily card, surface weekly.
+            session_window_seconds=0,
+            weekly_window_seconds=ANTIGRAVITY_WEEKLY,
         )
         paid = doc.get("paidTier")
         current = doc.get("currentTier") or {}
@@ -462,20 +506,20 @@ class GeminiFetcher:
         elif isinstance(current, dict):
             snap.tier = str(current.get("id") or "unknown")
 
-        # retrieveUserQuota is the endpoint gemini-cli itself polls to
-        # drive its usage UI: free and paid tiers both return per-model
-        # buckets with remainingFraction + resetTime. Without this the
-        # device was stuck at 0 % even on heavily-used accounts.
-        quota_proj = str(doc.get("cloudaicompanionProject") or "") or self._active_project()
+        project = str(doc.get("cloudaicompanionProject") or "")
         try:
-            quota = await self._fetch_quota(session, token, quota_proj)
+            quota = await self._fetch_quota(session, token, project)
         except Exception:
+            # ignore — fall back to tier-only snapshot
             quota = None
         if quota:
-            _gemini_apply_quota(snap, quota, time.time(), models)
+            _antigravity_apply_quota(snap, quota, time.time())
         return snap
 
     async def _fetch_quota(self, session: aiohttp.ClientSession, token: str, project: str) -> dict | None:
+        # retrieveUserQuotaSummary requires a top-level `project` (empty body →
+        # 403) and rejects loadCodeAssist-style metadata fields. Verified
+        # 2026-06-30.
         body: dict = {}
         if project:
             body["project"] = project
@@ -483,141 +527,101 @@ class GeminiFetcher:
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "User-Agent": ANTIGRAVITY_UA,
         }
         async with session.post(GEMINI_USER_QUOTA, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
             if resp.status < 200 or resp.status >= 300:
                 return None
             return await _read_json(resp)
 
-    async def _token(self, session: aiohttp.ClientSession) -> str:
-        cached_tok, cached_exp = self._cached_token
+    def _token(self) -> str:
+        """Read-only: agy's consumer token from the keyring. Per the maintainer's
+        choice we do NOT refresh it here — agy keeps it fresh while it runs. A
+        missing/expired token surfaces as CredsMissing/TokenExpired, which the
+        broker maps to 404/503 and the device renders as "--"."""
         now_ms = int(time.time() * 1000)
+        cached_tok, cached_exp = self._cached_token
         if cached_tok and cached_exp - now_ms > 60_000:
             return cached_tok
-
-        p = Path(self.creds_path)
-        if not p.is_file():
-            raise CredsMissing(f"gemini creds file missing: {self.creds_path}")
-        try:
-            disk = json.loads(p.read_text())
-        except Exception as e:
-            raise ParseUpstream(f"gemini creds parse error: {e}") from e
-
-        access = disk.get("access_token") or ""
-        refresh = disk.get("refresh_token") or ""
-        expiry = int(disk.get("expiry_date") or 0)
-        if access and expiry - now_ms > 60_000:
-            self._cached_token = (access, expiry)
-            return access
-        if not refresh:
-            raise TokenExpired("token expired and no refresh_token available")
-
-        oauth = await resolve_gemini_oauth_client(session)
-        form = {
-            "client_id": oauth.client_id,
-            "client_secret": oauth.client_secret,
-            "grant_type": "refresh_token",
-            "refresh_token": refresh,
-        }
-        try:
-            async with session.post(GEMINI_TOKEN_URL, data=form, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status < 200 or resp.status >= 300:
-                    body = await resp.text()
-                    raise Unauthorized(f"refresh failed: status={resp.status} body={body[:200]}")
-                out = await _read_json(resp)
-        except aiohttp.ClientError as e:
-            raise Transport(str(e)) from e
-
-        new_tok = out.get("access_token") or ""
-        if not new_tok:
-            raise ParseUpstream("refresh returned empty access_token")
-        new_exp = now_ms + int(out.get("expires_in") or 3600) * 1000
-        self._cached_token = (new_tok, new_exp)
-        return new_tok
-
-    def _active_project(self) -> str:
-        p = Path(self.projects_path)
-        if not p.is_file():
-            return ""
-        try:
-            doc = json.loads(p.read_text())
-        except Exception:
-            return ""
-        projects = doc.get("projects") or {}
-        for v in projects.values():
-            return str(v)
-        return ""
+        t = _read_keyring_token(self.keyring_service)
+        if not t or not t.get("access_token"):
+            raise CredsMissing(
+                f'antigravity keyring token not found (service="{self.keyring_service}"; sign in with agy)'
+            )
+        exp_ms = _parse_iso_ms(t.get("expiry") or "")
+        if exp_ms and exp_ms - now_ms < 60_000:
+            raise TokenExpired("antigravity keyring token expired (run agy to refresh it)")
+        self._cached_token = (t["access_token"], exp_ms or (now_ms + 300_000))
+        return t["access_token"]
 
 
-def _gemini_pick_bucket(buckets: list[dict], model_id: str) -> dict | None:
-    for b in buckets:
-        if b.get("modelId") == model_id:
-            return b
-    # Prefix fallback covers version drift (e.g. -flash → -flash-002).
-    for b in buckets:
-        mid = b.get("modelId") or ""
-        if isinstance(mid, str) and mid.startswith(model_id):
-            return b
-    return None
-
-
-def _gemini_used_pct(remaining_fraction: float) -> float:
-    if remaining_fraction < 0:
-        remaining_fraction = 0.0
-    elif remaining_fraction > 1:
-        remaining_fraction = 1.0
-    return (1 - remaining_fraction) * 100
+def _gemini_used_pct(remaining_fraction) -> float:
+    try:
+        r = float(remaining_fraction)
+    except (TypeError, ValueError):
+        r = 0.0
+    if not math.isfinite(r) or r < 0:
+        r = 0.0
+    elif r > 1:
+        r = 1.0
+    return (1 - r) * 100
 
 
 def _gemini_reset_eta(iso: str, now_unix: float) -> int:
     if not iso:
         return 0
-    eta = _seconds_until_iso(iso, now_unix)
-    return max(0, int(eta))
+    return max(0, int(_seconds_until_iso(iso, now_unix)))
 
 
-def _gemini_apply_quota(
-    snap: Snapshot, quota: dict, now_unix: float, models: list[str]
-) -> None:
-    buckets = quota.get("buckets") or []
-    if not isinstance(buckets, list):
-        return
-    if not models:
-        models = [GEMINI_SESSION_MODEL]
-    if len(models) > 3:
-        models = models[:3]
-    first = True
-    for m in models:
-        b = _gemini_pick_bucket(buckets, m)
+def _antigravity_apply_quota(snap: Snapshot, quota: dict, now_unix: float) -> None:
+    """Map the real retrieveUserQuotaSummary response —
+    {groups:[{displayName,description,buckets:[{window,resetTime,remainingFraction}]}]}
+    — onto the device snapshot. Each group becomes one weekly slot; the
+    "Gemini Models" group drives the headline weekly bar (maintainer's choice),
+    falling back to the first group if no Gemini group is present. Verified
+    against a live capture (agy 1.0.13, 2026-06-30)."""
+    groups = quota.get("groups") if isinstance(quota, dict) else None
+    if not isinstance(groups, list):
+        groups = []
+    headline_set = False
+    for g in groups:
+        if not isinstance(g, dict):
+            continue
+        gbuckets = g.get("buckets")
+        if not isinstance(gbuckets, list):
+            gbuckets = []
+        b = next((x for x in gbuckets if isinstance(x, dict) and x.get("window") == "weekly"), None)
+        if b is None:
+            b = gbuckets[0] if gbuckets and isinstance(gbuckets[0], dict) else None
         if b is None:
             continue
-        pct = _gemini_used_pct(float(b.get("remainingFraction") or 0))
+        pct = _gemini_used_pct(b.get("remainingFraction"))
         eta = _gemini_reset_eta(str(b.get("resetTime") or ""), now_unix)
         snap.slots.append(Slot(
-            label=_gemini_label(m),
+            label=_antigravity_group_label(g.get("displayName")),
             pct=pct,
-            window_seconds=GEMINI_SESSION_FALLBACK,
+            window_seconds=ANTIGRAVITY_WEEKLY,
             reset_eta_seconds=eta,
         ))
-        if first:
-            snap.session_pct = pct
-            snap.session_reset_eta_seconds = eta
-            first = False
+        is_gemini = "gemini" in str(g.get("displayName") or "").lower() or str(
+            b.get("bucketId") or ""
+        ).lower().startswith("gemini")
+        if is_gemini and not headline_set:
+            snap.weekly_pct = pct
+            snap.weekly_reset_eta_seconds = eta
+            headline_set = True
+    if not headline_set and snap.slots:
+        snap.weekly_pct = snap.slots[0].pct
+        snap.weekly_reset_eta_seconds = snap.slots[0].reset_eta_seconds
 
 
-def _gemini_label(model_id: str) -> str:
-    """Pill text rendered on the card: 'gemini-2.5-pro' → 'Pro'."""
-    tail = model_id
-    if tail.startswith("gemini-"):
-        tail = tail[len("gemini-"):]
-        # Strip the version segment ("2.5-").
-        if "-" in tail:
-            tail = tail.split("-", 1)[1]
-    if not tail:
-        return model_id
-    parts = [p[:1].upper() + p[1:] if p else p for p in tail.split("-")]
-    out = "-".join(parts)
-    return out[:15]
+def _antigravity_group_label(display_name) -> str:
+    """Group pill label: "Gemini Models" → "Gemini", "Claude and GPT models" →
+    "Claude and GPT". Capped to the device's 15-char slot label budget."""
+    s = re.sub(r"\s+models$", "", str(display_name or "").strip(), flags=re.IGNORECASE)
+    if not s:
+        return "Quota"
+    return s[:15] if len(s) > 15 else s
 
 
 # ---------------------------------------------------------------------------
@@ -632,11 +636,13 @@ def build_cache(cfg) -> Cache | None:
     }
     if cfg.codex.enabled:
         fetchers[PROVIDER_CODEX] = CodexFetcher(auth_path=cfg.codex_auth_path_abs())
-    if cfg.gemini.enabled:
-        fetchers[PROVIDER_GEMINI] = GeminiFetcher(
-            creds_path=cfg.gemini_creds_path_abs(),
-            projects_path=cfg.gemini_projects_path_abs(),
-            models=cfg.gemini_models(),
+    if cfg.antigravity.enabled:
+        # Registered under the canonical "antigravity" key. The broker folds the
+        # deprecated /usage/gemini alias onto it AFTER HMAC verification. The
+        # quota RPC needs agy's keyring token, not the on-disk oauth_creds.json.
+        fetchers[PROVIDER_ANTIGRAVITY] = AntigravityFetcher(
+            keyring_service=cfg.antigravity.keyring_service or "gemini",
+            models=cfg.antigravity_models(),
         )
     ttl = cfg.usage.cache_ttl_seconds or 30
     log.info("usage: providers=%s cache_ttl=%ss", sorted(fetchers.keys()), ttl)

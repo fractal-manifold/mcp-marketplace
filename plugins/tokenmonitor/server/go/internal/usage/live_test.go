@@ -96,24 +96,26 @@ func TestLiveCodex(t *testing.T) {
 	t.Logf("Codex live OK: %+v", snap)
 }
 
-func TestLiveGemini(t *testing.T) {
+func TestLiveAntigravity(t *testing.T) {
 	liveSkipUnless(t, "TMON_LIVE_GEMINI")
-	creds := homePath(t, ".gemini/oauth_creds.json")
-	projects := homePath(t, ".gemini/projects.json")
-	if _, err := os.Stat(creds); err != nil {
-		t.Skipf("no Gemini creds at %s: %v", creds, err)
-	}
-	f := &GeminiFetcher{CredsPath: creds, ProjectsPath: projects}
+	// Antigravity now reads agy's consumer token from the OS keyring
+	// (libsecret) — no creds file. Verified end-to-end against the live
+	// Google API (agy 1.0.13, 2026-06-30).
+	f := &AntigravityFetcher{KeyringService: "gemini"}
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	snap, err := f.Fetch(ctx)
 	if err != nil {
-		t.Fatalf("Gemini live fetch failed (URL or schema may have drifted): %v", err)
+		t.Fatalf("Antigravity live fetch failed (URL/UA/token or schema may have drifted): %v", err)
 	}
 	if snap.Tier == "" || snap.Tier == "unknown" {
 		t.Errorf("tier should be free-tier or a paid id, got %q", snap.Tier)
 	}
-	// We can't strongly assert percentages — free tier returns 0 with
-	// no quota signal, and paid tier mapping is still TODO. Just smoke.
-	t.Logf("Gemini live OK: %+v", snap)
+	if snap.WeeklyWindowSeconds != antigravityWeekly {
+		t.Errorf("weekly window: got %d want %d", snap.WeeklyWindowSeconds, antigravityWeekly)
+	}
+	if snap.SessionWindowSeconds != 0 {
+		t.Errorf("session window should be hidden (0), got %d", snap.SessionWindowSeconds)
+	}
+	t.Logf("Antigravity live OK: %+v", snap)
 }

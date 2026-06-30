@@ -92,7 +92,8 @@ func registerDiscoveryTools(s *server.MCPServer, d Deps) {
 			mcp.WithBoolean("pet_enabled", mcp.Description("Show the on-device virtual pet (default true). Device-owned like the display settings; pass false to hide it. Same setting as tokenmonitor_set_device_pending's pet_enabled.")),
 			mcp.WithBoolean("provider_claude", mcp.Description("Enable Claude provider.")),
 			mcp.WithBoolean("provider_codex",  mcp.Description("Enable Codex provider.")),
-			mcp.WithBoolean("provider_gemini", mcp.Description("Enable Gemini provider.")),
+			mcp.WithBoolean("provider_antigravity", mcp.Description("Enable Antigravity provider (tracks the `agy` CLI, successor to Gemini).")),
+			mcp.WithBoolean("provider_gemini", mcp.Description("Deprecated alias of provider_antigravity, accepted for backward compatibility.")),
 		),
 		handleProvision(d),
 	)
@@ -272,8 +273,9 @@ func handleProvision(d Deps) server.ToolHandlerFunc {
 		}
 		_, hasClaude := args["provider_claude"]
 		_, hasCodex := args["provider_codex"]
+		_, hasAnti := args["provider_antigravity"]
 		_, hasGemini := args["provider_gemini"]
-		if hasClaude || hasCodex || hasGemini {
+		if hasClaude || hasCodex || hasAnti || hasGemini {
 			p := map[string]bool{}
 			if hasClaude {
 				p["claude"] = req.GetBool("provider_claude", false)
@@ -281,7 +283,11 @@ func handleProvision(d Deps) server.ToolHandlerFunc {
 			if hasCodex {
 				p["codex"] = req.GetBool("provider_codex", false)
 			}
-			if hasGemini {
+			// Antigravity: prefer the new arg, fall back to the deprecated
+			// provider_gemini. The internal registry key stays "gemini".
+			if hasAnti {
+				p["gemini"] = req.GetBool("provider_antigravity", false)
+			} else if hasGemini {
 				p["gemini"] = req.GetBool("provider_gemini", false)
 			}
 			payload.Providers = p

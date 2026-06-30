@@ -72,10 +72,10 @@ section" or "the Audio settings".
 | --------------------------------- | -------------------------- | ---------------------------------- |
 | Set Claude provider mode          | `provider_mode_claude`     | `auto` \| `disabled` \| `subscription` \| `api_key` |
 | Set Codex provider mode           | `provider_mode_codex`      | `auto` \| `disabled` \| `subscription` \| `api_key` |
-| Set Gemini provider mode          | `provider_mode_gemini`     | `auto` \| `disabled` \| `subscription` \| `api_key` |
+| Set Antigravity provider mode     | `provider_mode_antigravity`| `auto` \| `disabled` \| `subscription` \| `api_key` |
 | Enable/disable Claude (coarse)    | `provider_claude`          | bool (legacy: true→auto, false→disabled) |
 | Enable/disable Codex (coarse)     | `provider_codex`           | bool (legacy: true→auto, false→disabled) |
-| Enable/disable Gemini (coarse)    | `provider_gemini`          | bool (legacy: true→auto, false→disabled) |
+| Enable/disable Antigravity (coarse)| `provider_antigravity`    | bool (legacy: true→auto, false→disabled) |
 
 Mode meanings: `disabled` hides the provider; `auto` trusts the broker's
 credential detection (subscription vs pay-as-you-go); `subscription` forces
@@ -83,6 +83,13 @@ the dashboard's quota-% view; `api_key` forces the $-spend view. The
 `provider_mode_*` arg wins over `provider_*` when both are given. "Disable
 Codex" → `provider_mode_codex=disabled`; "show Claude as API spend" →
 `provider_mode_claude=api_key`.
+
+The third provider was renamed **Gemini → Antigravity** (the tracked tool is
+now Google's `agy` CLI; it still runs the Gemini-family models). Prefer the
+`*_antigravity` arg names (`provider_mode_antigravity`, `provider_antigravity`,
+and the model-hint `antigravity_models`); the legacy `*_gemini` names
+(`provider_mode_gemini`, `provider_gemini`, `gemini_models`) are still accepted
+as aliases.
 
 #### Display
 
@@ -288,7 +295,7 @@ tokenmonitor_set_device_pending
   vol: 0
 ```
 
-### Disable Codex, keep Claude and Gemini, rotate every 45 s
+### Disable Codex, keep Claude and Antigravity, rotate every 45 s
 
 ```
 tokenmonitor_set_device_pending

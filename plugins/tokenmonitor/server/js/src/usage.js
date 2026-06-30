@@ -2,12 +2,24 @@
 // Wire-compatible with tokenmonitor-mcp Go internal/usage and tokenmonitor-mcp-py tmon_mcp.usage.
 // See compat/USAGE_WIRE.md for the JSON shape served at /usage/{provider}.
 
-import { existsSync, readFileSync } from "node:fs";
-import { resolveGeminiOAuthClient } from "./geminiOAuthClient.js";
+import { execFileSync } from "node:child_process";
 
 export const PROVIDER_CLAUDE = "claude";
 export const PROVIDER_CODEX = "codex";
+export const PROVIDER_ANTIGRAVITY = "antigravity";
+// PROVIDER_GEMINI is the DEPRECATED pre-rename wire string for the Antigravity
+// provider (Google retired the Gemini CLI 2026-06-18). Deployed firmware still
+// polls /usage/gemini and signs that exact path, so the broker keeps it as an
+// alias: canonicalProvider() maps it to PROVIDER_ANTIGRAVITY AFTER the HMAC
+// check, never before.
 export const PROVIDER_GEMINI = "gemini";
+
+// canonicalProvider folds the deprecated "gemini" wire alias onto the
+// canonical "antigravity" provider key used for cache/fetcher lookup. Call it
+// only AFTER verifying the request signature against the original path.
+export function canonicalProvider(p) {
+  return p === PROVIDER_GEMINI ? PROVIDER_ANTIGRAVITY : p;
+}
 
 // Error sentinels — broker maps each to an HTTP status. Carrying the
 // class identity (instead of a tagged string) lets the broker keep using
@@ -62,11 +74,11 @@ export class Cache {
     return Object.keys(this.fetchers).sort();
   }
 
-  geminiFetcher() {
-    // Return the wired GeminiFetcher for the per-device override path,
-    // or null if Gemini is disabled.
-    const f = this.fetchers[PROVIDER_GEMINI];
-    return f instanceof GeminiFetcher ? f : null;
+  antigravityFetcher() {
+    // Return the wired AntigravityFetcher for the per-device override path,
+    // or null if Antigravity is disabled.
+    const f = this.fetchers[PROVIDER_ANTIGRAVITY];
+    return f instanceof AntigravityFetcher ? f : null;
   }
 
   async get(provider) {
@@ -290,75 +302,85 @@ function codexEta(win) {
 }
 
 // -----------------------------------------------------------------------
-// Gemini
+// Antigravity (agy, successor to the retired Gemini CLI)
 // -----------------------------------------------------------------------
 
-const GEMINI_CODE_ASSIST = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
-const GEMINI_USER_QUOTA = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
-const GEMINI_TOKEN_URL = "https://oauth2.googleapis.com/token";
-// Gemini only has a daily quota — no weekly window. We surface the
-// Pro bucket (the headline model users care about most) as session
-// (24h) and leave weekly empty so the device hides that card.
-const GEMINI_SESSION_FALLBACK = 86400;
-const GEMINI_SESSION_MODEL = "gemini-2.5-pro";
+// Antigravity's grouped weekly quota is served from the `daily-` CANARY host,
+// not prod cloudcode-pa (prod 403s the quota RPC). Verified end-to-end via a
+// mitmproxy capture of agy 1.0.13 (2026-06-30) — see the project memory
+// "agy-antigravity-cli-format" for the full recipe.
+const ANTIGRAVITY_HOST = "https://daily-cloudcode-pa.googleapis.com/v1internal:";
+const GEMINI_CODE_ASSIST = ANTIGRAVITY_HOST + "loadCodeAssist";
+const GEMINI_USER_QUOTA = ANTIGRAVITY_HOST + "retrieveUserQuotaSummary";
+// retrieveUserQuotaSummary is a PRIVATE API gated on the registered client
+// User-Agent: without it Google returns 403 PERMISSION_DENIED; with agy's exact
+// UA it returns 200. Send it on every call.
+const ANTIGRAVITY_UA = "antigravity/cli/1.0.13 (aidev_client; os_type=linux; arch=amd64)";
+// Antigravity quota is a WEEKLY per-group limit (Gemini Models / Claude+GPT);
+// there is no daily/session window, so the device hides the session card.
+const ANTIGRAVITY_WEEKLY = 604800;
+// OS keyring service under which agy stores its consumer OAuth token. The token
+// is a JSON value {token:{access_token,refresh_token,expiry},…}; only the
+// access_token is read here (agy keeps it fresh while it runs).
+const ANTIGRAVITY_KEYRING_SERVICE = "gemini";
 
-export class GeminiFetcher {
-  constructor({ credsPath, projectsPath, models = [], modelsFor = null } = {}) {
-    this.credsPath = credsPath;
-    this.projectsPath = projectsPath;
-    // Ordered list of model IDs to expose as Snapshot.slots. Empty
-    // falls back to the single Pro bucket; first matched model is
-    // mirrored into session_pct for legacy firmware.
+// readKeyringToken pulls agy's consumer OAuth token from the OS keyring
+// (libsecret) via `secret-tool`. The quota RPC requires THIS token — the
+// gemini-cli token in oauth_creds.json authenticates loadCodeAssist but is
+// rejected (403) by the quota endpoint. Returns the inner token object, or
+// null on any failure (no secret-tool, locked/empty keyring, bad JSON) so the
+// fetcher degrades to "--" rather than crashing.
+function readKeyringToken(service) {
+  let raw;
+  try {
+    raw = execFileSync("secret-tool", ["lookup", "service", service], {
+      encoding: "utf8",
+      timeout: 5000,
+    });
+  } catch {
+    return null;
+  }
+  try {
+    const d = JSON.parse(raw);
+    return d && typeof d.token === "object" ? d.token : null;
+  } catch {
+    return null;
+  }
+}
+
+export class AntigravityFetcher {
+  constructor({ keyringService = ANTIGRAVITY_KEYRING_SERVICE, models = [], modelsFor = null } = {}) {
+    this.keyringService = keyringService;
+    // models/modelsFor are retained for call-site compatibility with the
+    // per-device override path; the quota is now grouped (Gemini Models /
+    // Claude+GPT), not per-model, so they no longer affect the result.
     this.models = models;
-    // Optional per-request hook (returns string[]). When set, this
-    // takes precedence over `models` and lets the broker honour a
-    // per-device override stored in the registry.
     this.modelsFor = modelsFor;
     this._cachedToken = { token: "", expiresAtMs: 0 };
   }
 
-  _modelsForRequest() {
-    if (typeof this.modelsFor === "function") {
-      const m = this.modelsFor();
-      if (Array.isArray(m) && m.length > 0) return m;
-    }
-    if (this.models && this.models.length > 0) return this.models;
-    return [GEMINI_SESSION_MODEL];
-  }
-
-  async fetchWithModels(models) {
-    // Same upstream call as fetch() but honour the supplied model
-    // slice (per-device override). Token cache is reused since we
-    // share the receiver — the model list is passed via parameter.
-    return this._fetchInternal(models);
+  async fetchWithModels() {
+    // Grouped quota ignores the per-device model slice; kept for call-site compat.
+    return this._fetchInternal();
   }
 
   async fetch() {
-    return this._fetchInternal(this._modelsForRequest());
+    return this._fetchInternal();
   }
 
-  async _fetchInternal(models) {
-    const tok = await this._token();
-    const body = {
-      metadata: {
-        ideType: "IDE_UNSPECIFIED",
-        platform: "PLATFORM_UNSPECIFIED",
-        pluginType: "GEMINI",
-      },
-    };
-    const proj = this._activeProject();
-    if (proj) {
-      body.cloudaicompanionProject = proj;
-      body.metadata.duetProject = proj;
-    }
+  async _fetchInternal() {
+    const tok = this._token();
     const resp = await doFetch(GEMINI_CODE_ASSIST, {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${tok}`,
         "Content-Type": "application/json",
         "Accept": "application/json",
+        "User-Agent": ANTIGRAVITY_UA,
       },
-      body: JSON.stringify(body),
+      // agy sends exactly this: ideType ANTIGRAVITY, no pluginType. The
+      // response carries cloudaicompanionProject, used for the quota call.
+      body: JSON.stringify({ metadata: { ideType: "ANTIGRAVITY" } }),
     }, 20000);
     if (resp.status === 401) throw new Unauthorized("upstream rejected token");
     if (resp.status === 429) throw new RateLimited(retryAfterFromHeaders(resp.headers));
@@ -366,22 +388,19 @@ export class GeminiFetcher {
     const doc = await readJSON(resp);
 
     const snap = emptySnapshot();
-    snap.session_window_seconds = GEMINI_SESSION_FALLBACK;
-    snap.weekly_window_seconds = 0;
+    // Weekly-only quota: hide the session/daily card, surface the weekly one.
+    snap.session_window_seconds = 0;
+    snap.weekly_window_seconds = ANTIGRAVITY_WEEKLY;
     if (doc.paidTier && typeof doc.paidTier === "object") {
       snap.tier = String(doc.paidTier.id || "paid");
     } else if (doc.currentTier && typeof doc.currentTier === "object") {
       snap.tier = String(doc.currentTier.id || "unknown");
     }
 
-    // retrieveUserQuota is the endpoint gemini-cli itself polls for its
-    // usage UI: both free and paid tiers return per-model buckets with
-    // remainingFraction and resetTime. Without this the device stays at
-    // 0 % even when the account has been heavily used.
-    const quotaProj = String(doc.cloudaicompanionProject || "") || this._activeProject();
+    const project = String(doc.cloudaicompanionProject || "");
     try {
-      const quota = await this._fetchQuota(tok, quotaProj);
-      if (quota) geminiApplyQuota(snap, quota, Date.now() / 1000, models);
+      const quota = await this._fetchQuota(tok, project);
+      if (quota) antigravityApplyQuota(snap, quota, Date.now() / 1000);
     } catch {
       // ignore — fall back to tier-only snapshot
     }
@@ -389,13 +408,17 @@ export class GeminiFetcher {
   }
 
   async _fetchQuota(token, project) {
-    const body = project ? { project } : {};
+    // retrieveUserQuotaSummary requires a top-level `project` (empty body → 403)
+    // and rejects loadCodeAssist-style metadata fields. Verified 2026-06-30.
+    const body = {};
+    if (project) body.project = project;
     const resp = await doFetch(GEMINI_USER_QUOTA, {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${token}`,
         "Content-Type": "application/json",
         "Accept": "application/json",
+        "User-Agent": ANTIGRAVITY_UA,
       },
       body: JSON.stringify(body),
     }, 20000);
@@ -403,73 +426,26 @@ export class GeminiFetcher {
     return await readJSON(resp);
   }
 
-  async _token() {
+  // Read-only: agy's consumer token from the keyring. Per the maintainer's
+  // choice we do NOT refresh it here — agy keeps it fresh while it runs. A
+  // missing/expired token surfaces as CredsMissing/TokenExpired, which the
+  // broker maps to 404/503 and the device renders as "--".
+  _token() {
     const nowMs = Date.now();
     if (this._cachedToken.token && this._cachedToken.expiresAtMs - nowMs > 60_000) {
       return this._cachedToken.token;
     }
-    if (!existsSync(this.credsPath)) throw new CredsMissing(`gemini creds file missing: ${this.credsPath}`);
-    let disk;
-    try {
-      disk = JSON.parse(readFileSync(this.credsPath, "utf8"));
-    } catch (e) {
-      throw new ParseUpstream(`gemini creds parse error: ${e.message}`);
+    const t = readKeyringToken(this.keyringService);
+    if (!t || !t.access_token) {
+      throw new CredsMissing(`antigravity keyring token not found (service="${this.keyringService}"; sign in with agy)`);
     }
-    const access = disk.access_token || "";
-    const refresh = disk.refresh_token || "";
-    const expiry = Number(disk.expiry_date || 0);
-    if (access && expiry - nowMs > 60_000) {
-      this._cachedToken = { token: access, expiresAtMs: expiry };
-      return access;
+    const expMs = Date.parse(t.expiry || "") || 0;
+    if (expMs && expMs - nowMs < 60_000) {
+      throw new TokenExpired("antigravity keyring token expired (run agy to refresh it)");
     }
-    if (!refresh) throw new TokenExpired("token expired and no refresh_token available");
-
-    const oauth = await resolveGeminiOAuthClient({ fetchImpl: doFetch });
-    const form = new URLSearchParams({
-      client_id: oauth.clientId,
-      client_secret: oauth.clientSecret,
-      grant_type: "refresh_token",
-      refresh_token: refresh,
-    });
-    const resp = await doFetch(GEMINI_TOKEN_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: form.toString(),
-    });
-    if (resp.status < 200 || resp.status >= 300) {
-      const text = await resp.text().catch(() => "");
-      throw new Unauthorized(`refresh failed: status=${resp.status} body=${text.slice(0, 200)}`);
-    }
-    const out = await readJSON(resp);
-    const newTok = out.access_token || "";
-    if (!newTok) throw new ParseUpstream("refresh returned empty access_token");
-    const newExp = nowMs + Number(out.expires_in || 3600) * 1000;
-    this._cachedToken = { token: newTok, expiresAtMs: newExp };
-    return newTok;
+    this._cachedToken = { token: t.access_token, expiresAtMs: expMs || (nowMs + 300_000) };
+    return t.access_token;
   }
-
-  _activeProject() {
-    if (!existsSync(this.projectsPath)) return "";
-    try {
-      const doc = JSON.parse(readFileSync(this.projectsPath, "utf8"));
-      const projects = doc?.projects || {};
-      for (const v of Object.values(projects)) return String(v);
-    } catch {
-      // Ignore — empty project is acceptable to loadCodeAssist.
-    }
-    return "";
-  }
-}
-
-function geminiPickBucket(buckets, modelId) {
-  for (const b of buckets) {
-    if (b && b.modelId === modelId) return b;
-  }
-  // Prefix fallback covers version drift (e.g. -flash → -flash-002).
-  for (const b of buckets) {
-    if (b && typeof b.modelId === "string" && b.modelId.startsWith(modelId)) return b;
-  }
-  return null;
 }
 
 function geminiUsedPct(remainingFraction) {
@@ -487,42 +463,47 @@ function geminiResetEta(iso, nowSec) {
   return Math.max(0, eta);
 }
 
-function geminiApplyQuota(snap, quota, nowSec, models) {
-  const buckets = Array.isArray(quota?.buckets) ? quota.buckets : [];
-  let list = Array.isArray(models) && models.length > 0 ? models : [GEMINI_SESSION_MODEL];
-  if (list.length > 3) list = list.slice(0, 3);
-  let first = true;
-  for (const m of list) {
-    const b = geminiPickBucket(buckets, m);
+// antigravityApplyQuota maps the real retrieveUserQuotaSummary response —
+// {groups:[{displayName,description,buckets:[{window,resetTime,remainingFraction}]}]}
+// — onto the device snapshot. Each group becomes one weekly slot; the
+// "Gemini Models" group drives the headline weekly bar (maintainer's choice),
+// falling back to the first group if no Gemini group is present. Verified
+// against a live capture (agy 1.0.13, 2026-06-30).
+function antigravityApplyQuota(snap, quota, nowSec) {
+  const groups = Array.isArray(quota?.groups) ? quota.groups : [];
+  let headlineSet = false;
+  for (const g of groups) {
+    const gbuckets = Array.isArray(g?.buckets) ? g.buckets : [];
+    const b = gbuckets.find((x) => x && x.window === "weekly") || gbuckets[0];
     if (!b) continue;
     const pct = geminiUsedPct(b.remainingFraction);
     const eta = geminiResetEta(b.resetTime, nowSec);
     snap.slots.push({
-      label: geminiLabel(m),
+      label: antigravityGroupLabel(g.displayName),
       pct,
-      window_seconds: GEMINI_SESSION_FALLBACK,
+      window_seconds: ANTIGRAVITY_WEEKLY,
       reset_eta_seconds: eta,
     });
-    if (first) {
-      snap.session_pct = pct;
-      snap.session_reset_eta_seconds = eta;
-      first = false;
+    const isGemini = /gemini/i.test(String(g.displayName || "")) ||
+      String(b.bucketId || "").toLowerCase().startsWith("gemini");
+    if (isGemini && !headlineSet) {
+      snap.weekly_pct = pct;
+      snap.weekly_reset_eta_seconds = eta;
+      headlineSet = true;
     }
+  }
+  if (!headlineSet && snap.slots.length > 0) {
+    snap.weekly_pct = snap.slots[0].pct;
+    snap.weekly_reset_eta_seconds = snap.slots[0].reset_eta_seconds;
   }
 }
 
-// Pill text rendered on the dashboard card. "gemini-2.5-pro" → "Pro".
-function geminiLabel(modelId) {
-  let tail = String(modelId || "");
-  if (tail.startsWith("gemini-")) {
-    tail = tail.slice("gemini-".length);
-    const idx = tail.indexOf("-");
-    if (idx >= 0) tail = tail.slice(idx + 1);
-  }
-  if (!tail) return modelId;
-  const parts = tail.split("-").map((p) => (p ? p[0].toUpperCase() + p.slice(1) : p));
-  const out = parts.join("-");
-  return out.length > 15 ? out.slice(0, 15) : out;
+// Group pill label: "Gemini Models" → "Gemini", "Claude and GPT models" →
+// "Claude and GPT". Capped to the device's 15-char slot label budget.
+function antigravityGroupLabel(displayName) {
+  let s = String(displayName || "").trim().replace(/\s+models$/i, "");
+  if (!s) return "Quota";
+  return s.length > 15 ? s.slice(0, 15) : s;
 }
 
 // -----------------------------------------------------------------------
@@ -544,11 +525,12 @@ export function buildCache(cfg, { credsModule, logger } = {}) {
       loadCodex: credsModule.loadCodex,
     });
   }
-  if (cfg.gemini?.enabled) {
-    fetchers[PROVIDER_GEMINI] = new GeminiFetcher({
-      credsPath: cfg.geminiCredsPathAbs(),
-      projectsPath: cfg.geminiProjectsPathAbs(),
-      models: cfg.geminiModels ? cfg.geminiModels() : [],
+  if (cfg.antigravity?.enabled) {
+    // Registered under the canonical "antigravity" key. The broker folds the
+    // deprecated /usage/gemini alias onto it AFTER HMAC verification.
+    fetchers[PROVIDER_ANTIGRAVITY] = new AntigravityFetcher({
+      keyringService: cfg.antigravity.keyring_service || "gemini",
+      models: cfg.antigravityModels ? cfg.antigravityModels() : [],
     });
   }
   const ttl = cfg.usage?.cache_ttl_seconds || 30;

@@ -11,7 +11,21 @@ import { Pricing } from "./pricing.js";
 
 export const PROVIDER_CLAUDE = "claude";
 export const PROVIDER_CODEX = "codex";
+export const PROVIDER_ANTIGRAVITY = "antigravity";
+// PROVIDER_GEMINI is the DEPRECATED pre-rename wire alias. No spend fetcher is
+// registered for Antigravity (the Gemini-CLI JSONL chat logs are gone; the
+// Antigravity CLI writes a proto+SQLite trajectory store with no recoverable
+// per-turn token counts yet — see the 2026-06-30 spike). /spend/antigravity
+// therefore returns NotImplementedProvider → the device renders "--" with no
+// stale dollars. Re-enable when a token source lands.
 export const PROVIDER_GEMINI = "gemini";
+
+// canonicalProvider folds the deprecated "gemini" wire alias onto the
+// canonical "antigravity" key. Call only AFTER HMAC verification of the
+// original request path.
+export function canonicalProvider(p) {
+  return p === PROVIDER_GEMINI ? PROVIDER_ANTIGRAVITY : p;
+}
 
 export class SpendError extends Error {}
 export class SpendUnavailable extends SpendError {}
@@ -468,18 +482,12 @@ export function buildSpendCache(cfg, { logger } = {}) {
       pricing,
     });
   }
-  if (cfg.gemini?.enabled) {
-    fetchers[PROVIDER_GEMINI] = new ProviderSpend(PROVIDER_GEMINI, {
-      root: cfg.geminiTmpPathAbs(),
-      fileMatch: (n) => n.startsWith("session-") && n.endsWith(".jsonl"),
-      parse: geminiRecords,
-      // Always $ for Gemini: free Code-Assist and a paid tier both write the
-      // same local oauth_creds.json, so they can't be told apart without a
-      // remote call. Default to computed $ rather than guess.
-      hasSub: () => false,
-      pricing,
-    });
-  }
+  // Antigravity spend is intentionally NOT wired: the Gemini-CLI chat-log
+  // JSONL source is gone, and the Antigravity CLI's proto+SQLite trajectory
+  // store has no recoverable per-turn token counts yet (spike 2026-06-30).
+  // With no fetcher, /spend/antigravity returns NotImplementedProvider → the
+  // device renders "--" with no stale dollars. geminiRecords is kept (below,
+  // and in _internals) for when a token source lands.
   const ttl = cfg.spend?.cache_ttl_seconds || 300;
   logger?.info?.(`spend: providers=${Object.keys(fetchers).sort()} cache_ttl=${ttl}s`);
   return new SpendCache(ttl, fetchers);

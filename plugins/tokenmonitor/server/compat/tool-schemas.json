@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema",
   "$comment": "Authoritative MCP tool definitions for tokenmonitor-mcp. Every impl (Go, Python, JS) must register tools with these exact name/description/inputSchema triples. The Python and JS servers load this file at runtime; the Go server hardcodes equivalent mcp.NewTool registrations in internal/mcp/{server,devices,discovery,ota}.go and must be kept in sync by hand.",
-  "version": 8,
+  "version": 9,
   "tools": [
     {
       "name": "tokenmonitor_status",
@@ -183,10 +183,15 @@
             "enum": ["auto", "disabled", "subscription", "api_key"],
             "description": "Codex provider mode (see provider_mode_claude). Wins over provider_codex when both are given."
           },
+          "provider_mode_antigravity": {
+            "type": "string",
+            "enum": ["auto", "disabled", "subscription", "api_key"],
+            "description": "Antigravity provider mode (see provider_mode_claude). Wins over provider_antigravity when both are given. Tracks the Antigravity CLI (`agy`), successor to the Gemini CLI."
+          },
           "provider_mode_gemini": {
             "type": "string",
             "enum": ["auto", "disabled", "subscription", "api_key"],
-            "description": "Gemini provider mode (see provider_mode_claude). Wins over provider_gemini when both are given."
+            "description": "Deprecated alias of provider_mode_antigravity, accepted for backward compatibility. Prefer provider_mode_antigravity."
           },
           "provider_claude": {
             "type": "boolean",
@@ -196,9 +201,13 @@
             "type": "boolean",
             "description": "Legacy coarse toggle: enable (true→auto) or disable (false) the Codex provider. Prefer provider_mode_codex."
           },
+          "provider_antigravity": {
+            "type": "boolean",
+            "description": "Legacy coarse toggle: enable (true→auto) or disable (false) the Antigravity provider. Prefer provider_mode_antigravity."
+          },
           "provider_gemini": {
             "type": "boolean",
-            "description": "Legacy coarse toggle: enable (true→auto) or disable (false) the Gemini provider. Prefer provider_mode_gemini."
+            "description": "Deprecated alias of provider_antigravity, accepted for backward compatibility. Prefer provider_mode_antigravity."
           },
           "autorotate_enabled": {
             "type": "boolean",
@@ -233,9 +242,13 @@
             "type": "string",
             "description": "Virtual pet name, up to 15 chars (truncated). Empty string uses the species default name."
           },
+          "antigravity_models": {
+            "type": "string",
+            "description": "Comma-separated list of Antigravity (Gemini-family) model IDs to show on the dashboard (max 3). Example: 'gemini-3.5-flash,gemini-3.1-pro'. Empty string clears the override and falls back to the broker's global default (tokenmonitor.toml [antigravity].models)."
+          },
           "gemini_models": {
             "type": "string",
-            "description": "Comma-separated list of Gemini model IDs to show on the dashboard (max 3). Example: 'gemini-2.5-pro,gemini-2.5-flash'. Empty string clears the override and falls back to the broker's global default (tokenmonitor.toml [gemini].models)."
+            "description": "Deprecated alias of antigravity_models, accepted for backward compatibility. Prefer antigravity_models."
           },
           "firmware_url": {
             "type": "string",
@@ -425,9 +438,13 @@
             "type": "boolean",
             "description": "Enable Codex provider."
           },
+          "provider_antigravity": {
+            "type": "boolean",
+            "description": "Enable Antigravity provider (tracks the `agy` CLI, successor to Gemini)."
+          },
           "provider_gemini": {
             "type": "boolean",
-            "description": "Enable Gemini provider."
+            "description": "Deprecated alias of provider_antigravity, accepted for backward compatibility."
           }
         },
         "required": [

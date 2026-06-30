@@ -89,7 +89,7 @@ def _provider_names(p: ProviderModeSet | None) -> list[str]:
     if provider_mode_enabled(p.codex):
         out.append("codex")
     if provider_mode_enabled(p.gemini):
-        out.append("gemini")
+        out.append("antigravity")
     return out
 
 
@@ -154,7 +154,7 @@ def _pending_changes(active: ConfigPayload, pending: ConfigPayload) -> list[str]
         am = list(active.gemini_models or [])
         pm = list(pending.gemini_models or [])
         if am != pm:
-            diffs.append("gemini_models")
+            diffs.append("antigravity_models")
     if pending.log_enabled is not None and (active.log_enabled is None or pending.log_enabled != active.log_enabled):
         diffs.append("log_enabled")
     return diffs
@@ -528,8 +528,10 @@ def _set_device_pending(deps: Deps, args: dict) -> dict:
     # (auto/disabled/subscription/api_key) and/or the legacy provider_<p>
     # bool (true→auto, false→disabled). The string arg wins over the bool.
     prov_keys = (
-        "provider_claude", "provider_codex", "provider_gemini",
-        "provider_mode_claude", "provider_mode_codex", "provider_mode_gemini",
+        "provider_claude", "provider_codex",
+        "provider_antigravity", "provider_gemini",
+        "provider_mode_claude", "provider_mode_codex",
+        "provider_mode_antigravity", "provider_mode_gemini",
     )
     if any(k in args for k in prov_keys):
         try:
@@ -545,6 +547,13 @@ def _set_device_pending(deps: Deps, args: dict) -> dict:
         for name in ("claude", "codex", "gemini"):
             mode_key = f"provider_mode_{name}"
             bool_key = f"provider_{name}"
+            if name == "gemini":
+                # Antigravity (formerly Gemini): prefer the new arg names,
+                # fall back to the deprecated gemini-named args.
+                if "provider_mode_antigravity" in args:
+                    mode_key = "provider_mode_antigravity"
+                if "provider_antigravity" in args:
+                    bool_key = "provider_antigravity"
             if mode_key in args:
                 s = str(args[mode_key])
                 if not valid_provider_mode(s):
@@ -575,13 +584,14 @@ def _set_device_pending(deps: Deps, args: dict) -> dict:
             pass
     if (pn := (args.get("pet_name") or "")):
         update.pet_name = str(pn)[:15]
-    if "gemini_models" in args:
-        raw = args["gemini_models"]
+    models_key = "antigravity_models" if "antigravity_models" in args else "gemini_models"
+    if models_key in args:
+        raw = args[models_key]
         if raw is None:
             raw = ""
         parts = [p.strip() for p in str(raw).split(",") if p.strip()]
         if len(parts) > 3:
-            return {"error": "gemini_models must list at most 3 entries"}
+            return {"error": f"{models_key} must list at most 3 entries"}
         update.gemini_models = parts  # empty list clears the override
     if "log_enabled" in args:
         update.log_enabled = bool(args["log_enabled"])
@@ -890,6 +900,10 @@ async def _provision(deps: Deps, args: dict) -> dict:
     providers: dict[str, bool] = {}
     for name in ("claude", "codex", "gemini"):
         key = f"provider_{name}"
+        # Antigravity (formerly Gemini): prefer the new arg name, fall back
+        # to the deprecated provider_gemini. Internal key stays "gemini".
+        if name == "gemini" and "provider_antigravity" in args:
+            key = "provider_antigravity"
         if key in args:
             providers[name] = bool(args[key])
     if providers:

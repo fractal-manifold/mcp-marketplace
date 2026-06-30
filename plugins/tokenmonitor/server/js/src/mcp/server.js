@@ -54,7 +54,7 @@ function providerNames(p) {
   const out = [];
   if (providerModeEnabled(p.claude)) out.push("claude");
   if (providerModeEnabled(p.codex)) out.push("codex");
-  if (providerModeEnabled(p.gemini)) out.push("gemini");
+  if (providerModeEnabled(p.gemini)) out.push("antigravity");
   return out;
 }
 
@@ -96,7 +96,7 @@ function pendingChanges(a, p) {
   if (Array.isArray(p.gemini_models)) {
     const am = Array.isArray(a.gemini_models) ? a.gemini_models : [];
     const same = am.length === p.gemini_models.length && am.every((m, i) => m === p.gemini_models[i]);
-    if (!same) out.push("gemini_models");
+    if (!same) out.push("antigravity_models");
   }
   return out;
 }
@@ -400,7 +400,7 @@ function setDevicePendingTool(deps, args) {
   // bool (true→auto, false→disabled). The string arg wins over the bool
   // when both are given. Read the current view and override only what
   // changed so all three land deterministically in NVS.
-  const provKeys = ["provider_claude", "provider_codex", "provider_gemini", "provider_mode_claude", "provider_mode_codex", "provider_mode_gemini"];
+  const provKeys = ["provider_claude", "provider_codex", "provider_antigravity", "provider_gemini", "provider_mode_claude", "provider_mode_codex", "provider_mode_antigravity", "provider_mode_gemini"];
   if (provKeys.some((k) => k in args)) {
     let cur;
     try { cur = deps.registry.load(deviceID); }
@@ -408,8 +408,14 @@ function setDevicePendingTool(deps, args) {
     const cm = (cur.pending && cur.pending.payload.provider_modes) || cur.active.payload.provider_modes;
     const base = cm ? { claude: cm.claude, codex: cm.codex, gemini: cm.gemini } : { claude: "auto", codex: "disabled", gemini: "disabled" };
     for (const name of ["claude", "codex", "gemini"]) {
-      const modeKey = `provider_mode_${name}`;
-      const boolKey = `provider_${name}`;
+      let modeKey = `provider_mode_${name}`;
+      let boolKey = `provider_${name}`;
+      if (name === "gemini") {
+        // Antigravity (formerly Gemini): prefer the new arg names, fall
+        // back to the deprecated gemini-named args.
+        if ("provider_mode_antigravity" in args) modeKey = "provider_mode_antigravity";
+        if ("provider_antigravity" in args) boolKey = "provider_antigravity";
+      }
       if (modeKey in args) {
         const s = String(args[modeKey]);
         if (!validProviderMode(s)) return { error: `${modeKey} must be one of auto/disabled/subscription/api_key` };
@@ -441,10 +447,11 @@ function setDevicePendingTool(deps, args) {
     if (Number.isFinite(v)) upd.pet_species = clamp(v, 0, 9);
   }
   if (args.pet_name) upd.pet_name = String(args.pet_name).slice(0, 15);
-  if ("gemini_models" in args) {
-    const raw = args.gemini_models == null ? "" : String(args.gemini_models);
+  const modelsKey = "antigravity_models" in args ? "antigravity_models" : "gemini_models";
+  if (modelsKey in args) {
+    const raw = args[modelsKey] == null ? "" : String(args[modelsKey]);
     const parts = raw.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
-    if (parts.length > 3) return { error: "gemini_models must list at most 3 entries" };
+    if (parts.length > 3) return { error: `${modelsKey} must list at most 3 entries` };
     upd.gemini_models = parts; // [] clears the override
   }
   const fu = (args.firmware_url || "").toString().trim();
@@ -677,7 +684,10 @@ async function provisionTool(deps, args) {
   if ("pet_enabled" in args) payload.pet_enabled = !!args.pet_enabled;
   const providers = {};
   for (const name of ["claude", "codex", "gemini"]) {
-    const key = `provider_${name}`;
+    let key = `provider_${name}`;
+    // Antigravity (formerly Gemini): prefer the new arg name, fall back to
+    // the deprecated provider_gemini. Internal key stays "gemini".
+    if (name === "gemini" && "provider_antigravity" in args) key = "provider_antigravity";
     if (key in args) providers[name] = !!args[key];
   }
   if (Object.keys(providers).length) payload.providers = providers;

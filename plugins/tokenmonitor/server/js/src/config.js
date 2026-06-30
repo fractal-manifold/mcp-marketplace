@@ -26,11 +26,13 @@ export function firmwarePath() {
   return expandUser(FIRMWARE_DIR);
 }
 
-// Default ordered list of model IDs exposed in /usage/gemini.slots when
-// [gemini].models is unset. Pro is the headline model; Flash burns
-// fastest. The firmware dashboard renders at most MAX_GEMINI_MODELS.
-export const DEFAULT_GEMINI_MODELS = ["gemini-2.5-pro", "gemini-2.5-flash"];
-export const MAX_GEMINI_MODELS = 3;
+// Default ordered list of model IDs exposed in /usage/antigravity.slots when
+// [antigravity].models is unset. Antigravity (agy, the successor to the
+// retired Gemini CLI) surfaces the Flash and Pro families; prefix matching
+// tolerates the effort suffix (-low/-medium/-high) Google appends. The
+// firmware dashboard renders at most MAX_ANTIGRAVITY_MODELS.
+export const DEFAULT_ANTIGRAVITY_MODELS = ["gemini-3.5-flash", "gemini-3.1-pro"];
+export const MAX_ANTIGRAVITY_MODELS = 3;
 
 function defaults() {
   return {
@@ -38,10 +40,17 @@ function defaults() {
     auth: { psk_passphrase: "", psk_hex: "" },
     credentials: { oauth_path: "~/.claude/.credentials.json" },
     codex: { enabled: false, auth_path: "~/.codex/auth.json" },
-    gemini: {
+    // Antigravity CLI (agy, successor to the retired Gemini CLI). The OAuth
+    // creds the CLI writes still live under ~/.gemini/ (shared layout). A
+    // legacy [gemini] section is still accepted and merged in below.
+    antigravity: {
       enabled: false,
       creds_path: "~/.gemini/oauth_creds.json",
       projects_path: "~/.gemini/projects.json",
+      // OS keyring service holding agy's consumer OAuth token (the quota RPC
+      // requires it; the oauth_creds.json token is rejected there). Read via
+      // `secret-tool lookup service <name>`.
+      keyring_service: "gemini",
       models: [],
     },
     usage: { cache_ttl_seconds: 30 },
@@ -54,7 +63,9 @@ function defaults() {
       claude_projects_path: "~/.claude/projects",
       claude_stats_cache_path: "~/.claude/stats-cache.json",
       codex_sessions_path: "~/.codex/sessions",
-      gemini_tmp_path: "~/.gemini/tmp",
+      // Antigravity CLI conversation trajectory store. The legacy
+      // gemini_tmp_path key is merged into this in load() for back-compat.
+      antigravity_conversations_path: "~/.gemini/antigravity-cli/conversations",
     },
     // Model price table used to turn tokens into USD. Source of truth is
     // LiteLLM's machine-readable table (same data ccusage uses); cached on
@@ -91,6 +102,29 @@ function mergeSection(target, src, name) {
   Object.assign(target[name], src[name]);
 }
 
+// mergeLegacyGemini folds a deprecated pre-rename [gemini] section /
+// gemini_tmp_path forward into the canonical antigravity fields when the new
+// keys are absent. Detection uses key presence in the parsed TOML so we don't
+// confuse "not provided" with "set to a zero value". Mirror of Go
+// config.mergeLegacyGemini.
+function mergeLegacyGemini(cfg, parsed) {
+  if (!parsed) return;
+  if (parsed.antigravity == null && parsed.gemini != null) {
+    const g = parsed.gemini;
+    cfg.antigravity.enabled = !!g.enabled;
+    if (g.creds_path) cfg.antigravity.creds_path = g.creds_path;
+    if (g.projects_path) cfg.antigravity.projects_path = g.projects_path;
+    if (Array.isArray(g.models) && g.models.length > 0) cfg.antigravity.models = g.models;
+  }
+  const sp = parsed.spend;
+  if (sp && sp.antigravity_conversations_path == null && sp.gemini_tmp_path) {
+    cfg.spend.antigravity_conversations_path = sp.gemini_tmp_path;
+  }
+  // Drop the legacy key if mergeSection copied it verbatim onto cfg.spend so
+  // the resolved config exposes only the canonical field.
+  if (cfg.spend && "gemini_tmp_path" in cfg.spend) delete cfg.spend.gemini_tmp_path;
+}
+
 export function load(path) {
   const explicit = !!path;
   let resolved = expandUser(path || DEFAULT_PATH);
@@ -103,9 +137,15 @@ export function load(path) {
   const raw = readFileSync(resolved, "utf8");
   const parsed = TOML.parse(raw);
   const cfg = defaults();
-  for (const k of ["server", "auth", "credentials", "codex", "gemini", "usage", "spend", "pricing", "security", "logging", "serial", "ota"]) {
+  for (const k of ["server", "auth", "credentials", "codex", "antigravity", "usage", "spend", "pricing", "security", "logging", "serial", "ota"]) {
     mergeSection(cfg, parsed, k);
   }
+  // Back-compat: a legacy tokenmonitor.toml uses [gemini] / gemini_tmp_path
+  // (pre-rename, before the Gemini CLI → Antigravity CLI migration). When the
+  // new keys are absent, fold the deprecated values forward so existing
+  // installs keep working. Mirror of Go mergeLegacyGemini: detection is on key
+  // presence in the parsed TOML, not on a zero value.
+  mergeLegacyGemini(cfg, parsed);
   // @iarna/toml parses [[ota.keys]] into an array of {key_id, pubkey_b64}
   // objects; Object.assign copies it verbatim. Normalise to a clean array
   // of strings so callers don't trip on missing fields.
@@ -129,18 +169,18 @@ export function load(path) {
   cfg.psk = () => cfg.pskBytes;
   cfg.oauthPathAbs = () => expandUser(cfg.credentials.oauth_path);
   cfg.codexAuthPathAbs = () => expandUser(cfg.codex.auth_path);
-  cfg.geminiCredsPathAbs = () => expandUser(cfg.gemini.creds_path);
-  cfg.geminiProjectsPathAbs = () => expandUser(cfg.gemini.projects_path);
+  cfg.antigravityCredsPathAbs = () => expandUser(cfg.antigravity.creds_path);
+  cfg.antigravityProjectsPathAbs = () => expandUser(cfg.antigravity.projects_path);
   cfg.claudeProjectsPathAbs = () => expandUser(cfg.spend.claude_projects_path);
   cfg.claudeStatsCachePathAbs = () => expandUser(cfg.spend.claude_stats_cache_path);
   cfg.codexSessionsPathAbs = () => expandUser(cfg.spend.codex_sessions_path);
-  cfg.geminiTmpPathAbs = () => expandUser(cfg.spend.gemini_tmp_path);
+  cfg.antigravityConvPathAbs = () => expandUser(cfg.spend.antigravity_conversations_path);
   cfg.pricingCachePathAbs = () => expandUser(cfg.pricing.cache_path);
-  cfg.geminiModels = () => {
-    const src = (cfg.gemini.models && cfg.gemini.models.length > 0)
-      ? cfg.gemini.models
-      : DEFAULT_GEMINI_MODELS;
-    return src.slice(0, MAX_GEMINI_MODELS);
+  cfg.antigravityModels = () => {
+    const src = (cfg.antigravity.models && cfg.antigravity.models.length > 0)
+      ? cfg.antigravity.models
+      : DEFAULT_ANTIGRAVITY_MODELS;
+    return src.slice(0, MAX_ANTIGRAVITY_MODELS);
   };
   // OTA keyring helpers — mirror of Go OTAConfig.Configured()/Pubkey().
   cfg.otaConfigured = () => cfg.ota.enabled && !!cfg.ota.releases_repo && cfg.ota.keys.length > 0;
