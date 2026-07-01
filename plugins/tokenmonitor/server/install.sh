@@ -48,6 +48,16 @@ mkdir -p "$bindir"
 install -m 755 "$src" "$dst"
 printf 'install.sh: installed launcher at %s\n' "$dst"
 
+# Install the VERSION file next to the launcher so its PATH-mode stale-binary
+# check (tokenmonitor-mcp reads $script_dir/VERSION into _want_ver) can warn when a
+# standalone tokenmonitor-mcp-{go,py,js} on PATH drifts behind this release.
+# Safe: bundle-mode detection additionally requires compat/ + a runtime dir,
+# so a lone VERSION next to the launcher stays in PATH mode.
+if [ -r "$src_dir/VERSION" ]; then
+    install -m 644 "$src_dir/VERSION" "$bindir/VERSION"
+    printf 'install.sh: installed VERSION at %s\n' "$bindir/VERSION"
+fi
+
 case ":$PATH:" in
     *":$bindir:"*) : ;;
     *)
