@@ -57,7 +57,10 @@ export function windowStarts(nowMs) {
   const today = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
   // ISO week: Monday start. getDay() is 0=Sun..6=Sat.
   const dow = (d.getDay() + 6) % 7; // 0=Mon..6=Sun
-  const week = today - dow * 86400_000;
+  // Step back whole calendar days, not dow*86400s: a DST transition inside the
+  // week makes a day 23 or 25 h long, so fixed-second subtraction lands an hour
+  // off the local Monday-00:00 boundary. Date() normalises negative day-of-month.
+  const week = new Date(d.getFullYear(), d.getMonth(), d.getDate() - dow).getTime();
   const month = new Date(d.getFullYear(), d.getMonth(), 1).getTime();
   return { today, week, month };
 }

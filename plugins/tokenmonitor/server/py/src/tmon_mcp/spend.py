@@ -14,7 +14,7 @@ import os
 import re
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from .pricing import Pricing, PriceTable
@@ -127,7 +127,10 @@ def window_starts(now: float) -> _Windows:
     d = datetime.fromtimestamp(now)
     today = d.replace(hour=0, minute=0, second=0, microsecond=0)
     dow = today.weekday()  # Monday=0
-    week = today.timestamp() - dow * 86400
+    # Subtract whole days via calendar arithmetic, not dow*86400 seconds: a DST
+    # transition inside the week makes a day 23 or 25 h long, so the fixed-second
+    # subtraction lands an hour off the local Monday-00:00 boundary.
+    week = (today - timedelta(days=dow)).timestamp()
     month = today.replace(day=1).timestamp()
     return _Windows(today.timestamp(), week, month)
 
