@@ -29,7 +29,11 @@ const DEFAULT_MARKETPLACE_URL =
 const FETCH_TIMEOUT_MS = 2500;
 const WATCHDOG_MS = 3500;
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6h
-const CACHE_FILE = path.join(os.tmpdir(), 'tokenmonitor-updatecheck.json');
+const CACHE_DIR = path.join(
+  process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'),
+  'tokenmonitor',
+);
+const CACHE_FILE = path.join(CACHE_DIR, 'updatecheck.json');
 
 function silentExit() {
   process.exit(0);
@@ -103,6 +107,7 @@ function readCache() {
 
 function writeCache(latest) {
   try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
     fs.writeFileSync(
       CACHE_FILE,
       JSON.stringify({ latest, checkedAt: Date.now() }),
