@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import socket
 import time
 from dataclasses import asdict
@@ -74,10 +75,17 @@ def _map_usage_error(e: "usage.UsageError") -> tuple[int, web.Response]:
         if e.retry_after > 0:
             r.headers["Retry-After"] = str(e.retry_after)
         return 429, r
-    if isinstance(e, (usage.Upstream, usage.ParseUpstream, usage.Transport)):
-        return 502, _error(502, f"upstream error: {e}")
-    # Unknown UsageError subclass: treat as upstream failure.
-    return 502, _error(502, f"upstream error: {e}")
+    # 502 bodies are FIXED strings (Go parity, usageErrorToHTTP): the detail
+    # goes to a server log, never to the client, so the wire body matches.
+    if isinstance(e, usage.Transport):
+        log.warning("usage transport error: %s", e)
+        return 502, _error(502, "transport error")
+    if isinstance(e, (usage.Upstream, usage.ParseUpstream)):
+        log.warning("usage upstream error: %s", e)
+        return 502, _error(502, "upstream error")
+    # Unknown UsageError subclass: internal error (Go default), logged.
+    log.warning("usage internal error: %s", e)
+    return 500, _error(500, "internal error")
 
 
 def make_app(
@@ -121,8 +129,35 @@ def make_app(
     app.router.add_get("/spend/{provider}", _handle_spend)
     app.router.add_get("/firmware/{name}", _handle_firmware)
     app.router.add_head("/firmware/{name}", _handle_firmware)
-    app.router.add_route("*", "/{tail:.*}", lambda r: _error(404, "not found"))
+    # Catch-all: a "*" route shadows aiohttp's own 405, so distinguish a wrong
+    # method on a KNOWN path (405) from an unknown path (404) manually, keeping
+    # the JSON error shape. Matches the Go/JS routers.
+    app.router.add_route("*", "/{tail:.*}", _not_found_or_405)
     return app
+
+
+# (regex, allowed methods) for every registered route, used by the catch-all
+# to return 405 on a method mismatch instead of 404.
+_ROUTE_METHODS: list[tuple[re.Pattern[str], set[str]]] = [
+    (re.compile(r"^/credentials$"), {"GET"}),
+    (re.compile(r"^/credentials/codex$"), {"GET"}),
+    (re.compile(r"^/firmware-logs$"), {"GET"}),
+    (re.compile(r"^/device/[^/]+/sync$"), {"GET"}),
+    (re.compile(r"^/device/[^/]+/logs$"), {"POST"}),
+    (re.compile(r"^/device/[^/]+/settings$"), {"POST"}),
+    (re.compile(r"^/usage/[^/]+$"), {"GET"}),
+    (re.compile(r"^/spend/[^/]+$"), {"GET"}),
+    (re.compile(r"^/firmware/[^/]+$"), {"GET", "HEAD"}),
+]
+
+
+async def _not_found_or_405(req: web.Request) -> web.Response:
+    for pat, methods in _ROUTE_METHODS:
+        if pat.match(req.path):
+            if req.method not in methods:
+                return _error(405, "method not allowed")
+            break
+    return _error(404, "not found")
 
 
 _firmware_sha_cache: dict[str, tuple[float, int, str]] = {}
@@ -557,8 +592,13 @@ async def _handle_spend(req: web.Request) -> web.Response:
             if isinstance(e, spend.NotImplementedProvider):
                 status_to_record = 501
                 return _error(501, "provider not enabled")
-            status_to_record = 503
-            return _error(503, "spend unavailable")
+            if isinstance(e, spend.SpendUnavailable):
+                status_to_record = 503
+                return _error(503, "spend unavailable")
+            # Any other SpendError is an internal fault (Go default), logged.
+            log.warning("spend handler error: %s", e)
+            status_to_record = 500
+            return _error(500, "internal")
         resp = web.json_response(asdict(snap))
         resp.headers["Cache-Control"] = "no-store"
         return resp

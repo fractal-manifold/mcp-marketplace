@@ -74,26 +74,24 @@ export function createHandler({ cfg, cache, state, fwLogs, registry, logger, usa
       logger.info(`auth rejected ${path}: non-ascii auth header`);
       return writeError(res, 401, "unauthorized");
     }
-    if (path === "/credentials" && req.method === "GET") return handleCredentials({ cfg, cache, state, registry, logger }, req, res);
-    if (path === "/credentials/codex" && req.method === "GET") return handleCredentialsCodex({ cfg, cache, state, registry, logger }, req, res);
-    if (path === "/firmware-logs" && req.method === "GET") return handleFirmwareLogs({ cfg, cache, fwLogs, logger }, req, res, url);
-    const usageMatch = path.match(/^\/usage\/([^/]+)$/);
-    if (usageMatch && req.method === "GET") {
-      return handleUsage({ cfg, cache, state, registry, logger, usageCache, provider: usageMatch[1] }, req, res);
-    }
-    const spendMatch = path.match(/^\/spend\/([^/]+)$/);
-    if (spendMatch && req.method === "GET") {
-      return handleSpend({ cfg, cache, state, registry, logger, spendCache, provider: spendMatch[1] }, req, res);
-    }
-    const m = path.match(/^\/device\/([^/]+)\/sync$/);
-    if (m && req.method === "GET") return handleDeviceSync({ cfg, cache, state, registry, logger, deviceID: m[1] }, req, res);
-    const lm = path.match(/^\/device\/([^/]+)\/logs$/);
-    if (lm && req.method === "POST") return handleDeviceLogs({ cfg, cache, state, registry, logger, deviceID: lm[1] }, req, res);
-    const sm = path.match(/^\/device\/([^/]+)\/settings$/);
-    if (sm && req.method === "POST") return handleDeviceSettings({ cfg, cache, state, registry, logger, deviceID: sm[1] }, req, res);
-    const fwm = path.match(/^\/firmware\/([^/]+)$/);
-    if (fwm && (req.method === "GET" || req.method === "HEAD")) {
-      return handleFirmware({ cfg, cache, registry, logger, name: fwm[1] }, req, res);
+    // Route by PATH first, then method: a matched path with a wrong method
+    // must return 405 (Go/py parity), not fall through to 404.
+    const routes = [
+      { re: /^\/credentials$/, methods: ["GET"], h: (m2) => handleCredentials({ cfg, cache, state, registry, logger }, req, res) },
+      { re: /^\/credentials\/codex$/, methods: ["GET"], h: (m2) => handleCredentialsCodex({ cfg, cache, state, registry, logger }, req, res) },
+      { re: /^\/firmware-logs$/, methods: ["GET"], h: (m2) => handleFirmwareLogs({ cfg, cache, fwLogs, logger }, req, res, url) },
+      { re: /^\/usage\/([^/]+)$/, methods: ["GET"], h: (m2) => handleUsage({ cfg, cache, state, registry, logger, usageCache, provider: m2[1] }, req, res) },
+      { re: /^\/spend\/([^/]+)$/, methods: ["GET"], h: (m2) => handleSpend({ cfg, cache, state, registry, logger, spendCache, provider: m2[1] }, req, res) },
+      { re: /^\/device\/([^/]+)\/sync$/, methods: ["GET"], h: (m2) => handleDeviceSync({ cfg, cache, state, registry, logger, deviceID: m2[1] }, req, res) },
+      { re: /^\/device\/([^/]+)\/logs$/, methods: ["POST"], h: (m2) => handleDeviceLogs({ cfg, cache, state, registry, logger, deviceID: m2[1] }, req, res) },
+      { re: /^\/device\/([^/]+)\/settings$/, methods: ["POST"], h: (m2) => handleDeviceSettings({ cfg, cache, state, registry, logger, deviceID: m2[1] }, req, res) },
+      { re: /^\/firmware\/([^/]+)$/, methods: ["GET", "HEAD"], h: (m2) => handleFirmware({ cfg, cache, registry, logger, name: m2[1] }, req, res) },
+    ];
+    for (const route of routes) {
+      const rm = path.match(route.re);
+      if (!rm) continue;
+      if (!route.methods.includes(req.method)) return writeError(res, 405, "method not allowed");
+      return route.h(rm);
     }
     writeError(res, 404, "not found");
   };
@@ -371,7 +369,11 @@ async function handleUsage({ cfg, cache, state, registry, logger, usageCache, pr
       if (e.retryAfter > 0) res.setHeader("Retry-After", String(e.retryAfter));
       return writeError(res, 429, "rate limited");
     }
-    if (e instanceof usage.UsageError) { rs.s = 502; return writeError(res, 502, `upstream error: ${e.message}`); }
+    // 502 bodies are FIXED strings (Go parity: transport vs upstream); the
+    // detail is logged, never returned to the client.
+    if (e instanceof usage.Transport) { logger.warn(`usage transport error: ${e.message}`); rs.s = 502; return writeError(res, 502, "transport error"); }
+    if (e instanceof usage.Upstream || e instanceof usage.ParseUpstream) { logger.warn(`usage upstream error: ${e.message}`); rs.s = 502; return writeError(res, 502, "upstream error"); }
+    if (e instanceof usage.UsageError) { logger.warn(`usage internal error: ${e.message}`); rs.s = 500; return writeError(res, 500, "internal error"); }
     logger.error(`usage handler crashed: ${e.stack || e.message}`);
     rs.s = 500; return writeError(res, 500, "internal");
   }

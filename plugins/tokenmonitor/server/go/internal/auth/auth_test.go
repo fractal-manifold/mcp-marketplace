@@ -37,6 +37,35 @@ func TestVerify_MissingHeaders(t *testing.T) {
 	}
 }
 
+func TestVerify_NonASCIIHeaderRejected(t *testing.T) {
+	cache := NewNonceCache(time.Minute)
+	now := time.Unix(1700000000, 0)
+	ts := strconv.FormatInt(now.Unix(), 10)
+	// A non-ASCII nonce (byte >= 0x80) must be a plain non-ASCII rejection,
+	// not a signature/format guess — parity with py/js.
+	err := Verify(mustPSK(), "GET", "/credentials", ts, "\xc3\xa9deadbeefdeadbeefdeadbeefdead", "deadbeef", "", "", cache, time.Minute, now)
+	if !errors.Is(err, ErrNonASCIIHeader) {
+		t.Fatalf("expected ErrNonASCIIHeader, got %v", err)
+	}
+	// Also on a device header carrying UTF-8.
+	nonce := "0123456789abcdef0123456789abcdef"
+	sig := ComputeSignature(mustPSK(), "GET", "/credentials", ts, nonce, "café", "")
+	err = Verify(mustPSK(), "GET", "/credentials", ts, nonce, sig, "café", "", cache, time.Minute, now)
+	if !errors.Is(err, ErrNonASCIIHeader) {
+		t.Fatalf("expected ErrNonASCIIHeader for device header, got %v", err)
+	}
+}
+
+func TestVerifyMulti_NonASCIIHeaderRejected(t *testing.T) {
+	cache := NewNonceCache(time.Minute)
+	now := time.Unix(1700000000, 0)
+	ts := strconv.FormatInt(now.Unix(), 10)
+	_, err := VerifyMulti([][]byte{mustPSK()}, "GET", "/credentials", ts, "\xc3\xa9deadbeefdeadbeefdeadbeefdead", "deadbeef", "", "", cache, time.Minute, now)
+	if !errors.Is(err, ErrNonASCIIHeader) {
+		t.Fatalf("expected ErrNonASCIIHeader, got %v", err)
+	}
+}
+
 func TestVerify_BadTimestamp(t *testing.T) {
 	cache := NewNonceCache(time.Minute)
 	err := Verify(mustPSK(), "GET", "/credentials", "not-a-number",

@@ -55,6 +55,21 @@ export const ERR_TIMESTAMP_SKEW = "timestamp skew";
 export const ERR_BAD_NONCE_FORMAT = "bad nonce format";
 export const ERR_BAD_SIGNATURE = "bad signature";
 export const ERR_NONCE_REPLAY = "nonce replay";
+export const ERR_NON_ASCII_HEADER = "non-ascii auth header";
+
+// Auth headers are ASCII-only (compat/HMAC_CANONICAL.md). Reject any value
+// carrying a code unit >= 0x80 with a plain 401, mirroring the py/js/Go gate,
+// so a non-ASCII header never slips through as a different error. Empty
+// strings (absent headers) pass.
+function allASCII(...values) {
+  for (const v of values) {
+    if (typeof v !== "string") continue;
+    for (let i = 0; i < v.length; i++) {
+      if (v.charCodeAt(i) >= 0x80) return false;
+    }
+  }
+  return true;
+}
 
 export class NonceCache {
   constructor(ttlSeconds) {
@@ -85,6 +100,7 @@ function constantTimeEqualHex(aHex, bHex) {
 // position mirrors the Go signature (between sigHeader and cache).
 export function verify(psk, method, path, tsHeader, nonceHeader, sigHeader, deviceHeader, configVersionHeader, cache, maxSkewSeconds, now) {
   if (!tsHeader || !nonceHeader || !sigHeader) throw new AuthError(ERR_MISSING_HEADERS);
+  if (!allASCII(tsHeader, nonceHeader, sigHeader, deviceHeader, configVersionHeader)) throw new AuthError(ERR_NON_ASCII_HEADER);
   const ts = parseStrictInt(tsHeader);
   if (ts === null) throw new AuthError(ERR_BAD_TIMESTAMP);
   const nowTs = now ?? Math.floor(Date.now() / 1000);
@@ -103,6 +119,7 @@ export function verify(psk, method, path, tsHeader, nonceHeader, sigHeader, devi
 
 export function verifyMulti(psks, method, path, tsHeader, nonceHeader, sigHeader, deviceHeader, configVersionHeader, cache, maxSkewSeconds, now) {
   if (!tsHeader || !nonceHeader || !sigHeader) throw new AuthError(ERR_MISSING_HEADERS);
+  if (!allASCII(tsHeader, nonceHeader, sigHeader, deviceHeader, configVersionHeader)) throw new AuthError(ERR_NON_ASCII_HEADER);
   const ts = parseStrictInt(tsHeader);
   if (ts === null) throw new AuthError(ERR_BAD_TIMESTAMP);
   const nowTs = now ?? Math.floor(Date.now() / 1000);

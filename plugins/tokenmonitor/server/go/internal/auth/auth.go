@@ -90,7 +90,25 @@ var (
 	ErrBadNonceFormat = errors.New("bad nonce format")
 	ErrBadSignature   = errors.New("bad signature")
 	ErrNonceReplay    = errors.New("nonce replay")
+	// ErrNonASCIIHeader rejects an auth header carrying a byte >= 0x80. The
+	// canonical HMAC contract is ASCII-only (compat/HMAC_CANONICAL.md); an
+	// explicit gate keeps parity with the py/js brokers (which reject before
+	// signature computation) so a non-ASCII header is always a plain 401.
+	ErrNonASCIIHeader = errors.New("non-ascii auth header")
 )
+
+// allASCII reports whether every byte of every value is < 0x80. Empty strings
+// (absent headers) pass.
+func allASCII(values ...string) bool {
+	for _, v := range values {
+		for i := 0; i < len(v); i++ {
+			if v[i] >= 0x80 {
+				return false
+			}
+		}
+	}
+	return true
+}
 
 // Verify checks an incoming request's auth headers against the shared PSK.
 // All non-nil error returns are reasons to reject with 401; never surface them
@@ -106,6 +124,9 @@ func Verify(
 ) error {
 	if tsHeader == "" || nonceHeader == "" || sigHeader == "" {
 		return ErrMissingHeaders
+	}
+	if !allASCII(tsHeader, nonceHeader, sigHeader, deviceHeader, configVersionHeader) {
+		return ErrNonASCIIHeader
 	}
 	ts, err := strconv.ParseInt(tsHeader, 10, 64)
 	if err != nil {
@@ -174,6 +195,9 @@ func VerifyMulti(
 ) (VerifyResult, error) {
 	if tsHeader == "" || nonceHeader == "" || sigHeader == "" {
 		return VerifyResult{}, ErrMissingHeaders
+	}
+	if !allASCII(tsHeader, nonceHeader, sigHeader, deviceHeader, configVersionHeader) {
+		return VerifyResult{}, ErrNonASCIIHeader
 	}
 	ts, err := strconv.ParseInt(tsHeader, 10, 64)
 	if err != nil {
