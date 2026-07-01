@@ -74,11 +74,49 @@ fi
 bundle_version() { cat "$script_dir/VERSION" 2>/dev/null || echo dev; }
 
 # mkdir-based lock (atomic, POSIX). Serializes concurrent first-run
-# setups across multiple Claude Code sessions sharing the cache.
+# setups across multiple Claude Code sessions sharing the cache. The
+# holder writes its PID into <lock>/pid; a contender STEALS the lock
+# (removes it and retries) when that PID names a dead process or the
+# lockdir has been abandoned for >10 min, so a setup killed mid-flight
+# can't wedge every future session behind the old rmdir-only cleanup.
+TMON_HELD_LOCK=""
+
+# release_lock <dir>: remove the lock (now a dir containing a pid file)
+# and clear the held-lock marker if it was ours. Guards an empty arg so
+# the global EXIT trap is a no-op once we released explicitly / never
+# acquired.
+release_lock() {
+    [ -n "${1:-}" ] || return 0
+    rm -rf "$1" 2>/dev/null || true
+    [ "$1" = "$TMON_HELD_LOCK" ] && TMON_HELD_LOCK=""
+    return 0
+}
+
+# One global trap: on any exit release whatever lock we currently hold.
+# (The success paths exec the runtime and release explicitly first, so
+# this only fires when a setup dies before releasing.)
+trap 'release_lock "$TMON_HELD_LOCK"' EXIT INT TERM
+
 acquire_lock() {
     _lock="$1"
     _tries=0
     while ! mkdir "$_lock" 2>/dev/null; do
+        # Contention. Steal the lock if its holder is gone (dead PID) or
+        # the lockdir is stale (>10 min), then retry immediately.
+        _steal=0
+        _lpid=$(cat "$_lock/pid" 2>/dev/null || true)
+        if [ -n "$_lpid" ]; then
+            kill -0 "$_lpid" 2>/dev/null || _steal=1
+        fi
+        if [ "$_steal" -eq 0 ] && \
+           [ -n "$(find "$_lock" -maxdepth 0 -mmin +10 -print 2>/dev/null)" ]; then
+            _steal=1
+        fi
+        if [ "$_steal" -eq 1 ]; then
+            log "stealing stale lock $_lock (holder pid='${_lpid:-?}')"
+            rm -rf "$_lock" 2>/dev/null || true
+            continue
+        fi
         _tries=$((_tries + 1))
         if [ "$_tries" -gt 600 ]; then
             log "timed out waiting for lock $_lock"
@@ -86,9 +124,10 @@ acquire_lock() {
         fi
         sleep 1
     done
+    printf '%s' "$$" > "$_lock/pid"
+    TMON_HELD_LOCK="$_lock"
     return 0
 }
-release_lock() { rmdir "$1" 2>/dev/null || true; }
 
 # Copy the version-pinned shared files (VERSION + compat/) into the cache
 # so the runtimes' upward "find ../compat / find ../VERSION" walks resolve
