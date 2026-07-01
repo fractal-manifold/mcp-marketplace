@@ -37,12 +37,22 @@ def _error(status: int, msg: str) -> web.Response:
     return web.json_response({"error": msg}, status=status)
 
 
+def _snapshot_body(snap: Any) -> dict:
+    """asdict(snap) but with `degraded` emitted only when true — so the wire
+    matches Go (omitempty) and JS (property set only when true). Harmless for
+    snapshots (e.g. spend) that never carry the field."""
+    body = asdict(snap)
+    if not body.get("degraded"):
+        body.pop("degraded", None)
+    return body
+
+
 def _stale_response(snap: Any, reason: str) -> web.Response:
     """200 + last-good snapshot + X-Tmon-Stale-Reason, mirroring Go/JS
     stale-with-200 (go/internal/broker/server.go ~586-600,
     js/src/broker/server.js ~291-295). reason is the upstream error message."""
     snap.fetched_at_unix = snap.fetched_at_unix or int(time.time())
-    resp = web.json_response(asdict(snap))
+    resp = web.json_response(_snapshot_body(snap))
     resp.headers["Cache-Control"] = "no-store"
     resp.headers["X-Tmon-Stale-Reason"] = reason
     return resp
@@ -487,7 +497,7 @@ async def _handle_usage(req: web.Request) -> web.Response:
                         status_to_record = 502
                         return _error(502, f"upstream error: {e}")
                     snap.fetched_at_unix = int(time.time())
-                    body = asdict(snap)
+                    body = _snapshot_body(snap)
                     resp = web.json_response(body)
                     resp.headers["Cache-Control"] = "no-store"
                     return resp
@@ -503,7 +513,7 @@ async def _handle_usage(req: web.Request) -> web.Response:
                 return _stale_response(e.stale_snapshot, str(e))
             status_to_record, r = _map_usage_error(e)
             return r
-        body = asdict(snap)
+        body = _snapshot_body(snap)
         resp = web.json_response(body)
         resp.headers["Cache-Control"] = "no-store"
         return resp

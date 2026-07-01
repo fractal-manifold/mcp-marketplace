@@ -30,6 +30,11 @@ type Snapshot struct {
 	Tier                   string  `json:"tier"`
 	FetchedAtUnix          int64   `json:"fetched_at_unix"`
 	StaleSeconds           uint32  `json:"stale_seconds"`
+	// Degraded is true when the broker reached the provider but the quota
+	// sub-RPC failed, so the *Pct fields are placeholders (typically 0). The
+	// device renders "usage unavailable" on that provider's card instead of
+	// trusting the 0%. omitempty → emitted only when true (compat/USAGE_WIRE.md).
+	Degraded bool `json:"degraded,omitempty"`
 	// Slots is the optional per-card override surfaced by Gemini (and
 	// reserved for any future provider with N model-scoped buckets). When
 	// non-empty, the firmware ignores SessionPct/WeeklyPct/DesignPct and
@@ -196,6 +201,10 @@ func (c *Cache) Get(ctx context.Context, provider string) (Snapshot, error) {
 	c.mu.Lock()
 	delete(c.inFlights, provider)
 	if err == nil {
+		// A degraded snapshot (Fetch succeeded but a quota sub-RPC failed)
+		// still replaces last-good in the cache; the Degraded marker travels
+		// with it so the device sees "usage unavailable" rather than a stale-
+		// looking 0%.
 		snap.FetchedAtUnix = now.Unix()
 		snap.StaleSeconds = 0
 		c.entries[provider] = entry{snap: snap, fetched: now, hasValue: true}

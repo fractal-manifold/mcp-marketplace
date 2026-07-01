@@ -111,6 +111,10 @@ class Snapshot:
     tier: str = "unknown"
     fetched_at_unix: int = 0
     stale_seconds: int = 0
+    # True when the broker reached the provider but the quota sub-RPC failed,
+    # so the *_pct fields are placeholders. Emitted on the wire ONLY when true
+    # (the broker pops it when falsy) — see compat/USAGE_WIRE.md.
+    degraded: bool = False
     slots: list[Slot] = field(default_factory=list)
 
 
@@ -509,11 +513,18 @@ class AntigravityFetcher:
         project = str(doc.get("cloudaicompanionProject") or "")
         try:
             quota = await self._fetch_quota(session, token, project)
-        except Exception:
-            # ignore — fall back to tier-only snapshot
+        except Exception as e:
+            # Quota sub-RPC failed: keep the tier-only snapshot but log the
+            # error (previously swallowed) and mark it degraded below.
+            log.warning("usage: antigravity quota sub-RPC failed (degraded): %s", e)
             quota = None
         if quota:
             _antigravity_apply_quota(snap, quota, time.time())
+        else:
+            # Reached the provider but no usable quota → placeholder pct fields.
+            # Mark degraded so the device shows "usage unavailable" rather than
+            # a bogus 0% (compat/USAGE_WIRE.md).
+            snap.degraded = True
         return snap
 
     async def _fetch_quota(self, session: aiohttp.ClientSession, token: str, project: str) -> dict | None:

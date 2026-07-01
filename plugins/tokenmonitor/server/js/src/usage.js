@@ -400,9 +400,20 @@ export class AntigravityFetcher {
     const project = String(doc.cloudaicompanionProject || "");
     try {
       const quota = await this._fetchQuota(tok, project);
-      if (quota) antigravityApplyQuota(snap, quota, Date.now() / 1000);
-    } catch {
-      // ignore — fall back to tier-only snapshot
+      if (quota) {
+        antigravityApplyQuota(snap, quota, Date.now() / 1000);
+      } else {
+        // Reached the provider but got no usable quota → placeholder pct.
+        snap.degraded = true;
+        (this.logger || console).warn("usage: antigravity quota sub-RPC returned no data (degraded)");
+      }
+    } catch (e) {
+      // Quota sub-RPC failed: keep the tier-only snapshot but mark it degraded
+      // so the device shows "usage unavailable" rather than a bogus 0%
+      // (compat/USAGE_WIRE.md). Set the property only when true — emptySnapshot
+      // must not carry a default degraded key.
+      snap.degraded = true;
+      (this.logger || console).warn(`usage: antigravity quota sub-RPC failed (degraded): ${e && e.message ? e.message : e}`);
     }
     return snap;
   }

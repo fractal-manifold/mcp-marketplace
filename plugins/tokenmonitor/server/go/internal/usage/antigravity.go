@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os/exec"
 	"strings"
@@ -166,10 +167,18 @@ func (f *AntigravityFetcher) fetchInternal(ctx context.Context) (Snapshot, error
 	}
 
 	// retrieveUserQuotaSummary carries the grouped weekly buckets. On any
-	// error we fall back to the tier-only snapshot (matches the JS broker,
-	// which swallows the quota error and keeps the partial snapshot).
+	// error we fall back to the tier-only snapshot AND mark it Degraded so the
+	// device renders "usage unavailable" instead of trusting the placeholder
+	// 0% (compat/USAGE_WIRE.md). The error is logged (previously swallowed).
 	if q, qerr := f.fetchQuota(ctx, tok, doc.CloudAICompanionProject); qerr == nil && q != nil {
 		antigravityApplyQuota(&snap, q, f.now())
+	} else {
+		snap.Degraded = true
+		if qerr != nil {
+			log.Printf("usage: antigravity quota sub-RPC failed (degraded): %v", qerr)
+		} else {
+			log.Printf("usage: antigravity quota sub-RPC returned no data (degraded)")
+		}
 	}
 	return snap, nil
 }
