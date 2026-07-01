@@ -305,18 +305,27 @@ def codex_records(path: str) -> list[Record]:
             o = json.loads(line)
         except ValueError:
             continue
+        if not isinstance(o, dict):
+            continue
         otype = o.get("type")
         if otype == "session_meta" or "session_meta" in o:
             meta = o.get("session_meta") or o.get("payload") or o
+            # A malformed record (e.g. "session_meta": "bogus-string") makes
+            # meta a non-dict — guard so meta.get() below can't crash.
+            if not isinstance(meta, dict):
+                meta = {}
             if not model:
                 model = meta.get("model") or meta.get("originator") or ""
             if not session_ts:
                 session_ts = _parse_iso(meta.get("timestamp", "")) or _parse_iso(o.get("timestamp", ""))
         if otype == "turn_context":
-            payload = o.get("payload") or {}
-            if payload.get("model"):
+            payload = o.get("payload")
+            if isinstance(payload, dict) and payload.get("model"):
                 model = payload["model"]
-        payload = o.get("payload") or o
+        # token_count is only counted when it is inside the nested `payload`
+        # (Go semantics). A top-level token_count record with no payload is
+        # ignored — falling back to `o` would double-count.
+        payload = o.get("payload")
         if isinstance(payload, dict) and payload.get("type") == "token_count":
             info = payload.get("info") or {}
             tot = info.get("total_token_usage")

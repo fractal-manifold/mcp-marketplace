@@ -217,6 +217,7 @@ function codexRecords(path) {
     if (!line) continue;
     let o;
     try { o = JSON.parse(line); } catch { continue; }
+    if (!o || typeof o !== "object") continue;
     if (o.type === "session_meta" || o.session_meta) {
       const meta = o.session_meta || o.payload || o;
       model = model || meta.model || meta.originator || "";
@@ -225,7 +226,10 @@ function codexRecords(path) {
     if (o.type === "turn_context" && o.payload) {
       model = o.payload.model || model;
     }
-    const payload = o.payload || o;
+    // token_count is only counted when inside the nested `payload` (Go
+    // semantics). A top-level token_count with no payload is ignored — the old
+    // `o.payload || o` fallback double-counted it.
+    const payload = o.payload;
     if (payload && payload.type === "token_count" && payload.info) {
       const t = payload.info.total_token_usage;
       if (t) lastTotal = t; // accumulated — keep the last
