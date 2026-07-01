@@ -245,8 +245,11 @@ function verifyForPath({ cfg, cache, registry, logger }, req, res, path, recordS
 function handleCredentialsCodex({ cfg, cache, state, registry, logger }, req, res) {
   const rs = { s: 200 };
   res.on("close", () => { try { state.recordRequest(req.socket.remoteAddress || "", rs.s); } catch {} });
-  if (!cfg.codex?.enabled) { rs.s = 404; return writeError(res, 404, "codex provider disabled"); }
+  // Authenticate BEFORE revealing whether codex is enabled — otherwise an
+  // unsigned probe distinguishes enabled (401) from disabled (404), leaking
+  // the provider's enablement. Matches the Go reference (verify, then enabled).
   if (!verifyForPath({ cfg, cache, registry, logger }, req, res, "/credentials/codex", rs)) return;
+  if (!cfg.codex?.enabled) { rs.s = 404; return writeError(res, 404, "codex provider disabled"); }
   let c;
   try { c = creds.loadCodex(cfg.codexAuthPathAbs()); }
   catch (e) {

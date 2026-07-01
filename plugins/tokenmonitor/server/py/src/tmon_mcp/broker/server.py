@@ -362,13 +362,17 @@ async def _handle_credentials_codex(req: web.Request) -> web.Response:
     state = req.app["state"]
     status_to_record = 200
     try:
-        if not cfg.codex.enabled:
-            status_to_record = 404
-            return _error(404, "codex provider disabled")
+        # Authenticate BEFORE revealing whether codex is enabled — otherwise an
+        # unsigned probe distinguishes enabled (401) from disabled (404),
+        # leaking the provider's enablement to unauthenticated callers. Matches
+        # the Go reference (handleCodexCredentials: verify, then enabled).
         ok, err_resp = await _verify_for_path(req, "/credentials/codex")
         if not ok:
             status_to_record = err_resp.status
             return err_resp
+        if not cfg.codex.enabled:
+            status_to_record = 404
+            return _error(404, "codex provider disabled")
         try:
             c = creds.load_codex(cfg.codex_auth_path_abs())
         except creds.CredsFileMissing:
