@@ -253,6 +253,15 @@ test("check inert when unconfigured (no keys)", async () => {
   assert.equal(rep.devices.length, 0);
 });
 
+test("devPrerelease rejects a doubled -dev. suffix (first suffix must be exactly 12 digits)", () => {
+  // Regression for bug 22: the old end-anchored regex matched only the trailing
+  // "-dev.<12>" and wrongly accepted this; use the first occurrence like go/py.
+  assert.equal(ota.devPrerelease("1.0.0-dev.111111111111-dev.222222222222"), null);
+  assert.equal(ota.validVersion("1.0.0-dev.111111111111-dev.222222222222"), false);
+  // A single well-formed suffix still parses.
+  assert.equal(ota.devPrerelease("0.6.8-dev.202606021930"), 202606021930n);
+});
+
 // --- shared cross-runtime version-ordering contract -------------------------
 const orderPath = findCompat("ota/semver_order.json");
 const ORDER = orderPath ? JSON.parse(readFileSync(orderPath, "utf8")) : null;

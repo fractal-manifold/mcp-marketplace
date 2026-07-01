@@ -72,8 +72,15 @@ export function packSemver(v) {
 // The fixed 12-digit width keeps the value identical across the Go (uint64)
 // and Python (int) brokers.
 export function devPrerelease(v) {
-  const m = /-dev\.([0-9]{12})$/.exec(String(v));
-  return m ? BigInt(m[1]) : null;
+  // Use the FIRST "-dev." occurrence and require the whole remainder to be
+  // exactly 12 digits (Go/py semantics). An end-anchored regex would wrongly
+  // accept "1.0.0-dev.<12>-dev.<12>" by matching only the trailing suffix.
+  const s = String(v);
+  const marker = "-dev.";
+  const i = s.indexOf(marker);
+  if (i < 0) return null;
+  const ts = s.slice(i + marker.length);
+  return /^[0-9]{12}$/.test(ts) ? BigInt(ts) : null;
 }
 
 // validVersion reports whether v is a well-formed firmware version:
