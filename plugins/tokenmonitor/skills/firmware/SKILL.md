@@ -109,8 +109,10 @@ python tools/tmtools/lib/manifest.py sign \
 
 `--channel dev` for development units (a production unit refuses a
 `channel:dev` manifest; omit the flag / use `--channel stable` for
-factory SKUs). `--sku` is the hardware SKU (`DEV`, `S1`, `S2`). The
-output JSON carries `manifest_b64` and `signature_b64`.
+factory SKUs). `--sku` is the **hardware** SKU (`S1`, `S2`, …); dev units
+still pass their real hardware SKU — `DEV` is a serial FAC value (dev-ness
+keys on the serial's FAC field), never a SKU. The output JSON carries
+`manifest_b64` and `signature_b64`.
 
 Deliver them with a **manifest-only** `set_device_pending` — it merges
 with the firmware pending you just staged (it does NOT replace it):
