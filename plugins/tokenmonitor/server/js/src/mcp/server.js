@@ -84,7 +84,7 @@ function pendingChanges(a, p) {
   if (p.city && p.city !== a.city) out.push("city");
   if (p.br_day && p.br_day !== a.br_day) out.push("br_day");
   if (p.br_night && p.br_night !== a.br_night) out.push("br_night");
-  if (p.vol && p.vol !== a.vol) out.push("vol");
+  if (p.vol != null && p.vol !== a.vol) out.push("vol");
   if (p.provider_modes && (!a.provider_modes || p.provider_modes.claude !== a.provider_modes.claude || p.provider_modes.codex !== a.provider_modes.codex || p.provider_modes.gemini !== a.provider_modes.gemini)) out.push("providers");
   if (p.autorotate_enabled != null && p.autorotate_enabled !== a.autorotate_enabled) out.push("autorotate_enabled");
   if (p.log_enabled != null && (a.log_enabled == null || p.log_enabled !== a.log_enabled)) out.push("log_enabled");
@@ -367,7 +367,7 @@ function registerDeviceTool(deps, args) {
     channel = validChannelArg(args.channel);
     if (channel === null) return { error: "channel must be 'stable' or 'dev'" };
   }
-  const payload = { broker_url: brokerURL, psk_hex: pskHex, city: String(args.city || "").trim(), br_day: 0, br_night: 0, vol: 0, providers: null, provider_modes: null, autorotate_enabled: null, autorotate_interval_s: null, version: 0, channel };
+  const payload = { broker_url: brokerURL, psk_hex: pskHex, city: String(args.city || "").trim(), br_day: 0, br_night: 0, vol: null, providers: null, provider_modes: null, autorotate_enabled: null, autorotate_interval_s: null, version: 0, channel };
   if (args.br_day) payload.br_day = clamp(Number.parseInt(args.br_day, 10) || 0, 10, 100);
   if (args.br_night) payload.br_night = clamp(Number.parseInt(args.br_night, 10) || 0, 5, 100);
   if (args.vol != null) payload.vol = clamp(Number.parseInt(args.vol, 10) || 0, 0, 100);
@@ -391,7 +391,7 @@ function setDevicePendingTool(deps, args) {
       return { error: e.message };
     }
   }
-  const upd = { version: 0, broker_url: "", psk_hex: "", city: "", br_day: 0, br_night: 0, vol: 0, providers: null, provider_modes: null, autorotate_enabled: null, autorotate_interval_s: null, theme_mode: "", pet_enabled: null, pet_species: null, pet_name: "", gemini_models: null, log_enabled: null, firmware_url: "", firmware_sha256: "", firmware_version: "", firmware_manifest_b64: "", firmware_manifest_sig_b64: "", min_secure_version: 0 };
+  const upd = { version: 0, broker_url: "", psk_hex: "", city: "", br_day: 0, br_night: 0, vol: null, providers: null, provider_modes: null, autorotate_enabled: null, autorotate_interval_s: null, theme_mode: "", pet_enabled: null, pet_species: null, pet_name: "", gemini_models: null, log_enabled: null, firmware_url: "", firmware_sha256: "", firmware_version: "", firmware_manifest_b64: "", firmware_manifest_sig_b64: "", min_secure_version: 0 };
   if (args.broker_url) upd.broker_url = String(args.broker_url).trim();
   if (args.psk_hex) {
     const v = String(args.psk_hex).trim().toLowerCase();
@@ -552,7 +552,7 @@ function publishFirmwareTool(deps, args) {
     firmwareURL = `${base}/firmware/${fileName}`;
   }
 
-  const upd = { version: 0, broker_url: "", psk_hex: "", city: "", br_day: 0, br_night: 0, vol: 0,
+  const upd = { version: 0, broker_url: "", psk_hex: "", city: "", br_day: 0, br_night: 0, vol: null,
                 providers: null, provider_modes: null, autorotate_enabled: null, autorotate_interval_s: null,
                 theme_mode: "", gemini_models: null,
                 firmware_url: firmwareURL, firmware_sha256: shaHex, firmware_version: version };
@@ -591,7 +591,7 @@ function revertFirmwareTool(deps, args) {
       `To downgrade, issue a new firmware with min_secure_version below ${floor}, signed by the KSK.`
     ) };
   }
-  const upd = { version: 0, broker_url: "", psk_hex: "", city: "", br_day: 0, br_night: 0, vol: 0,
+  const upd = { version: 0, broker_url: "", psk_hex: "", city: "", br_day: 0, br_night: 0, vol: null,
                 providers: null, provider_modes: null, autorotate_enabled: null, autorotate_interval_s: null,
                 theme_mode: "", gemini_models: null,
                 firmware_url: fu, firmware_sha256: fs, firmware_version: fv,
@@ -732,7 +732,7 @@ async function provisionTool(deps, args) {
     const regModes = payload.providers
       ? { claude: providerModeFromBool(!!payload.providers.claude), codex: providerModeFromBool(!!payload.providers.codex), gemini: providerModeFromBool(!!payload.providers.gemini) }
       : null;
-    const regPayload = { version: 0, broker_url: brokerURL, psk_hex: pskHex, city: payload.city || "", br_day: payload.br_day || 0, br_night: payload.br_night || 0, vol: payload.vol || 0, providers: null, provider_modes: regModes, autorotate_enabled: null, autorotate_interval_s: null, theme_mode: payload.theme_mode || "", pet_enabled: ("pet_enabled" in payload) ? payload.pet_enabled : null };
+    const regPayload = { version: 0, broker_url: brokerURL, psk_hex: pskHex, city: payload.city || "", br_day: payload.br_day || 0, br_night: payload.br_night || 0, vol: payload.vol ?? null, providers: null, provider_modes: regModes, autorotate_enabled: null, autorotate_interval_s: null, theme_mode: payload.theme_mode || "", pet_enabled: ("pet_enabled" in payload) ? payload.pet_enabled : null };
     try { deps.registry.register(deviceID, regPayload); out.registered = true; }
     catch (e) {
       if (/already exists/.test(e.message)) {

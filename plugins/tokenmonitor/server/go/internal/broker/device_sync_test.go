@@ -21,6 +21,37 @@ import (
 
 const syncTestID = "ab12cd34"
 
+// TestPendingPayloadJSON_VolOmittedWhenNil pins the wire contract: a nil Vol
+// (never set) must NOT emit a "vol" key, so a device is never silently muted;
+// an explicit Vol=0 (mute) must emit "vol":0.
+func TestPendingPayloadJSON_VolOmittedWhenNil(t *testing.T) {
+	u8 := func(v uint8) *uint8 { return &v }
+
+	nilJSON, err := pendingPayloadJSON(registry.ConfigPayload{Version: 8, City: "Barcelona"})
+	if err != nil {
+		t.Fatalf("pendingPayloadJSON (nil vol): %v", err)
+	}
+	var nilMap map[string]any
+	if err := json.Unmarshal(nilJSON, &nilMap); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := nilMap["vol"]; ok {
+		t.Fatalf("nil Vol must omit the vol key, got %s", nilJSON)
+	}
+
+	zeroJSON, err := pendingPayloadJSON(registry.ConfigPayload{Version: 8, Vol: u8(0)})
+	if err != nil {
+		t.Fatalf("pendingPayloadJSON (vol=0): %v", err)
+	}
+	var zeroMap map[string]any
+	if err := json.Unmarshal(zeroJSON, &zeroMap); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if v, ok := zeroMap["vol"]; !ok || v.(float64) != 0 {
+		t.Fatalf("explicit Vol=0 must emit vol:0, got %s", zeroJSON)
+	}
+}
+
 func mustHex(t *testing.T, n int) string {
 	t.Helper()
 	buf := make([]byte, n)

@@ -51,6 +51,23 @@ test("golden round-trips via JS reader/writer", { skip }, () => {
   }
 });
 
+const novolPath = findCompat("registry/golden/ab12cd34_novol.toml");
+const novolSkip = novolPath ? false : "compat/registry/golden unavailable (standalone checkout)";
+const novol = novolPath ? readFileSync(novolPath, "utf8") : "";
+
+test("golden with no vol key parses vol as null and round-trips absent", { skip: novolSkip }, () => {
+  const dev = _testing.deviceFromTOML(novol);
+  // Absent vol on disk must be null ("never set"), never 0 (explicit mute) —
+  // otherwise the device would be silently muted on the next sync.
+  assert.equal(dev.active.payload.vol, null);
+  assert.ok(dev.pending);
+  assert.equal(dev.pending.payload.vol, null);
+  // Round-trip through the writer keeps vol absent (null), never materialises 0.
+  const dev2 = _testing.deviceFromTOML(_testing.deviceToTOML(dev));
+  assert.equal(dev2.active.payload.vol, null);
+  assert.equal(dev2.pending.payload.vol, null);
+});
+
 test("theme_mode-only pending bumps version and round-trips", () => {
   const tmp = mkdtempSync(join(tmpdir(), "tmon-reg-"));
   try {

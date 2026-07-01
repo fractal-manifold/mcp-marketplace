@@ -156,6 +156,44 @@ test("device-sync emits legacy CTR pending when fw header is below the GCM floor
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("device-sync omits vol from the pending wire when it was never set", async () => {
+  const { dir, reg } = newReg();
+  try {
+    // Register + stage a city-only change; vol was never set on this device.
+    reg.register(DEVID, { ..._testing.emptyPayload(), broker_url: "http://x", psk_hex: PSK_HEX, city: "Madrid" });
+    reg.setPending(DEVID, { ..._testing.emptyPayload(), city: "Paris" });
+    const handler = createHandler({
+      cfg: makeCfg(), cache: new auth.NonceCache(300), state: new State(),
+      fwLogs: null, registry: reg, logger: silentLogger(),
+    });
+    const req = makeReq("GET", `/device/${DEVID}/sync`, syncHeaders(DEVID, 1, { "x-tmon-fw-version": "0.8.0" }));
+    const res = new FakeRes();
+    await dispatch(handler, req, res);
+    assert.equal(res.statusCode, 200, res.body);
+    const out = JSON.parse(res.body);
+    const nonce = Buffer.from(out.pending.nonce_b64, "base64");
+    const ct = Buffer.from(out.pending.payload_b64, "base64");
+    const pt = decryptPending(PSK, nonce, ct).toString("utf8");
+    const wire = JSON.parse(pt);
+    // The bug: JS materialised vol:0 → device silently muted. Must be absent.
+    assert.equal("vol" in wire, false, `vol must be omitted, got ${pt}`);
+
+    // But an explicit mute (vol=0) MUST reach the device.
+    const dev2 = reg.setPending(DEVID, { ..._testing.emptyPayload(), city: "Paris", vol: 0 });
+    const pv = dev2.pending.payload.version;
+    const req2 = makeReq("GET", `/device/${DEVID}/sync`, syncHeaders(DEVID, pv - 1, { "x-tmon-fw-version": "0.8.0" }));
+    const res2 = new FakeRes();
+    await dispatch(handler, req2, res2);
+    const out2 = JSON.parse(res2.body);
+    const pt2 = decryptPending(
+      PSK,
+      Buffer.from(out2.pending.nonce_b64, "base64"),
+      Buffer.from(out2.pending.payload_b64, "base64"),
+    ).toString("utf8");
+    assert.equal(JSON.parse(pt2).vol, 0, `explicit mute must be sent, got ${pt2}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("device-sync emits enc=gcm pending when fw header is >= 0.9.0", async () => {
   const { dir, reg } = newReg();
   try {

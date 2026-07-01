@@ -61,6 +61,35 @@ def test_golden_round_trips_via_python_writer():
         assert vars(dev.pending.payload.provider_modes) == {"claude": "auto", "codex": "auto", "gemini": "disabled"}
 
 
+def test_golden_novol_keeps_vol_absent():
+    """ab12cd34_novol.toml has no `vol` key: absence must parse as None
+    ("never set"), never 0 (explicit mute), and must survive a round-trip so
+    the device-sync wire blob omits vol and never silently mutes a device."""
+    from tmon_mcp.broker.server import _pending_payload_json
+
+    src = GOLDEN_DIR / "ab12cd34_novol.toml"
+    dev = _device_from_toml(src.read_text())
+    assert dev.active.payload.vol is None
+    assert dev.pending is not None
+    assert dev.pending.payload.vol is None
+
+    # Round-trip through the writer keeps vol absent.
+    dev2 = _device_from_toml(dev.to_toml())
+    assert dev2.active.payload.vol is None
+    assert dev2.pending.payload.vol is None
+
+    # The device-sync wire payload omits vol entirely when it was never set.
+    import json
+
+    wire = json.loads(_pending_payload_json(dev.pending.payload))
+    assert "vol" not in wire
+
+    # But an explicit mute (vol=0) IS emitted.
+    dev.pending.payload.vol = 0
+    wire0 = json.loads(_pending_payload_json(dev.pending.payload))
+    assert wire0["vol"] == 0
+
+
 def test_register_and_set_pending(tmp_path: Path):
     reg = Registry(str(tmp_path))
     dev = reg.register("abcdef01", ConfigPayload(broker_url="http://example", psk_hex="aa" * 32, city="X"))

@@ -366,7 +366,7 @@ function providersToModes(p) {
 function emptyPayload() {
   return {
     version: 0, broker_url: "", psk_hex: "", city: "",
-    br_day: 0, br_night: 0, vol: 0,
+    br_day: 0, br_night: 0, vol: null,
     providers: null, provider_modes: null, autorotate_enabled: null, autorotate_interval_s: null,
     theme_mode: "",
     // Virtual pet — device-owned display settings, synced like theme/brightness.
@@ -396,7 +396,9 @@ function payloadToTomlObj(p) {
   if (p.city) d.city = p.city;
   if (p.br_day) d.br_day = Number(p.br_day);
   if (p.br_night) d.br_night = Number(p.br_night);
-  if (p.vol) d.vol = Number(p.vol);
+  // vol == null means "never set" (omit); vol === 0 is an explicit mute and
+  // must survive the round-trip, so guard on != null rather than truthiness.
+  if (p.vol != null) d.vol = Number(p.vol);
   // provider_modes is the canonical field; the legacy providers bool table
   // is never written (loadLocked migrates it on read).
   if (p.provider_modes != null) {
@@ -434,7 +436,8 @@ function tomlObjToPayload(d) {
     city: String(d.city || ""),
     br_day: Number(d.br_day || 0),
     br_night: Number(d.br_night || 0),
-    vol: Number(d.vol || 0),
+    // vol absent on disk == "never set" (null), not 0 (which is explicit mute).
+    vol: typeof d.vol === "number" ? d.vol : null,
     // Canonical field is provider_modes; fold any legacy providers bool
     // table into it and drop the bool so it is never re-emitted.
     providers: null,

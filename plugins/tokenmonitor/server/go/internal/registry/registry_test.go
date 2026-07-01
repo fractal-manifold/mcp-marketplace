@@ -81,6 +81,54 @@ func TestGolden_LegacyProvidersMigrateToModes(t *testing.T) {
 	}
 }
 
+// TestGolden_NoVol loads the shared ab12cd34_novol.toml fixture (no `vol`
+// key in [active] or [pending]) and asserts the Go reader treats absent vol
+// as nil ("never set"), not 0 (explicit mute), and that a save/reload
+// round-trip keeps it nil. Mirrors the JS/Python novol tests.
+func TestGolden_NoVol(t *testing.T) {
+	src := findGolden(t, "ab12cd34_novol.toml")
+	if src == "" {
+		t.Skip("compat/registry/golden unavailable (standalone checkout)")
+	}
+	raw, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatalf("read golden: %v", err)
+	}
+	r := newReg(t)
+	if err := os.WriteFile(filepath.Join(r.dir, "ab12cd34.toml"), raw, 0o644); err != nil {
+		t.Fatalf("seed golden: %v", err)
+	}
+	dev, err := r.Load("ab12cd34")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if dev.Active.Vol != nil {
+		t.Fatalf("active vol absent on disk should parse as nil, got %v", *dev.Active.Vol)
+	}
+	if dev.Pending == nil {
+		t.Fatal("pending missing")
+	}
+	if dev.Pending.Vol != nil {
+		t.Fatalf("pending vol absent on disk should parse as nil, got %v", *dev.Pending.Vol)
+	}
+	// Round-trip: a partial update to the pending (no vol) must not
+	// materialise vol=0.
+	dev2, err := r.SetPending("ab12cd34", ConfigPayload{City: "Sevilla"})
+	if err != nil {
+		t.Fatalf("SetPending: %v", err)
+	}
+	if dev2.Pending.Vol != nil {
+		t.Fatalf("pending vol should stay nil after partial update, got %v", *dev2.Pending.Vol)
+	}
+	reloaded, err := r.Load("ab12cd34")
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.Pending.Vol != nil {
+		t.Fatalf("pending vol should stay nil after reload, got %v", *reloaded.Pending.Vol)
+	}
+}
+
 func TestValidDeviceID(t *testing.T) {
 	cases := map[string]bool{
 		"ab12cd34": true,
