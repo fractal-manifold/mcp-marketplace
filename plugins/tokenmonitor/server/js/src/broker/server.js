@@ -175,22 +175,43 @@ async function handleFirmware({ cfg, cache, registry, logger, name }, req, res) 
     res.setHeader("X-Tmon-Firmware-SHA256", sha);
   }
 
-  // Minimal Range: bytes=START-[END] support. Anything else falls back
-  // to a full response. The device's resume path only ever asks for a
-  // single open-ended suffix, so the simple case is enough.
+  // Range: bytes=START-[END] and suffix bytes=-N support, matching the Go
+  // reference (http.ServeContent). An out-of-range or unsatisfiable request
+  // returns 416 + Content-Range: bytes */<size>; an unparseable Range header
+  // falls back to a full 200.
   const range = req.headers.range;
   let start = 0, end = st.size - 1, status = 200;
   if (range) {
     const m = /^bytes=(\d*)-(\d*)$/.exec(range);
-    if (m) {
-      const s = m[1] ? Number.parseInt(m[1], 10) : NaN;
-      const e = m[2] ? Number.parseInt(m[2], 10) : st.size - 1;
-      if (!Number.isNaN(s) && s < st.size) {
-        start = s;
-        end = Math.min(e, st.size - 1);
-        status = 206;
-        res.setHeader("Content-Range", `bytes ${start}-${end}/${st.size}`);
+    if (m && (m[1] !== "" || m[2] !== "")) {
+      let satisfiable = true;
+      if (m[1] === "") {
+        // Suffix range: last N bytes. bytes=-0 (or invalid) is unsatisfiable.
+        const n = Number.parseInt(m[2], 10);
+        if (!Number.isFinite(n) || n <= 0) {
+          satisfiable = false;
+        } else {
+          start = Math.max(0, st.size - n);
+          end = st.size - 1;
+        }
+      } else {
+        const s = Number.parseInt(m[1], 10);
+        const e = m[2] ? Number.parseInt(m[2], 10) : st.size - 1;
+        if (!Number.isFinite(s) || s >= st.size) {
+          satisfiable = false;
+        } else {
+          start = s;
+          end = Math.min(e, st.size - 1);
+          if (end < start) satisfiable = false;
+        }
       }
+      if (!satisfiable) {
+        res.setHeader("Content-Range", `bytes */${st.size}`);
+        res.statusCode = 416;
+        return res.end();
+      }
+      status = 206;
+      res.setHeader("Content-Range", `bytes ${start}-${end}/${st.size}`);
     }
   }
   res.setHeader("Content-Length", end - start + 1);
