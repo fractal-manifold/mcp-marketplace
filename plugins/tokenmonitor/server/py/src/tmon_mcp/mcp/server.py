@@ -332,6 +332,19 @@ async def _health(deps: Deps) -> dict:
         checks.append({"name": "observed_traffic", "pass": False, "detail": f"last request returned {snap.last_request_status}"})
 
     ok = all(c["pass"] for c in checks)
+
+    # broker version advisory. Appended AFTER the ok rollup: an available update
+    # is informational, not a health failure, so it never flips ok:false.
+    # Emitted only once the self-check succeeded. Mirror of Go handleHealth.
+    u = deps.state.update()
+    if u.known:
+        if u.outdated:
+            checks.append({"name": "broker_version", "pass": False,
+                           "detail": f"{u.current} installed; {u.latest} available — update the tokenmonitor plugin"})
+        else:
+            checks.append({"name": "broker_version", "pass": True,
+                           "detail": f"{u.current} (up to date)"})
+
     return {"ok": ok, "role": snap.role, "checks": checks}
 
 

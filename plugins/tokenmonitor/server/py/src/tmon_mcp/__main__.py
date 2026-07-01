@@ -26,6 +26,7 @@ from .mdns import Publisher as MdnsPublisher
 from .registry.store import Registry
 from .serial_tailer import Tailer
 from .state import Role, State
+from . import updatecheck
 
 
 def _build_logger(logs: Buffer, level: str) -> logging.Logger:
@@ -125,11 +126,15 @@ async def _run_daemon(cfg, logs: Buffer, logger: logging.Logger) -> int:
     # leader by construction in daemon mode (it owns the bound socket).
     ota_stop = asyncio.Event()
     ota_task = asyncio.create_task(ota.run(cfg, registry, ota_stop))
+    # Broker self-version check: best-effort poll of the marketplace catalog so
+    # /sync (and tokenmonitor_health/status) can advertise "broker outdated".
+    update_task = asyncio.create_task(updatecheck.run(state, logger, stop=ota_stop))
     try:
         await asyncio.Event().wait()
     finally:
         ota_stop.set()
         await ota_task
+        await update_task
         if mdns_pub is not None:
             await mdns_pub.close()
         if tailer:
@@ -184,12 +189,18 @@ async def _run_mcp(cfg, logs: Buffer, logger: logging.Logger) -> int:
 
     broker_task = asyncio.create_task(leader_run(cfg.server.bind, cfg.server.port, state, on_leader, stop))
 
+    # Broker self-version check runs once at startup, NOT leader-scoped (mirror
+    # of Go main.go): both the MCP tools and any /sync we later serve as leader
+    # read the same shared verdict. Shares `stop` so it tears down with serve.
+    update_task = asyncio.create_task(updatecheck.run(state, logger, stop=stop))
+
     deps = McpDeps(cfg=cfg, state=state, logs=logs, registry=_open_registry(logger), version=__version__)
     try:
         await mcp_serve(deps)
     finally:
         stop.set()
         await broker_task
+        await update_task
     return 0
 
 

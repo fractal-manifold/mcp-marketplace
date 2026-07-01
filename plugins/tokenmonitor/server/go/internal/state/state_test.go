@@ -1,6 +1,8 @@
 package state
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -55,5 +57,30 @@ func TestRecordRequest(t *testing.T) {
 	s.RecordRequest("x", 401, now.Add(time.Second))
 	if snap := s.Snapshot(); snap.RequestsTotal != 2 {
 		t.Errorf("RequestsTotal after 2 records = %d", snap.RequestsTotal)
+	}
+}
+
+func TestUpdate_OmittedUntilKnown(t *testing.T) {
+	s := New()
+	// Before any check: fields must be entirely absent from the JSON so callers
+	// can distinguish "not yet checked" from "up to date".
+	b, _ := json.Marshal(s.Snapshot())
+	if strings.Contains(string(b), "update_available") || strings.Contains(string(b), "latest_version") {
+		t.Fatalf("unknown verdict leaked into snapshot: %s", b)
+	}
+
+	s.SetUpdate(UpdateInfo{Known: true, Outdated: true, Current: "0.9.2", Latest: "0.9.4"})
+	snap := s.Snapshot()
+	if snap.UpdateAvailable == nil || !*snap.UpdateAvailable {
+		t.Errorf("UpdateAvailable = %v, want true", snap.UpdateAvailable)
+	}
+	if snap.LatestVersion != "0.9.4" {
+		t.Errorf("LatestVersion = %q, want 0.9.4", snap.LatestVersion)
+	}
+
+	// Known and up to date: update_available present and false.
+	s.SetUpdate(UpdateInfo{Known: true, Outdated: false, Current: "0.9.4", Latest: "0.9.4"})
+	if snap := s.Snapshot(); snap.UpdateAvailable == nil || *snap.UpdateAvailable {
+		t.Errorf("UpdateAvailable = %v, want non-nil false", snap.UpdateAvailable)
 	}
 }

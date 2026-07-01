@@ -233,6 +233,14 @@ async function healthTool(deps) {
   else if (snap.last_request_status === 200) checks.push({ name: "observed_traffic", pass: true, detail: `last request OK at ${snap.last_request_at || ""}` });
   else checks.push({ name: "observed_traffic", pass: false, detail: `last request returned ${snap.last_request_status}` });
   const ok = checks.every((c) => c.pass);
+  // Broker version advisory. Appended AFTER the ok rollup: an available update
+  // is informational, not a health failure, so it never flips ok:false.
+  // Emitted only once the self-check succeeded. Mirrors Go handleHealth.
+  const u = deps.state.update ? deps.state.update() : null;
+  if (u && u.known) {
+    if (u.outdated) checks.push({ name: "broker_version", pass: false, detail: `${u.current} installed; ${u.latest} available — update the tokenmonitor plugin` });
+    else checks.push({ name: "broker_version", pass: true, detail: `${u.current} (up to date)` });
+  }
   return { ok, role: snap.role, checks };
 }
 

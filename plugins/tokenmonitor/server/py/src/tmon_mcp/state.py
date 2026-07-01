@@ -17,6 +17,21 @@ class Role(str, Enum):
 
 
 @dataclass
+class UpdateInfo:
+    """Cached result of the broker self-version check: is a newer broker/plugin
+    release published than the one running. ``known`` is False until the first
+    successful fetch of the remote marketplace catalog; while unknown the broker
+    advertises nothing (never a false "up to date" or "outdated"). Mirror of Go
+    state.UpdateInfo."""
+
+    known: bool = False
+    outdated: bool = False
+    current: str = ""
+    latest: str = ""
+    checked_at: str = ""  # RFC3339, empty until the first successful check
+
+
+@dataclass
 class Snapshot:
     runtime: str
     role: str
@@ -25,6 +40,10 @@ class Snapshot:
     last_request_remote: str = ""
     last_request_status: int = 0
     requests_total: int = 0
+    # update_available is set only once the self-version check has succeeded;
+    # None (omitted) means "not yet checked", distinct from False ("up to date").
+    update_available: bool | None = None
+    latest_version: str = ""
 
     def to_dict(self) -> dict:
         out = {
@@ -39,6 +58,10 @@ class Snapshot:
             out["last_request_remote"] = self.last_request_remote
         if self.last_request_status:
             out["last_request_status"] = self.last_request_status
+        if self.update_available is not None:
+            out["update_available"] = self.update_available
+        if self.latest_version:
+            out["latest_version"] = self.latest_version
         return out
 
 
@@ -54,6 +77,7 @@ class State:
     _last_remote: str = ""
     _last_status: int = 0
     _count: int = 0
+    _update: UpdateInfo = field(default_factory=UpdateInfo)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def set_role(self, role: Role) -> None:
@@ -71,8 +95,22 @@ class State:
             self._last_status = status
             self._count += 1
 
+    def set_update(self, info: UpdateInfo) -> None:
+        """Record the latest broker self-version-check result. The update-check
+        poller pokes this concurrently; the broker /sync handler and the MCP
+        health/status tools read it back via ``update``."""
+        with self._lock:
+            self._update = info
+
+    def update(self) -> UpdateInfo:
+        """Return the last cached self-version-check result (default =
+        known:False, i.e. no check has succeeded yet)."""
+        with self._lock:
+            return self._update
+
     def snapshot(self) -> Snapshot:
         with self._lock:
+            u = self._update
             return Snapshot(
                 runtime=RUNTIME,
                 role=self._role.value,
@@ -81,4 +119,6 @@ class State:
                 last_request_remote=self._last_remote,
                 last_request_status=self._last_status,
                 requests_total=self._count,
+                update_available=(u.outdated if u.known else None),
+                latest_version=(u.latest if u.known else ""),
             )

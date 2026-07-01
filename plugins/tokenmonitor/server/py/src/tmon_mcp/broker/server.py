@@ -676,6 +676,18 @@ async def _handle_device_sync(req: web.Request) -> web.Response:
 
         dev = registry.load(device_id)
         resp_body: dict[str, Any] = {"active_version": dev.active.payload.version}
+        # Advertise the broker self-version-check verdict on every 200 so the
+        # device can surface a "broker outdated" banner. Only once known — an
+        # unchecked/unreachable verdict stays absent (no false banner). Mirror
+        # of Go's syncResponse omitempty fields.
+        try:
+            u = state.update()
+        except Exception:
+            u = None
+        if u is not None and u.known:
+            resp_body["broker_update_available"] = u.outdated
+            resp_body["broker_version"] = u.current
+            resp_body["broker_latest"] = u.latest
         if dev.pending is not None and observed < dev.pending.payload.version:
             if active is None or len(active) != 32:
                 status_to_record = 500

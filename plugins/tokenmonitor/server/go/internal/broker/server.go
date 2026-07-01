@@ -141,7 +141,7 @@ func NewMux(cfg *config.Config, cache *auth.NonceCache, st *state.State, logger 
 		} else if strings.HasSuffix(r.URL.Path, "/settings") {
 			handleDeviceSettings(cfg, cache, logger, reg, rec, r)
 		} else {
-			handleDeviceSync(cfg, cache, logger, reg, rec, r)
+			handleDeviceSync(cfg, cache, logger, reg, st, rec, r)
 		}
 		if st != nil {
 			st.RecordRequest(r.RemoteAddr, rec.status, time.Now())
@@ -764,6 +764,15 @@ func fwSupportsGCM(fw string) bool {
 type syncResponse struct {
 	ActiveVersion uint32       `json:"active_version"`
 	Pending       *pendingBlob `json:"pending,omitempty"`
+	// BrokerUpdateAvailable is true when the broker's self-version check found
+	// a newer plugin/broker release published than the one running. Emitted
+	// only once a check has succeeded; absent while the verdict is unknown, so
+	// the device never shows a false "update available" banner. BrokerVersion
+	// is the running release version (for the device's Settings line);
+	// BrokerLatest is the newest published version when known.
+	BrokerUpdateAvailable *bool  `json:"broker_update_available,omitempty"`
+	BrokerVersion         string `json:"broker_version,omitempty"`
+	BrokerLatest          string `json:"broker_latest,omitempty"`
 }
 
 // pendingPayloadJSON serialises a registry.ConfigPayload to the canonical
@@ -883,7 +892,7 @@ func pendingPayloadJSON(p registry.ConfigPayload) ([]byte, error) {
 // pending PSK can fetch and confirm), promotes if the device has
 // adopted pending, and returns the (encrypted) pending blob whenever
 // the device's reported config_version lags behind.
-func handleDeviceSync(cfg *config.Config, cache *auth.NonceCache, logger *log.Logger, reg *registry.Registry, w http.ResponseWriter, r *http.Request) {
+func handleDeviceSync(cfg *config.Config, cache *auth.NonceCache, logger *log.Logger, reg *registry.Registry, st *state.State, w http.ResponseWriter, r *http.Request) {
 	if reg == nil {
 		writeError(w, http.StatusNotFound, "device registry not configured")
 		return
@@ -1010,6 +1019,17 @@ func handleDeviceSync(cfg *config.Config, cache *auth.NonceCache, logger *log.Lo
 	}
 
 	resp := syncResponse{ActiveVersion: dev.Active.Version}
+	if st != nil {
+		// Advertise the broker self-version-check verdict on every 200 so the
+		// device can surface a "broker outdated" banner. Only once known — an
+		// unchecked/unreachable verdict stays absent (no false banner).
+		if u := st.Update(); u.Known {
+			avail := u.Outdated
+			resp.BrokerUpdateAvailable = &avail
+			resp.BrokerVersion = u.Current
+			resp.BrokerLatest = u.Latest
+		}
+	}
 	if dev.Pending != nil && observed < dev.Pending.Version {
 		// Encrypt the pending payload with the device's *currently active*
 		// PSK. The device decrypts with what it already has, learns the

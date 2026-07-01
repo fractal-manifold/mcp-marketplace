@@ -9,6 +9,7 @@ import { VERSION, RUNTIME } from "./version.js";
 import * as auth from "./auth.js";
 import * as creds from "./creds.js";
 import * as ota from "./ota.js";
+import * as updatecheck from "./updatecheck.js";
 import * as usage from "./usage.js";
 import * as spend from "./spend.js";
 import { load as loadConfig, devicesPath } from "./config.js";
@@ -129,6 +130,10 @@ async function runDaemon(cfg, logs, logger) {
   // leader by construction in daemon mode — it owns the bound socket.
   const otaAbort = new AbortController();
   ota.run(cfg, registry, otaAbort.signal, logger);
+  // Broker self-version check: best-effort, started once at startup (not
+  // leader-scoped — a daemon is the leader by construction). Shares the OTA
+  // abort so it tears down with the process. Mirrors Go's go updatecheck.Run.
+  updatecheck.run(state, { baked: VERSION, logger, abortSignal: otaAbort.signal });
   try {
     await new Promise(() => {}); // run until killed
   } finally {
@@ -146,6 +151,13 @@ async function runMCP(cfg, logs, logger) {
   const fwLogs = (limit) => ({ connected: tailer ? tailer.connected() : false, total_available: fwBuf.length, lines: fwBuf.tail(limit) });
   const abortCtrl = new AbortController();
   const registry = openRegistry(logger);
+
+  // Broker self-version check: best-effort, started once at startup and NOT
+  // scoped to leadership — even a follower session should surface "broker
+  // outdated" via tokenmonitor_health / tokenmonitor_status. Shares the MCP
+  // abort so it stops when the server shuts down. Mirrors Go's
+  // go updatecheck.Run(ctx, Version, st, logger).
+  updatecheck.run(state, { baked: VERSION, logger, abortSignal: abortCtrl.signal });
 
   // makeServer is called by tryListen on each leadership attempt. The
   // server it returns is the actual HTTP server — no probe-then-relisten.

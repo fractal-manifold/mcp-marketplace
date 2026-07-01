@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -141,6 +142,64 @@ func TestDeviceSync_PendingDelivered_DecryptsWithActivePSK(t *testing.T) {
 	}
 	if payload["psk_hex"] != newPSK {
 		t.Errorf("payload psk_hex = %v, want %s", payload["psk_hex"], newPSK)
+	}
+}
+
+// newDeviceSyncServerWithState is like newDeviceSyncServer but hands back the
+// *state.State so a test can seed the broker self-version verdict.
+func newDeviceSyncServerWithState(t *testing.T) (*httptest.Server, *registry.Registry, *state.State) {
+	t.Helper()
+	cfg := newTestConfig(t, writeCredsFile(t, time.Now().Add(time.Hour).UnixMilli()))
+	cache := auth.NewNonceCache(time.Duration(cfg.Security.NonceCacheTTLSeconds) * time.Second)
+	logger := log.New(io.Discard, "", 0)
+	reg, err := registry.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := state.New()
+	ts := httptest.NewServer(NewMux(cfg, cache, st, logger, nil, reg, nil, nil))
+	t.Cleanup(ts.Close)
+	return ts, reg, st
+}
+
+func TestDeviceSync_BrokerUpdateFields_PresentWhenKnown(t *testing.T) {
+	ts, reg, st := newDeviceSyncServerWithState(t)
+	st.SetUpdate(state.UpdateInfo{Known: true, Outdated: true, Current: "0.9.2", Latest: "0.9.4"})
+	activePSK := mustHex(t, 32)
+	if _, err := reg.Register(syncTestID, registry.ConfigPayload{PSKHex: activePSK, BrokerURL: "http://x"}); err != nil {
+		t.Fatal(err)
+	}
+	pskBytes, _ := hex.DecodeString(activePSK)
+	resp := signedSyncRequest(t, ts, pskBytes, syncTestID, 1)
+	defer resp.Body.Close()
+	var r syncResponse
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		t.Fatal(err)
+	}
+	if r.BrokerUpdateAvailable == nil || !*r.BrokerUpdateAvailable {
+		t.Errorf("broker_update_available = %v, want true", r.BrokerUpdateAvailable)
+	}
+	if r.BrokerVersion != "0.9.2" || r.BrokerLatest != "0.9.4" {
+		t.Errorf("broker version/latest = %q/%q, want 0.9.2/0.9.4", r.BrokerVersion, r.BrokerLatest)
+	}
+}
+
+func TestDeviceSync_BrokerUpdateFields_AbsentWhenUnknown(t *testing.T) {
+	ts, reg, _ := newDeviceSyncServerWithState(t) // verdict left unknown
+	activePSK := mustHex(t, 32)
+	if _, err := reg.Register(syncTestID, registry.ConfigPayload{PSKHex: activePSK, BrokerURL: "http://x"}); err != nil {
+		t.Fatal(err)
+	}
+	pskBytes, _ := hex.DecodeString(activePSK)
+	resp := signedSyncRequest(t, ts, pskBytes, syncTestID, 1)
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	// Raw-body check: the fields must be entirely absent (omitempty), not just
+	// zero-valued, so an old-firmware/JSON-strict device never misreads them.
+	for _, key := range []string{"broker_update_available", "broker_version", "broker_latest"} {
+		if strings.Contains(string(body), key) {
+			t.Errorf("unknown verdict leaked %q into /sync body: %s", key, body)
+		}
 	}
 }
 

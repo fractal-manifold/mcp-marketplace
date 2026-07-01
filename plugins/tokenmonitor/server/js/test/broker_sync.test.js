@@ -239,6 +239,68 @@ test("device-sync clears a revert tombstone once the device reports a newer vers
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("device-sync omits broker_* update fields while the verdict is unknown", async () => {
+  const { dir, reg } = newReg();
+  try {
+    reg.register(DEVID, { ..._testing.emptyPayload(), broker_url: "http://x", psk_hex: PSK_HEX });
+    // Fresh State: no update check has succeeded → known:false.
+    const handler = createHandler({
+      cfg: makeCfg(), cache: new auth.NonceCache(300), state: new State(),
+      fwLogs: null, registry: reg, logger: silentLogger(),
+    });
+    const req = makeReq("GET", `/device/${DEVID}/sync`, syncHeaders(DEVID, 0));
+    const res = new FakeRes();
+    await dispatch(handler, req, res);
+    assert.equal(res.statusCode, 200, res.body);
+    const out = JSON.parse(res.body);
+    assert.equal(out.broker_update_available, undefined);
+    assert.equal(out.broker_version, undefined);
+    assert.equal(out.broker_latest, undefined);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("device-sync advertises broker_update_available:true when the cache says outdated", async () => {
+  const { dir, reg } = newReg();
+  try {
+    reg.register(DEVID, { ..._testing.emptyPayload(), broker_url: "http://x", psk_hex: PSK_HEX });
+    const state = new State();
+    state.setUpdate({ known: true, outdated: true, current: "0.9.2", latest: "0.9.4", checkedAt: 1 });
+    const handler = createHandler({
+      cfg: makeCfg(), cache: new auth.NonceCache(300), state,
+      fwLogs: null, registry: reg, logger: silentLogger(),
+    });
+    const req = makeReq("GET", `/device/${DEVID}/sync`, syncHeaders(DEVID, 0));
+    const res = new FakeRes();
+    await dispatch(handler, req, res);
+    assert.equal(res.statusCode, 200, res.body);
+    const out = JSON.parse(res.body);
+    assert.equal(out.broker_update_available, true);
+    assert.equal(out.broker_version, "0.9.2");
+    assert.equal(out.broker_latest, "0.9.4");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("device-sync still emits broker_* (available:false) when known & up to date", async () => {
+  const { dir, reg } = newReg();
+  try {
+    reg.register(DEVID, { ..._testing.emptyPayload(), broker_url: "http://x", psk_hex: PSK_HEX });
+    const state = new State();
+    state.setUpdate({ known: true, outdated: false, current: "0.9.4", latest: "0.9.4", checkedAt: 1 });
+    const handler = createHandler({
+      cfg: makeCfg(), cache: new auth.NonceCache(300), state,
+      fwLogs: null, registry: reg, logger: silentLogger(),
+    });
+    const req = makeReq("GET", `/device/${DEVID}/sync`, syncHeaders(DEVID, 0));
+    const res = new FakeRes();
+    await dispatch(handler, req, res);
+    assert.equal(res.statusCode, 200, res.body);
+    const out = JSON.parse(res.body);
+    assert.equal(out.broker_update_available, false);
+    assert.equal(out.broker_version, "0.9.4");
+    assert.equal(out.broker_latest, "0.9.4");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("percent-encoded usage path verifies against the DECODED signature", async () => {
   // /usage/cla%75de on the wire; the device signs /usage/claude. The handler
   // must decode before HMAC, so the (default-PSK) verify path is reached and

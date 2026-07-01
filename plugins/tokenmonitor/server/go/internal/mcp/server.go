@@ -365,6 +365,20 @@ func handleHealth(d Deps) server.ToolHandlerFunc {
 				break
 			}
 		}
+
+		// 4. broker version advisory. Appended AFTER the allOK rollup: an
+		//    available update is informational, not a health failure, so it
+		//    never flips ok:false. Emitted only once the self-check succeeded.
+		if u := d.State.Update(); u.Known {
+			if u.Outdated {
+				checks = append(checks, healthCheck{"broker_version", false,
+					u.Current + " installed; " + u.Latest + " available — update the tokenmonitor plugin"})
+			} else {
+				checks = append(checks, healthCheck{"broker_version", true,
+					u.Current + " (up to date)"})
+			}
+		}
+
 		return mcp.NewToolResultJSON(struct {
 			OK     bool          `json:"ok"`
 			Role   string        `json:"role"`

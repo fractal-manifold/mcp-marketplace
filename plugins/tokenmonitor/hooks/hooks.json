@@ -1,0 +1,15 @@
+{
+  "description": "TokenMonitor SessionStart hook — nudges to update the plugin/broker when a newer release is published (the broker does not auto-update)",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start.js\""
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -548,6 +548,18 @@ function handleDeviceSync({ cfg, cache, state, registry, logger, deviceID }, req
     }
 
     const out = { active_version: dev.active.payload.version };
+    // Advertise the broker self-version-check verdict on every 200 so the
+    // device can surface a "broker outdated" banner. Only once known — an
+    // unchecked/unreachable verdict stays absent (no false banner). Mirrors
+    // Go's *bool + omitempty behaviour on the sync response.
+    if (state && typeof state.update === "function") {
+      const u = state.update();
+      if (u && u.known) {
+        out.broker_update_available = u.outdated;
+        out.broker_version = u.current;
+        out.broker_latest = u.latest;
+      }
+    }
     if (dev.pending && observed < dev.pending.payload.version) {
       if (!active || active.length !== 32) return finishErr(500, "broker config invalid");
       const pt = Buffer.from(pendingPayloadJSON(dev.pending.payload), "utf8");

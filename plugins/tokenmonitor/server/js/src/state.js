@@ -19,6 +19,11 @@ export class State {
     this._lastRemote = "";
     this._lastStatus = 0;
     this._count = 0;
+    // Cached broker self-version-check verdict. `known` stays false until the
+    // first successful marketplace fetch; while unknown the broker advertises
+    // nothing (never a false "up to date" or "outdated"). Mirrors Go
+    // state.UpdateInfo.
+    this._update = { known: false, outdated: false, current: "", latest: "", checkedAt: 0 };
   }
   setRole(r) {
     if (this._role === r) return;
@@ -31,6 +36,23 @@ export class State {
     this._lastStatus = status;
     this._count += 1;
   }
+  // setUpdate records the latest broker self-version-check result. The
+  // update-check poller pokes this; the broker /sync handler and the MCP
+  // health/status tools read it back via update(). Mirrors Go State.SetUpdate.
+  setUpdate(u) {
+    this._update = {
+      known: !!(u && u.known),
+      outdated: !!(u && u.outdated),
+      current: (u && u.current) || "",
+      latest: (u && u.latest) || "",
+      checkedAt: (u && u.checkedAt) || 0,
+    };
+  }
+  // update returns the last cached self-version-check result (default =
+  // known:false, i.e. no check has succeeded yet). Mirrors Go State.Update.
+  update() {
+    return this._update;
+  }
   snapshot() {
     const out = {
       runtime: RUNTIME,
@@ -41,6 +63,13 @@ export class State {
     if (this._lastAt) out.last_request_at = rfc3339(this._lastAt);
     if (this._lastRemote) out.last_request_remote = this._lastRemote;
     if (this._lastStatus) out.last_request_status = this._lastStatus;
+    // Surface the update verdict only once known, so callers distinguish
+    // "up to date" from "not yet checked". Mirrors Go Snapshot's
+    // *bool omitempty + latest_version,omitempty.
+    if (this._update.known) {
+      out.update_available = this._update.outdated;
+      if (this._update.latest) out.latest_version = this._update.latest;
+    }
     return out;
   }
 }

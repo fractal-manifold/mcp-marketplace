@@ -54,6 +54,7 @@ import (
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/serial"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/spend"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/state"
+	"github.com/fractal-manifold/tokenmonitor-mcp/internal/updatecheck"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/usage"
 )
 
@@ -280,6 +281,11 @@ func runMCP(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int {
 	defer stop()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	// Broker self-version check: is a newer plugin/broker release published?
+	// Runs in every process (not leader-scoped) so both the MCP tools and the
+	// broker /sync handler read a populated verdict. Best-effort — never blocks.
+	go updatecheck.Run(ctx, Version, st, logger)
 
 	var wg sync.WaitGroup
 

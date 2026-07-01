@@ -39,6 +39,19 @@ type State struct {
 	lastRequestRemote string
 	lastRequestStatus int
 	requestsTotal     uint64
+	update            UpdateInfo
+}
+
+// UpdateInfo is the cached result of the broker self-version check: is a newer
+// broker/plugin release published than the one running. Known is false until
+// the first successful fetch of the remote marketplace catalog; while unknown
+// the broker advertises nothing (never a false "up to date" or "outdated").
+type UpdateInfo struct {
+	Known     bool      `json:"known"`
+	Outdated  bool      `json:"outdated"`
+	Current   string    `json:"current"`
+	Latest    string    `json:"latest,omitempty"`
+	CheckedAt time.Time `json:"checked_at,omitempty"`
 }
 
 func New() *State {
@@ -67,6 +80,23 @@ func (s *State) RecordRequest(remote string, status int, t time.Time) {
 	s.requestsTotal++
 }
 
+// SetUpdate records the latest broker self-version-check result. The
+// update-check poller pokes this concurrently; the broker /sync handler and
+// the MCP health/status tools read it back via Update.
+func (s *State) SetUpdate(u UpdateInfo) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.update = u
+}
+
+// Update returns the last cached self-version-check result (zero value =
+// Known:false, i.e. no check has succeeded yet).
+func (s *State) Update() UpdateInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.update
+}
+
 // Snapshot is an immutable view suitable for serializing back to MCP
 // callers. Times are zero values if the event has never happened.
 // The Runtime field identifies which language implementation produced
@@ -80,6 +110,12 @@ type Snapshot struct {
 	LastRequestRemote string    `json:"last_request_remote,omitempty"`
 	LastRequestStatus int       `json:"last_request_status,omitempty"`
 	RequestsTotal     uint64    `json:"requests_total"`
+	// UpdateAvailable is true when the self-version check found a newer
+	// broker/plugin release than the one running. Omitted (absent) until the
+	// first successful check, so callers can distinguish "up to date" from
+	// "not yet checked".
+	UpdateAvailable *bool  `json:"update_available,omitempty"`
+	LatestVersion   string `json:"latest_version,omitempty"`
 }
 
 // Runtime is the identifier this implementation reports in the
@@ -90,7 +126,7 @@ const Runtime = "go"
 func (s *State) Snapshot() Snapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return Snapshot{
+	snap := Snapshot{
 		Runtime:           Runtime,
 		Role:              s.role.String(),
 		RoleSince:         s.roleSince,
@@ -99,4 +135,10 @@ func (s *State) Snapshot() Snapshot {
 		LastRequestStatus: s.lastRequestStatus,
 		RequestsTotal:     s.requestsTotal,
 	}
+	if s.update.Known {
+		avail := s.update.Outdated
+		snap.UpdateAvailable = &avail
+		snap.LatestVersion = s.update.Latest
+	}
+	return snap
 }
