@@ -52,9 +52,9 @@ const (
 // live Google API via a mitmproxy capture of agy 1.0.13 (2026-06-30); mirrors
 // the JS broker's AntigravityFetcher for wire parity.
 //
-// Models / ModelsFor are retained only for call-site compatibility with the
-// per-device override path (FetchWithModels). The quota is now GROUPED, not
-// per-model, so they no longer affect the result.
+// Models / ModelsFor are vestigial: the quota is now GROUPED (Gemini Models /
+// Claude+GPT), not per-model, so they no longer affect the result. The
+// per-device override path that consumed them was removed (bug 27).
 type AntigravityFetcher struct {
 	KeyringService string
 	Models         []string
@@ -90,15 +90,6 @@ func (f *AntigravityFetcher) keyringService() string {
 type geminiAccessToken struct {
 	Token       string
 	ExpiresAtMS int64
-}
-
-// FetchWithModels is like Fetch but kept for call-site compatibility with the
-// per-device override path. The quota is now grouped (Gemini Models /
-// Claude+GPT), not per-model, so `models` is ignored — the broker can keep
-// calling this without instantiating a second fetcher (and duplicating the
-// token cache).
-func (f *AntigravityFetcher) FetchWithModels(ctx context.Context, _ []string) (Snapshot, error) {
-	return f.fetchInternal(ctx)
 }
 
 // Fetch reads agy's keyring token and POSTs to the canary cloudcode-pa host.

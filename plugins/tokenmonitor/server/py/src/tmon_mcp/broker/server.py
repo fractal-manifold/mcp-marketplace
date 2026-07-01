@@ -445,25 +445,6 @@ async def _handle_credentials_codex(req: web.Request) -> web.Response:
             pass
 
 
-def _device_antigravity_models(reg: Registry, device_id: str) -> list[str]:
-    """Return the per-device Antigravity model override (pending first, then
-    active). Empty list when no override is configured. The registry field is
-    still named gemini_models (internal, pre-rename) — only the wire/provider
-    key migrated.
-    """
-    try:
-        dev = reg.load(device_id)
-    except NotFound:
-        return []
-    except Exception:
-        return []
-    if dev.pending is not None and dev.pending.payload.gemini_models:
-        return list(dev.pending.payload.gemini_models)
-    if dev.active.payload.gemini_models:
-        return list(dev.active.payload.gemini_models)
-    return []
-
-
 async def _handle_usage(req: web.Request) -> web.Response:
     """Serve a synthesised usage snapshot at /usage/{provider}.
 
@@ -492,51 +473,11 @@ async def _handle_usage(req: web.Request) -> web.Response:
             status_to_record = 503
             return _error(503, "usage disabled (no providers configured)")
 
-        # Per-device Antigravity override: when the device has a non-empty
-        # model list, bypass the cache and fetch with that slice. The token
-        # cache inside the AntigravityFetcher is preserved, so this is only
-        # one extra upstream round-trip per poll.
-        reg: registry.Registry | None = req.app.get("registry")
-        device_id = req.headers.get("X-Tmon-Device", "")
-        if (
-            provider == usage.PROVIDER_ANTIGRAVITY
-            and reg is not None
-            and device_id
-            and registry.valid_device_id(device_id)
-        ):
-            models = _device_antigravity_models(reg, device_id)
-            if models:
-                gem = usage_cache.antigravity_fetcher() if hasattr(usage_cache, "antigravity_fetcher") else None
-                if gem is not None:
-                    try:
-                        snap = await gem.fetch_with_models(http, models)
-                    except usage.NotImplementedProvider:
-                        status_to_record = 501
-                        return _error(501, "provider not enabled")
-                    except usage.CredsMissing:
-                        status_to_record = 404
-                        return _error(404, "creds file missing")
-                    except usage.TokenExpired:
-                        status_to_record = 503
-                        return _error(503, "token expired, refresh on laptop")
-                    except usage.Unauthorized:
-                        status_to_record = 401
-                        return _error(401, "upstream rejected token")
-                    except usage.RateLimited as e:
-                        status_to_record = 429
-                        r = _error(429, "rate limited")
-                        if e.retry_after > 0:
-                            r.headers["Retry-After"] = str(e.retry_after)
-                        return r
-                    except (usage.Upstream, usage.ParseUpstream, usage.Transport) as e:
-                        status_to_record = 502
-                        return _error(502, f"upstream error: {e}")
-                    snap.fetched_at_unix = int(time.time())
-                    body = _snapshot_body(snap)
-                    resp = web.json_response(body)
-                    resp.headers["Cache-Control"] = "no-store"
-                    return resp
-
+        # NOTE: the per-device Antigravity model override was removed (bug 27).
+        # fetch_with_models ignored its models arg since the quota went grouped,
+        # so the override was a pure cache bypass (two upstream Google calls per
+        # poll for an identical result). The gemini_models registry→device wire
+        # plumbing is unrelated (device-side config) and is kept.
         try:
             snap = await usage_cache.get(http, provider)
         except usage.UsageError as e:

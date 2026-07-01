@@ -359,11 +359,6 @@ export class AntigravityFetcher {
     this._cachedToken = { token: "", expiresAtMs: 0 };
   }
 
-  async fetchWithModels() {
-    // Grouped quota ignores the per-device model slice; kept for call-site compat.
-    return this._fetchInternal();
-  }
-
   async fetch() {
     return this._fetchInternal();
   }

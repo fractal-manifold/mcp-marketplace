@@ -467,11 +467,6 @@ class AntigravityFetcher:
     models_for: Callable[[], list[str]] | None = None
     _cached_token: tuple[str, int] = field(default=("", 0))  # (token, expires_at_ms)
 
-    async def fetch_with_models(self, session: aiohttp.ClientSession, models: list[str]) -> Snapshot:
-        """Grouped quota ignores the per-device model slice; kept for call-site
-        compat with the per-device override path in the broker."""
-        return await self._fetch_internal(session)
-
     async def fetch(self, session: aiohttp.ClientSession) -> Snapshot:
         return await self._fetch_internal(session)
 

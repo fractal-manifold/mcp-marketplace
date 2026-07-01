@@ -559,26 +559,11 @@ func handleUsage(cfg *config.Config, nonceCache *auth.NonceCache, logger *log.Lo
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 
-	// Per-device Antigravity override: when the device's registry record
-	// has a non-empty model list, bypass the shared cache so we serve the
-	// requested model slice. The token cache inside the AntigravityFetcher
-	// is still reused, so this is only one extra upstream round-trip per poll.
-	deviceID := r.Header.Get("X-Tmon-Device")
-	if provider == usage.ProviderAntigravity && reg != nil && deviceID != "" && registry.ValidDeviceID(deviceID) {
-		if models := deviceGeminiModels(reg, deviceID); len(models) > 0 {
-			if gf, ok := usageCache.AntigravityFetcher(); ok {
-				snap, ferr := gf.FetchWithModels(ctx, models)
-				if ferr != nil {
-					writeUsageError(w, ferr)
-					return
-				}
-				snap.FetchedAtUnix = time.Now().Unix()
-				writeJSON(w, http.StatusOK, snap)
-				return
-			}
-		}
-	}
-
+	// NOTE: the per-device Antigravity model override was removed (bug 27).
+	// FetchWithModels ignored its models arg since the quota went grouped, so
+	// the override block was a pure cache bypass — two upstream Google calls
+	// per device poll for an identical result. The gemini_models registry→
+	// device wire plumbing is unrelated (device-side config) and is kept.
 	snap, err := usageCache.Get(ctx, provider)
 	if err != nil {
 		// Stale-with-error: cache returned the last good snapshot
@@ -594,29 +579,6 @@ func handleUsage(cfg *config.Config, nonceCache *auth.NonceCache, logger *log.Lo
 		return
 	}
 	writeJSON(w, http.StatusOK, snap)
-}
-
-// deviceGeminiModels returns the registry's per-device gemini_models
-// override for the given device. Prefers an in-flight pending list (so
-// the override applies as soon as it's staged, without waiting for a
-// promotion) but falls back to the active value. Returns nil when no
-// record exists or the field is empty.
-func deviceGeminiModels(reg *registry.Registry, deviceID string) []string {
-	dev, err := reg.Load(deviceID)
-	if err != nil || dev == nil {
-		return nil
-	}
-	if dev.Pending != nil && len(dev.Pending.GeminiModels) > 0 {
-		out := make([]string, len(dev.Pending.GeminiModels))
-		copy(out, dev.Pending.GeminiModels)
-		return out
-	}
-	if len(dev.Active.GeminiModels) > 0 {
-		out := make([]string, len(dev.Active.GeminiModels))
-		copy(out, dev.Active.GeminiModels)
-		return out
-	}
-	return nil
 }
 
 // handleSpend serves GET /spend/{provider}: locally-computed token cost.

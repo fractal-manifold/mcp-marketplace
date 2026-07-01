@@ -281,25 +281,6 @@ function handleCredentialsCodex({ cfg, cache, state, registry, logger }, req, re
   return writeJSON(res, 200, { access_token: c.accessToken, expires_at: c.expiresAtISO(), account_id: c.accountId });
 }
 
-// Read the per-device gemini_models override from the registry,
-// preferring pending over active so a freshly-staged override applies
-// without waiting for a promotion. Returns [] when no override.
-function deviceGeminiModels(registry, deviceID) {
-  let dev;
-  try {
-    dev = registry.load(deviceID);
-  } catch {
-    return [];
-  }
-  if (dev?.pending?.payload?.gemini_models && dev.pending.payload.gemini_models.length > 0) {
-    return dev.pending.payload.gemini_models.slice();
-  }
-  if (dev?.active?.payload?.gemini_models && dev.active.payload.gemini_models.length > 0) {
-    return dev.active.payload.gemini_models.slice();
-  }
-  return [];
-}
-
 async function handleUsage({ cfg, cache, state, registry, logger, usageCache, provider }, req, res) {
   const rs = { s: 200 };
   res.on("close", () => { try { state.recordRequest(req.socket.remoteAddress || "", rs.s); } catch {} });
@@ -311,43 +292,11 @@ async function handleUsage({ cfg, cache, state, registry, logger, usageCache, pr
   provider = usage.canonicalProvider(provider);
   if (!usageCache) { rs.s = 503; return writeError(res, 503, "usage disabled (no providers configured)"); }
 
-  // Per-device Antigravity override: bypass the shared cache and fetch the
-  // requested model slice. Token cache inside the AntigravityFetcher is
-  // preserved.
-  try {
-    const deviceID = req.headers["x-tmon-device"] || "";
-    if (
-      provider === usage.PROVIDER_ANTIGRAVITY &&
-      registry &&
-      deviceID &&
-      validDeviceID(deviceID) &&
-      typeof usageCache.antigravityFetcher === "function"
-    ) {
-      const models = deviceGeminiModels(registry, deviceID);
-      if (models.length > 0) {
-        const gf = usageCache.antigravityFetcher();
-        if (gf) {
-          const snap = await gf.fetchWithModels(models);
-          snap.fetched_at_unix = Math.floor(Date.now() / 1000);
-          rs.s = 200;
-          return writeJSON(res, 200, snap);
-        }
-      }
-    }
-  } catch (e) {
-    if (e instanceof usage.CredsMissing) { rs.s = 404; return writeError(res, 404, "creds file missing"); }
-    if (e instanceof usage.TokenExpired) { rs.s = 503; return writeError(res, 503, "token expired, refresh on laptop"); }
-    if (e instanceof usage.Unauthorized) { rs.s = 401; return writeError(res, 401, "upstream rejected token"); }
-    if (e instanceof usage.RateLimited) {
-      rs.s = 429;
-      if (e.retryAfter > 0) res.setHeader("Retry-After", String(e.retryAfter));
-      return writeError(res, 429, "rate limited");
-    }
-    if (e instanceof usage.UsageError) { rs.s = 502; return writeError(res, 502, `upstream error: ${e.message}`); }
-    logger.error(`gemini override fetch crashed: ${e.stack || e.message}`);
-    rs.s = 500; return writeError(res, 500, "internal");
-  }
-
+  // NOTE: the per-device Antigravity model override was removed (bug 27).
+  // fetchWithModels ignored its models arg since the quota went grouped, so
+  // the override was a pure cache bypass (two upstream Google calls per poll
+  // for an identical result). The gemini_models registry→device wire plumbing
+  // is unrelated (device-side config) and is kept.
   try {
     const snap = await usageCache.get(provider);
     rs.s = 200;
