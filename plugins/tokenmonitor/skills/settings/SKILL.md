@@ -100,6 +100,12 @@ as aliases.
 | Theme (day / night / auto)        | `theme_mode`               | one of `day`, `night`, `auto`      |
 | Day brightness                    | `br_day`                   | int, 10..100 (% of backlight)      |
 | Night brightness                  | `br_night`                 | int, 5..100 (% of backlight)       |
+| Custom-panel screen               | `panel_enabled`            | bool (default false, opt-in)       |
+
+`panel_enabled` only turns on the swipe-up screen; it shows data only if the
+broker is also pointed at a panel file via its `[panel]` config section (see
+the monorepo's `docs/custom-panel.md`). Enabling it on a broker with no
+`[panel]` set just shows an empty-state message on the device.
 
 #### Virtual pet
 

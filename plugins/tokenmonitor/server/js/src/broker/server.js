@@ -12,8 +12,8 @@ import { NotFound, validDeviceID } from "../registry/store.js";
 import { firmwarePath } from "../config.js";
 import { packSemver } from "../ota.js";
 import { createHash } from "node:crypto";
-import { createReadStream, statSync } from "node:fs";
-import { resolve as resolvePath, sep as pathSep } from "node:path";
+import { createReadStream, statSync, readFileSync } from "node:fs";
+import { resolve as resolvePath, sep as pathSep, join as joinPath } from "node:path";
 
 function writeJSON(res, status, body) {
   const buf = Buffer.from(JSON.stringify(body), "utf8");
@@ -83,6 +83,7 @@ export function createHandler({ cfg, cache, state, fwLogs, registry, logger, usa
       { re: /^\/usage\/([^/]+)$/, methods: ["GET"], h: (m2) => handleUsage({ cfg, cache, state, registry, logger, usageCache, provider: m2[1] }, req, res) },
       { re: /^\/spend\/([^/]+)$/, methods: ["GET"], h: (m2) => handleSpend({ cfg, cache, state, registry, logger, spendCache, provider: m2[1] }, req, res) },
       { re: /^\/device\/([^/]+)\/sync$/, methods: ["GET"], h: (m2) => handleDeviceSync({ cfg, cache, state, registry, logger, deviceID: m2[1] }, req, res) },
+      { re: /^\/device\/([^/]+)\/panel$/, methods: ["GET"], h: (m2) => handleDevicePanel({ cfg, cache, state, registry, logger, deviceID: m2[1] }, req, res) },
       { re: /^\/device\/([^/]+)\/logs$/, methods: ["POST"], h: (m2) => handleDeviceLogs({ cfg, cache, state, registry, logger, deviceID: m2[1] }, req, res) },
       { re: /^\/device\/([^/]+)\/settings$/, methods: ["POST"], h: (m2) => handleDeviceSettings({ cfg, cache, state, registry, logger, deviceID: m2[1] }, req, res) },
       { re: /^\/firmware\/([^/]+)$/, methods: ["GET", "HEAD"], h: (m2) => handleFirmware({ cfg, cache, registry, logger, name: m2[1] }, req, res) },
@@ -442,6 +443,85 @@ function handleFirmwareLogs({ cfg, cache, fwLogs, logger }, req, res, url) {
   }
 }
 
+// Bounds the served panel document; the device parses into fixed buffers.
+// Keep in sync with compat/PANEL_WIRE.md and the Go panelMaxBytes.
+const PANEL_MAX_BYTES = 8 * 1024;
+// mtime+size cache: a program rewriting the file in place is picked up next poll.
+const panelCache = new Map();
+
+// resolvePanelPath: <dir>/<id>.json, then <dir>/default.json, then the global
+// file. "" ⇒ feature off. deviceID already passed validDeviceID (no slashes).
+function resolvePanelPath(cfg, deviceID) {
+  const dir = cfg.panelDirAbs ? cfg.panelDirAbs() : "";
+  if (dir) {
+    if (deviceID) {
+      const p = joinPath(dir, `${deviceID}.json`);
+      try { if (statSync(p).isFile()) return p; } catch {}
+    }
+    const d = joinPath(dir, "default.json");
+    try { if (statSync(d).isFile()) return d; } catch {}
+  }
+  const f = cfg.panelFileAbs ? cfg.panelFileAbs() : "";
+  return f || "";
+}
+
+// readPanelFile → { body } on success, or { status, msg } on error
+// (404 absent, 422 oversize/non-JSON).
+function readPanelFile(path) {
+  let st;
+  try { st = statSync(path); }
+  catch (e) { return e.code === "ENOENT" ? { status: 404, msg: "no panel" } : { status: 500, msg: "panel read error" }; }
+  if (!st.isFile()) return { status: 404, msg: "no panel" };
+  if (st.size > PANEL_MAX_BYTES) return { status: 422, msg: `panel too large (${st.size} > ${PANEL_MAX_BYTES} bytes)` };
+  const cached = panelCache.get(path);
+  if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) return { body: cached.body };
+  let raw;
+  try { raw = readFileSync(path); }
+  catch { return { status: 500, msg: "panel read error" }; }
+  try { JSON.parse(raw.toString("utf8")); }
+  catch { return { status: 422, msg: "panel is not valid JSON" }; }
+  panelCache.set(path, { mtimeMs: st.mtimeMs, size: st.size, body: raw });
+  return { body: raw };
+}
+
+// GET /device/{id}/panel — serve the user-authored panel doc verbatim. Same
+// HMAC envelope as /device/{id}/sync. Additive: unconfigured / absent ⇒ 404.
+function handleDevicePanel({ cfg, cache, state, registry, logger, deviceID }, req, res) {
+  let recordStatus = 200;
+  const finishErr = (s, m) => { recordStatus = s; writeError(res, s, m); };
+  res.on("close", () => { try { state.recordRequest(req.socket.remoteAddress || "", recordStatus); } catch {} });
+
+  if (!registry) return finishErr(404, "device registry not configured");
+  if (!validDeviceID(deviceID)) return finishErr(400, "invalid device_id");
+  let active, pending;
+  try { ({ active, pending } = registry.psksFor(deviceID)); }
+  catch (e) {
+    if (e instanceof NotFound) return finishErr(404, "unknown device");
+    logger.warn(`registry lookup ${deviceID}: ${e.message}`); return finishErr(500, "registry error");
+  }
+  const signedPath = `/device/${deviceID}/panel`;
+  try {
+    auth.verifyMulti(
+      [active, pending],
+      "GET", signedPath,
+      req.headers["x-tmon-timestamp"], req.headers["x-tmon-nonce"], req.headers["x-tmon-signature"],
+      req.headers["x-tmon-device"] || "", req.headers["x-tmon-config-version"] || "",
+      cache, cfg.security.max_timestamp_skew_seconds,
+    );
+  } catch (e) { logger.info(`auth rejected ${signedPath}: ${e.message}`); return finishErr(401, "unauthorized"); }
+
+  const path = resolvePanelPath(cfg, deviceID);
+  if (!path) return finishErr(404, "panel not configured");
+  const r = readPanelFile(path);
+  if (r.status) { if (r.status === 500) logger.warn(`panel read ${path}`); return finishErr(r.status, r.msg); }
+  recordStatus = 200;
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Content-Length", r.body.length);
+  res.setHeader("Cache-Control", "no-store");
+  res.end(r.body);
+}
+
 function handleDeviceSync({ cfg, cache, state, registry, logger, deviceID }, req, res) {
   let recordStatus = 200;
   const finish = (s, b) => { recordStatus = s; writeJSON(res, s, b); };
@@ -714,6 +794,10 @@ function handleDeviceSettings({ cfg, cache, state, registry, logger, deviceID },
       if (typeof body.pet_enabled !== "boolean") return finishErr(400, "bad settings body");
       s.pet_enabled = body.pet_enabled;
     }
+    if (body.panel_enabled != null) {
+      if (typeof body.panel_enabled !== "boolean") return finishErr(400, "bad settings body");
+      s.panel_enabled = body.panel_enabled;
+    }
     if (body.pet_species != null) {
       // uint (0..255 here); applyReported clamps to the 0..9 enum. Absent →
       // left untouched (device hasn't picked a species).
@@ -772,6 +856,7 @@ function pendingPayloadJSON(p) {
   if (p.pet_enabled != null) wire.pet_enabled = !!p.pet_enabled;
   if (p.pet_species != null) wire.pet_species = Number(p.pet_species);
   if (p.pet_name) wire.pet_name = String(p.pet_name);
+  if (p.panel_enabled != null) wire.panel_enabled = !!p.panel_enabled;
   if (Array.isArray(p.gemini_models) && p.gemini_models.length > 0) {
     // Dual-emit the per-device model override CSV under the new
     // "antigravity_models" key and the deprecated "gemini_models" key.

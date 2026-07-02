@@ -52,6 +52,7 @@ type Config struct {
 	Usage  Usage  `toml:"usage"`
 	Spend       Spend       `toml:"spend"`
 	Pricing     Pricing     `toml:"pricing"`
+	Panel       Panel       `toml:"panel"`
 	Security    Security    `toml:"security"`
 	Logging     Logging     `toml:"logging"`
 	Serial      Serial      `toml:"serial"`
@@ -168,6 +169,19 @@ type Pricing struct {
 	TTLHours  int    `toml:"ttl_hours"`
 }
 
+// Panel feeds the device's optional custom-panel screen. The user's own
+// program writes a self-describing JSON document (charts / tables) that the
+// broker serves verbatim from GET /device/<id>/panel. Both fields empty =
+// feature off (endpoint answers 404).
+//
+//   - File: a single global document served to every device.
+//   - Dir:  a directory of per-device documents; <dir>/<id>.json wins, then
+//     <dir>/default.json, then File.
+type Panel struct {
+	File string `toml:"file"`
+	Dir  string `toml:"dir"`
+}
+
 type Security struct {
 	MaxTimestampSkewSeconds int `toml:"max_timestamp_skew_seconds"`
 	NonceCacheTTLSeconds    int `toml:"nonce_cache_ttl_seconds"`
@@ -269,6 +283,11 @@ func (c *Config) CodexSessionsPath() string    { return expandUser(c.Spend.Codex
 // merged into it in Load() for back-compat.
 func (c *Config) AntigravityConvPath() string { return expandUser(c.Spend.AntigravityConvPath) }
 func (c *Config) PricingCachePath() string    { return expandUser(c.Pricing.CachePath) }
+
+// PanelFile / PanelDir expand the [panel] paths; the broker resolves the
+// effective per-device file from these (see broker.resolvePanelPath).
+func (c *Config) PanelFile() string { return expandUser(c.Panel.File) }
+func (c *Config) PanelDir() string  { return expandUser(c.Panel.Dir) }
 
 func expandUser(p string) string {
 	if strings.HasPrefix(p, "~/") {
@@ -470,6 +489,23 @@ keyring_service = "gemini"
 # re-fetching upstream. A device polling every 60 s with TTL 30 s hits
 # each upstream once per minute at most.
 cache_ttl_seconds = 30
+
+[panel]
+# Optional custom-panel screen. Your OWN program writes a self-describing
+# JSON document (charts / tables) and the broker serves it verbatim from
+# GET /device/<id>/panel; the device draws it on an extra screen reached by
+# swiping up. Leave both empty (default) to keep the feature off — the
+# endpoint then answers 404, exactly like an older broker.
+#
+# Single global document served to every device:
+# file = "~/.config/tokenmonitor/panel.json"
+#
+# Or a directory of per-device documents (<dir>/<id>.json wins, then
+# <dir>/default.json, then the global file):
+# dir = "~/.config/tokenmonitor/panels"
+#
+# Document format + limits (tiles<=4, points<=64, body<=8KB) live in
+# docs/custom-panel.md and compat/PANEL_WIRE.md.
 
 [security]
 max_timestamp_skew_seconds = 60

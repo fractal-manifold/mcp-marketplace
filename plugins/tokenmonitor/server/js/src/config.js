@@ -75,6 +75,12 @@ function defaults() {
       cache_path: "~/.config/tokenmonitor/pricing-cache.json",
       ttl_hours: 24,
     },
+    // Optional custom-panel screen source. The user's own program writes a
+    // self-describing JSON document (charts / tables) that the broker serves
+    // verbatim from GET /device/<id>/panel. Both empty ⇒ feature off (404).
+    // file: single global doc; dir: per-device (<dir>/<id>.json wins, then
+    // <dir>/default.json, then file).
+    panel: { file: "", dir: "" },
     security: { max_timestamp_skew_seconds: 60, nonce_cache_ttl_seconds: 300 },
     logging: { level: "INFO" },
     serial: { device: "", baud: 115200, lines: 2000 },
@@ -137,7 +143,7 @@ export function load(path) {
   const raw = readFileSync(resolved, "utf8");
   const parsed = TOML.parse(raw);
   const cfg = defaults();
-  for (const k of ["server", "auth", "credentials", "codex", "antigravity", "usage", "spend", "pricing", "security", "logging", "serial", "ota"]) {
+  for (const k of ["server", "auth", "credentials", "codex", "antigravity", "usage", "spend", "pricing", "panel", "security", "logging", "serial", "ota"]) {
     mergeSection(cfg, parsed, k);
   }
   // Back-compat: a legacy tokenmonitor.toml uses [gemini] / gemini_tmp_path
@@ -176,6 +182,8 @@ export function load(path) {
   cfg.codexSessionsPathAbs = () => expandUser(cfg.spend.codex_sessions_path);
   cfg.antigravityConvPathAbs = () => expandUser(cfg.spend.antigravity_conversations_path);
   cfg.pricingCachePathAbs = () => expandUser(cfg.pricing.cache_path);
+  cfg.panelFileAbs = () => (cfg.panel.file ? expandUser(cfg.panel.file) : "");
+  cfg.panelDirAbs = () => (cfg.panel.dir ? expandUser(cfg.panel.dir) : "");
   cfg.antigravityModels = () => {
     const src = (cfg.antigravity.models && cfg.antigravity.models.length > 0)
       ? cfg.antigravity.models

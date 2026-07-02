@@ -123,6 +123,7 @@ def make_app(
     app.router.add_get("/credentials/codex", _handle_credentials_codex)
     app.router.add_get("/firmware-logs", _handle_firmware_logs)
     app.router.add_get("/device/{device_id}/sync", _handle_device_sync)
+    app.router.add_get("/device/{device_id}/panel", _handle_device_panel)
     app.router.add_post("/device/{device_id}/logs", _handle_device_logs)
     app.router.add_post("/device/{device_id}/settings", _handle_device_settings)
     app.router.add_get("/usage/{provider}", _handle_usage)
@@ -143,6 +144,7 @@ _ROUTE_METHODS: list[tuple[re.Pattern[str], set[str]]] = [
     (re.compile(r"^/credentials/codex$"), {"GET"}),
     (re.compile(r"^/firmware-logs$"), {"GET"}),
     (re.compile(r"^/device/[^/]+/sync$"), {"GET"}),
+    (re.compile(r"^/device/[^/]+/panel$"), {"GET"}),
     (re.compile(r"^/device/[^/]+/logs$"), {"POST"}),
     (re.compile(r"^/device/[^/]+/settings$"), {"POST"}),
     (re.compile(r"^/usage/[^/]+$"), {"GET"}),
@@ -587,6 +589,118 @@ async def _handle_firmware_logs(req: web.Request) -> web.Response:
     return resp
 
 
+# Bounds the served panel document; the device parses into fixed buffers.
+# Keep in sync with compat/PANEL_WIRE.md and the Go panelMaxBytes.
+_PANEL_MAX_BYTES = 8 * 1024
+
+# mtime+size cache mirroring _firmware_sha_cache: a program rewriting the file
+# in place is picked up on the next poll.
+_panel_cache: dict[str, tuple[float, int, bytes]] = {}
+
+
+def _resolve_panel_path(cfg: Config, device_id: str) -> str:
+    """Pick the file to serve for device_id, most specific first:
+    <dir>/<id>.json, then <dir>/default.json, then the global file. "" = off.
+
+    device_id has passed valid_device_id (no slashes) so <id>.json is safe."""
+    d = cfg.panel_dir_abs()
+    if d:
+        if device_id:
+            p = Path(d) / f"{device_id}.json"
+            if p.is_file():
+                return str(p)
+        p = Path(d) / "default.json"
+        if p.is_file():
+            return str(p)
+    f = cfg.panel_file_abs()
+    if f:
+        return f
+    return ""
+
+
+def _read_panel_file(path: str) -> tuple[bytes | None, int, str]:
+    """Return (body, err_status, err_msg). 404 absent, 422 oversize/non-JSON."""
+    p = Path(path)
+    try:
+        st = p.stat()
+    except FileNotFoundError:
+        return None, 404, "no panel"
+    except OSError as e:
+        log.warning("panel stat %s: %s", path, e)
+        return None, 500, "panel read error"
+    if not p.is_file():
+        return None, 404, "no panel"
+    if st.st_size > _PANEL_MAX_BYTES:
+        return None, 422, f"panel too large ({st.st_size} > {_PANEL_MAX_BYTES} bytes)"
+
+    cached = _panel_cache.get(path)
+    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return cached[2], 0, ""
+
+    try:
+        raw = p.read_bytes()
+    except OSError as e:
+        log.warning("panel read %s: %s", path, e)
+        return None, 500, "panel read error"
+    try:
+        json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return None, 422, "panel is not valid JSON"
+
+    _panel_cache[path] = (st.st_mtime, st.st_size, raw)
+    return raw, 0, ""
+
+
+async def _handle_device_panel(req: web.Request) -> web.Response:
+    """GET /device/{id}/panel — serve the user-authored panel doc verbatim.
+
+    Same HMAC envelope as /device/{id}/sync. Purely additive: not configured
+    or file absent ⇒ 404, so the firmware has one "no panel" code path."""
+    cfg: Config = req.app["cfg"]
+    cache: auth.NonceCache = req.app["cache"]
+    registry: Registry | None = req.app["registry"]
+    if registry is None:
+        return _error(404, "device registry not configured")
+
+    device_id = req.match_info["device_id"]
+    if not valid_device_id(device_id):
+        return _error(400, "invalid device_id")
+
+    try:
+        active, pending = registry.psks_for(device_id)
+    except NotFound:
+        return _error(404, "unknown device")
+    except Exception as e:
+        log.warning("registry lookup %s: %s", device_id, e)
+        return _error(500, "registry error")
+
+    try:
+        auth.verify_multi(
+            [active, pending],
+            "GET", req.path,
+            req.headers.get("X-Tmon-Timestamp", ""),
+            req.headers.get("X-Tmon-Nonce", ""),
+            req.headers.get("X-Tmon-Signature", ""),
+            req.headers.get("X-Tmon-Device", ""),
+            req.headers.get("X-Tmon-Config-Version", ""),
+            cache,
+            cfg.security.max_timestamp_skew_seconds,
+        )
+    except auth.AuthError as e:
+        log.info("auth rejected /device/%s/panel from %s: %s", device_id, req.remote, e)
+        return _error(401, "unauthorized")
+
+    path = _resolve_panel_path(cfg, device_id)
+    if not path:
+        return _error(404, "panel not configured")
+    body, err_status, err_msg = _read_panel_file(path)
+    if body is None:
+        return _error(err_status, err_msg)
+    resp = web.Response(body=body, content_type="application/json")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 async def _handle_device_sync(req: web.Request) -> web.Response:
     cfg: Config = req.app["cfg"]
     cache: auth.NonceCache = req.app["cache"]
@@ -858,6 +972,9 @@ async def _handle_device_settings(req: web.Request) -> web.Response:
         pet_enabled = body.get("pet_enabled")
         if pet_enabled is not None and not isinstance(pet_enabled, bool):
             raise ValueError("bad pet_enabled")
+        panel_enabled = body.get("panel_enabled")
+        if panel_enabled is not None and not isinstance(panel_enabled, bool):
+            raise ValueError("bad panel_enabled")
         # pet_species is a uint (0..255 here); applyReported clamps to 0..9.
         # Absent → None → left untouched (device hasn't picked a species).
         pet_species = _uint("pet_species", 255)
@@ -877,6 +994,7 @@ async def _handle_device_settings(req: web.Request) -> web.Response:
             autorotate_enabled=autorotate_enabled,
             autorotate_interval_s=autorotate_interval_s,
             pet_enabled=pet_enabled,
+            panel_enabled=panel_enabled,
             pet_species=pet_species,
             pet_name=pet_name,
         )
@@ -958,6 +1076,8 @@ def _pending_payload_json(p) -> str:
         wire["theme_mode"] = p.theme_mode
     if p.pet_enabled is not None:
         wire["pet_enabled"] = bool(p.pet_enabled)
+    if p.panel_enabled is not None:
+        wire["panel_enabled"] = bool(p.panel_enabled)
     if p.pet_species is not None:
         wire["pet_species"] = int(p.pet_species)
     if p.pet_name:

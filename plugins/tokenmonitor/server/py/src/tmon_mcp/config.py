@@ -120,6 +120,20 @@ class Pricing:
 
 
 @dataclass
+class Panel:
+    """Optional custom-panel screen source. The user's own program writes a
+    self-describing JSON document (charts / tables) that the broker serves
+    verbatim from GET /device/<id>/panel. Both empty ⇒ feature off (404).
+
+    file: a single global document served to every device.
+    dir:  a directory of per-device docs (<dir>/<id>.json wins, then
+          <dir>/default.json, then file)."""
+
+    file: str = ""
+    dir: str = ""
+
+
+@dataclass
 class Security:
     max_timestamp_skew_seconds: int = 60
     nonce_cache_ttl_seconds: int = 300
@@ -196,6 +210,7 @@ class Config:
     usage: Usage = field(default_factory=Usage)
     spend: Spend = field(default_factory=Spend)
     pricing: Pricing = field(default_factory=Pricing)
+    panel: Panel = field(default_factory=Panel)
     security: Security = field(default_factory=Security)
     logging: Logging = field(default_factory=Logging)
     serial: Serial = field(default_factory=Serial)
@@ -231,6 +246,12 @@ class Config:
 
     def pricing_cache_path_abs(self) -> str:
         return str(Path(self.pricing.cache_path).expanduser())
+
+    def panel_file_abs(self) -> str:
+        return str(Path(self.panel.file).expanduser()) if self.panel.file else ""
+
+    def panel_dir_abs(self) -> str:
+        return str(Path(self.panel.dir).expanduser()) if self.panel.dir else ""
 
     def antigravity_models(self) -> list[str]:
         """Return the configured model list, clamped to MAX_ANTIGRAVITY_MODELS.
@@ -297,6 +318,7 @@ def load(path: str | None = None) -> Config:
     _section(raw, "usage", cfg.usage)
     _section(raw, "spend", cfg.spend)
     _section(raw, "pricing", cfg.pricing)
+    _section(raw, "panel", cfg.panel)
     _section(raw, "security", cfg.security)
     _section(raw, "logging", cfg.logging)
     _section(raw, "serial", cfg.serial)

@@ -116,6 +116,12 @@ Resolve only the broker URL before asking the user anything else:
     - `pet_enabled` — `true` shows the virtual ASCII pet on the
       dashboard, `false` hides it. Device default is `true` (shown). Pass
       `false` only if the user explicitly doesn't want it.
+    - `panel_enabled` — `true` enables the swipe-up custom-panel screen
+      (broker-fed charts/tables; the data comes from a local file the
+      broker serves via `GET /device/<id>/panel`, configured in the
+      broker's `[panel]` section — see `docs/custom-panel.md`). Device
+      default is `false` (opt-in). Pass `true` only if the user set up a
+      panel data source.
 - **providers** — REQUIRED. The device tracks usage from one or more of
   Claude, Codex and Antigravity; only the ones enabled here are polled and
   shown on the dashboard. Default selection rules:
@@ -164,9 +170,9 @@ Resolve only the broker URL before asking the user anything else:
 Call `tokenmonitor_provision` with the values from steps 1–3 (do not
 pass `psk_hex` — let the broker generate it; do pass each selected
 provider as `provider_claude=true` / `provider_codex=true` /
-`provider_antigravity=true`; pass `theme_mode` / `pet_enabled` only if the
-user expressed a preference, otherwise omit them so the device defaults
-stand). Expected return on success:
+`provider_antigravity=true`; pass `theme_mode` / `pet_enabled` /
+`panel_enabled` only if the user expressed a preference, otherwise omit
+them so the device defaults stand). Expected return on success:
 
 ```json
 {

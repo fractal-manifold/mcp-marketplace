@@ -191,6 +191,10 @@ class ConfigPayload:
     # change" / not picked yet, so no sentinel is stored. pet_name: up to
     # 15 chars; "" = use the species default name. See SETTINGS_REPORT.md.
     pet_enabled: bool | None = None
+    # Custom-panel screen — device-owned display toggle, synced exactly
+    # like pet_enabled. None = "no change"; defaults false on-device
+    # (opt-in).
+    panel_enabled: bool | None = None
     pet_species: int | None = None
     pet_name: str = ""
     # Per-device override of the Gemini model list surfaced as
@@ -243,6 +247,8 @@ class ConfigPayload:
             d["theme_mode"] = str(self.theme_mode)
         if self.pet_enabled is not None:
             d["pet_enabled"] = bool(self.pet_enabled)
+        if self.panel_enabled is not None:
+            d["panel_enabled"] = bool(self.panel_enabled)
         if self.pet_species is not None:
             d["pet_species"] = int(self.pet_species)
         if self.pet_name:
@@ -288,6 +294,7 @@ class ConfigPayload:
             autorotate_interval_s=int(d["autorotate_interval_s"]) if "autorotate_interval_s" in d else None,
             theme_mode=str(d.get("theme_mode", "")),
             pet_enabled=bool(d["pet_enabled"]) if "pet_enabled" in d else None,
+            panel_enabled=bool(d["panel_enabled"]) if "panel_enabled" in d else None,
             pet_species=int(d["pet_species"]) if "pet_species" in d else None,
             pet_name=str(d.get("pet_name", "")),
             gemini_models=[str(m) for m in d["gemini_models"]] if "gemini_models" in d else None,
@@ -565,6 +572,7 @@ class Registry:
         autorotate_enabled: bool | None = None,
         autorotate_interval_s: int | None = None,
         pet_enabled: bool | None = None,
+        panel_enabled: bool | None = None,
         pet_species: int | None = None,
         pet_name: str | None = None,
     ) -> Device:
@@ -580,7 +588,7 @@ class Registry:
             changed = _apply_reported(
                 dev.active.payload, theme_mode, br_day, br_night, vol,
                 autorotate_enabled, autorotate_interval_s,
-                pet_enabled, pet_species, pet_name,
+                pet_enabled, panel_enabled, pet_species, pet_name,
             )
             if dev.pending is not None:
                 changed = _apply_reported(
@@ -796,6 +804,7 @@ def _apply_reported(
     autorotate_enabled: bool | None,
     autorotate_interval_s: int | None,
     pet_enabled: bool | None = None,
+    panel_enabled: bool | None = None,
     pet_species: int | None = None,
     pet_name: str | None = None,
 ) -> bool:
@@ -841,6 +850,11 @@ def _apply_reported(
         if p.pet_enabled != b:
             p.pet_enabled = b
             changed = True
+    if panel_enabled is not None:
+        b = bool(panel_enabled)
+        if p.panel_enabled != b:
+            p.panel_enabled = b
+            changed = True
     if pet_species is not None:
         # Clamp to the species enum 0..9 like every other numeric. Absence
         # (None) is handled by the caller — the device omits the field until
@@ -876,6 +890,7 @@ def _merge_payload(base: ConfigPayload, upd: ConfigPayload) -> ConfigPayload:
         autorotate_interval_s=upd.autorotate_interval_s if upd.autorotate_interval_s is not None else base.autorotate_interval_s,
         theme_mode=upd.theme_mode or base.theme_mode,
         pet_enabled=upd.pet_enabled if upd.pet_enabled is not None else base.pet_enabled,
+        panel_enabled=upd.panel_enabled if upd.panel_enabled is not None else base.panel_enabled,
         pet_species=upd.pet_species if upd.pet_species is not None else base.pet_species,
         pet_name=upd.pet_name or base.pet_name,
         gemini_models=list(upd.gemini_models) if upd.gemini_models is not None else base.gemini_models,
@@ -922,6 +937,10 @@ def _payload_equivalent(a: ConfigPayload, b: ConfigPayload) -> bool:
     if (a.pet_enabled is None) != (b.pet_enabled is None):
         return False
     if a.pet_enabled is not None and a.pet_enabled != b.pet_enabled:
+        return False
+    if (a.panel_enabled is None) != (b.panel_enabled is None):
+        return False
+    if a.panel_enabled is not None and a.panel_enabled != b.panel_enabled:
         return False
     if (a.pet_species is None) != (b.pet_species is None):
         return False

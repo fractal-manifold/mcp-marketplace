@@ -1,11 +1,11 @@
 // Package mcp exposes the tokenmonitor-mcp tools to Claude Code over the standard
 // MCP stdio JSON-RPC transport. Five tools are registered:
 //
-//   tokenmonitor_status          — quick snapshot (role, last request, etc.)
-//   tokenmonitor_health          — full diagnostic: creds + self-ping
-//   tokenmonitor_recent_logs     — last N broker log lines (local buffer)
-//   tokenmonitor_firmware_logs   — last N ESP-IDF log lines from the device
-//   tokenmonitor_provision_hint  — IP/port to enter in the device's captive portal
+//	tokenmonitor_status          — quick snapshot (role, last request, etc.)
+//	tokenmonitor_health          — full diagnostic: creds + self-ping
+//	tokenmonitor_recent_logs     — last N broker log lines (local buffer)
+//	tokenmonitor_firmware_logs   — last N ESP-IDF log lines from the device
+//	tokenmonitor_provision_hint  — IP/port to enter in the device's captive portal
 //
 // The MCP server runs in its own goroutine alongside the broker; it does
 // not own the listener or the broker — it just reads from the shared
@@ -167,6 +167,7 @@ func NewServer(d Deps) *server.MCPServer {
 				mcp.Enum("day", "night", "auto"),
 			),
 			mcp.WithBoolean("pet_enabled", mcp.Description("Show the on-device virtual pet (default true). The pet is device-owned, like the display settings; the user can also toggle it on the device.")),
+			mcp.WithBoolean("panel_enabled", mcp.Description("Show the on-device custom-panel screen (broker-fed charts/tables via GET /device/<id>/panel; default false, opt-in). Device-owned like the display settings; the user can also toggle it on the device.")),
 			mcp.WithNumber("pet_species", mcp.Description("Virtual pet species, 0..9: 0=cat,1=dog,2=dragon,3=robot,4=blob,5=slime,6=duck,7=penguin,8=owl,9=ghost. Out-of-range values are clamped.")),
 			mcp.WithString("pet_name", mcp.Description("Virtual pet name, up to 15 chars (truncated). Empty string uses the species default name.")),
 			mcp.WithString("antigravity_models",
@@ -273,10 +274,10 @@ func handleStatus(d Deps) server.ToolHandlerFunc {
 }
 
 type configInfo struct {
-	MaxSkewSeconds  int    `json:"max_timestamp_skew_seconds"`
-	NonceCacheTTLS  int    `json:"nonce_cache_ttl_seconds"`
-	AuthMode        string `json:"auth_mode"` // "passphrase" or "psk_hex"
-	LoggingLevel    string `json:"logging_level"`
+	MaxSkewSeconds int    `json:"max_timestamp_skew_seconds"`
+	NonceCacheTTLS int    `json:"nonce_cache_ttl_seconds"`
+	AuthMode       string `json:"auth_mode"` // "passphrase" or "psk_hex"
+	LoggingLevel   string `json:"logging_level"`
 }
 
 func configInfoOf(c *config.Config) configInfo {

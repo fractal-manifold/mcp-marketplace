@@ -93,6 +93,7 @@ function pendingChanges(a, p) {
   if (p.pet_enabled != null && p.pet_enabled !== a.pet_enabled) out.push("pet_enabled");
   if (p.pet_species != null && p.pet_species !== a.pet_species) out.push("pet_species");
   if (p.pet_name && p.pet_name !== a.pet_name) out.push("pet_name");
+  if (p.panel_enabled != null && p.panel_enabled !== a.panel_enabled) out.push("panel_enabled");
   if (Array.isArray(p.gemini_models)) {
     const am = Array.isArray(a.gemini_models) ? a.gemini_models : [];
     const same = am.length === p.gemini_models.length && am.every((m, i) => m === p.gemini_models[i]);
@@ -391,7 +392,7 @@ function setDevicePendingTool(deps, args) {
       return { error: e.message };
     }
   }
-  const upd = { version: 0, broker_url: "", psk_hex: "", city: "", br_day: 0, br_night: 0, vol: null, providers: null, provider_modes: null, autorotate_enabled: null, autorotate_interval_s: null, theme_mode: "", pet_enabled: null, pet_species: null, pet_name: "", gemini_models: null, log_enabled: null, firmware_url: "", firmware_sha256: "", firmware_version: "", firmware_manifest_b64: "", firmware_manifest_sig_b64: "", min_secure_version: 0 };
+  const upd = { version: 0, broker_url: "", psk_hex: "", city: "", br_day: 0, br_night: 0, vol: null, providers: null, provider_modes: null, autorotate_enabled: null, autorotate_interval_s: null, theme_mode: "", pet_enabled: null, pet_species: null, pet_name: "", panel_enabled: null, gemini_models: null, log_enabled: null, firmware_url: "", firmware_sha256: "", firmware_version: "", firmware_manifest_b64: "", firmware_manifest_sig_b64: "", min_secure_version: 0 };
   if (args.broker_url) upd.broker_url = String(args.broker_url).trim();
   if (args.psk_hex) {
     const v = String(args.psk_hex).trim().toLowerCase();
@@ -455,6 +456,9 @@ function setDevicePendingTool(deps, args) {
     if (Number.isFinite(v)) upd.pet_species = clamp(v, 0, 9);
   }
   if (args.pet_name) upd.pet_name = String(args.pet_name).slice(0, 15);
+  // Custom panel — device-owned display setting, same handling shape as
+  // pet_enabled above (default false / opt-in on-device).
+  if ("panel_enabled" in args) upd.panel_enabled = !!args.panel_enabled;
   const modelsKey = "antigravity_models" in args ? "antigravity_models" : "gemini_models";
   if (modelsKey in args) {
     const raw = args[modelsKey] == null ? "" : String(args[modelsKey]);
@@ -690,6 +694,7 @@ async function provisionTool(deps, args) {
     payload.theme_mode = tm;
   }
   if ("pet_enabled" in args) payload.pet_enabled = !!args.pet_enabled;
+  if ("panel_enabled" in args) payload.panel_enabled = !!args.panel_enabled;
   const providers = {};
   for (const name of ["claude", "codex", "gemini"]) {
     let key = `provider_${name}`;
@@ -732,7 +737,7 @@ async function provisionTool(deps, args) {
     const regModes = payload.providers
       ? { claude: providerModeFromBool(!!payload.providers.claude), codex: providerModeFromBool(!!payload.providers.codex), gemini: providerModeFromBool(!!payload.providers.gemini) }
       : null;
-    const regPayload = { version: 0, broker_url: brokerURL, psk_hex: pskHex, city: payload.city || "", br_day: payload.br_day || 0, br_night: payload.br_night || 0, vol: payload.vol ?? null, providers: null, provider_modes: regModes, autorotate_enabled: null, autorotate_interval_s: null, theme_mode: payload.theme_mode || "", pet_enabled: ("pet_enabled" in payload) ? payload.pet_enabled : null };
+    const regPayload = { version: 0, broker_url: brokerURL, psk_hex: pskHex, city: payload.city || "", br_day: payload.br_day || 0, br_night: payload.br_night || 0, vol: payload.vol ?? null, providers: null, provider_modes: regModes, autorotate_enabled: null, autorotate_interval_s: null, theme_mode: payload.theme_mode || "", pet_enabled: ("pet_enabled" in payload) ? payload.pet_enabled : null, panel_enabled: ("panel_enabled" in payload) ? payload.panel_enabled : null };
     try { deps.registry.register(deviceID, regPayload); out.registered = true; }
     catch (e) {
       if (/already exists/.test(e.message)) {

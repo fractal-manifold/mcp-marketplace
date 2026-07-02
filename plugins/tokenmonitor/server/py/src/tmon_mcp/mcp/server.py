@@ -146,6 +146,8 @@ def _pending_changes(active: ConfigPayload, pending: ConfigPayload) -> list[str]
         diffs.append("theme_mode")
     if pending.pet_enabled is not None and (active.pet_enabled is None or pending.pet_enabled != active.pet_enabled):
         diffs.append("pet_enabled")
+    if pending.panel_enabled is not None and (active.panel_enabled is None or pending.panel_enabled != active.panel_enabled):
+        diffs.append("panel_enabled")
     if pending.pet_species is not None and (active.pet_species is None or pending.pet_species != active.pet_species):
         diffs.append("pet_species")
     if pending.pet_name and pending.pet_name != active.pet_name:
@@ -590,6 +592,8 @@ def _set_device_pending(deps: Deps, args: dict) -> dict:
     # theme/brightness/autorotate above.
     if "pet_enabled" in args:
         update.pet_enabled = bool(args["pet_enabled"])
+    if "panel_enabled" in args:
+        update.panel_enabled = bool(args["panel_enabled"])
     if "pet_species" in args:
         try:
             update.pet_species = _clamp(int(args["pet_species"]), 0, 9)
@@ -910,6 +914,8 @@ async def _provision(deps: Deps, args: dict) -> dict:
         payload["theme_mode"] = tm
     if "pet_enabled" in args:
         payload["pet_enabled"] = bool(args["pet_enabled"])
+    if "panel_enabled" in args:
+        payload["panel_enabled"] = bool(args["panel_enabled"])
     providers: dict[str, bool] = {}
     for name in ("claude", "codex", "gemini"):
         key = f"provider_{name}"
@@ -947,6 +953,8 @@ async def _provision(deps: Deps, args: dict) -> dict:
             reg_payload.theme_mode = payload["theme_mode"]
         if "pet_enabled" in payload:
             reg_payload.pet_enabled = payload["pet_enabled"]
+        if "panel_enabled" in payload:
+            reg_payload.panel_enabled = payload["panel_enabled"]
         if providers:
             # Provisioning carries the coarse bool set; lift it into the
             # canonical mode triple (true→auto, false→disabled).

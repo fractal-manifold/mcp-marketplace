@@ -140,6 +140,8 @@ func NewMux(cfg *config.Config, cache *auth.NonceCache, st *state.State, logger 
 			handleDeviceLogs(cfg, cache, logger, reg, rec, r)
 		} else if strings.HasSuffix(r.URL.Path, "/settings") {
 			handleDeviceSettings(cfg, cache, logger, reg, rec, r)
+		} else if strings.HasSuffix(r.URL.Path, "/panel") {
+			handleDevicePanel(cfg, cache, logger, reg, rec, r)
 		} else {
 			handleDeviceSync(cfg, cache, logger, reg, st, rec, r)
 		}
@@ -802,6 +804,9 @@ func pendingPayloadJSON(p registry.ConfigPayload) ([]byte, error) {
 	if p.PetEnabled != nil {
 		wire["pet_enabled"] = *p.PetEnabled
 	}
+	if p.PanelEnabled != nil {
+		wire["panel_enabled"] = *p.PanelEnabled
+	}
 	if p.PetSpecies != nil {
 		wire["pet_species"] = *p.PetSpecies
 	}
@@ -1127,6 +1132,7 @@ type settingsReportBody struct {
 	AutorotateEnabled   *bool   `json:"autorotate_enabled"`
 	AutorotateIntervalS *uint16 `json:"autorotate_interval_s"`
 	PetEnabled          *bool   `json:"pet_enabled"`
+	PanelEnabled        *bool   `json:"panel_enabled"`
 	PetSpecies          *uint8  `json:"pet_species"`
 	PetName             *string `json:"pet_name"`
 }
@@ -1221,6 +1227,7 @@ func handleDeviceSettings(cfg *config.Config, cache *auth.NonceCache, logger *lo
 		AutorotateEnabled:   body.AutorotateEnabled,
 		AutorotateIntervalS: body.AutorotateIntervalS,
 		PetEnabled:          body.PetEnabled,
+		PanelEnabled:        body.PanelEnabled,
 		PetSpecies:          body.PetSpecies,
 		PetName:             body.PetName,
 	}); errors.Is(rerr, registry.ErrNotFound) {

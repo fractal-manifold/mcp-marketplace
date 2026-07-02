@@ -37,10 +37,12 @@ import (
 // silently producing junk.
 //
 // v2 adds: device.serial_number, device.hw_sku (factory identity),
-//          pending.firmware_manifest_b64 / firmware_manifest_sig_b64
-//          (signed OTA manifest delivered alongside the .bin URL),
-//          active.min_secure_version (anti-rollback floor mirrored
-//          from the device's tmon_min_sv NVS key).
+//
+//	pending.firmware_manifest_b64 / firmware_manifest_sig_b64
+//	(signed OTA manifest delivered alongside the .bin URL),
+//	active.min_secure_version (anti-rollback floor mirrored
+//	from the device's tmon_min_sv NVS key).
+//
 // v1 files load with empty serial / hw_sku / manifest fields and are
 // re-serialised as v2 on the next save (migration in loadLocked).
 // v3 adds: device.channel (release track: "" / "stable" vs "dev"). It's
@@ -140,25 +142,25 @@ func migrateProviderModes(p *ConfigPayload) {
 // contrast, are the snapshot of the last fully-applied config and
 // therefore have every field populated.
 type ConfigPayload struct {
-	Version              uint32       `toml:"version"`
-	BrokerURL            string       `toml:"broker_url,omitempty"`
-	PSKHex               string       `toml:"psk_hex,omitempty"`
-	City                 string       `toml:"city,omitempty"`
-	BrDay                *uint8       `toml:"br_day,omitempty"`
-	BrNight              *uint8       `toml:"br_night,omitempty"`
-	Vol                  *uint8       `toml:"vol,omitempty"`
+	Version   uint32 `toml:"version"`
+	BrokerURL string `toml:"broker_url,omitempty"`
+	PSKHex    string `toml:"psk_hex,omitempty"`
+	City      string `toml:"city,omitempty"`
+	BrDay     *uint8 `toml:"br_day,omitempty"`
+	BrNight   *uint8 `toml:"br_night,omitempty"`
+	Vol       *uint8 `toml:"vol,omitempty"`
 	// Providers is the legacy bool set — read for migration only, never
 	// written (loadLocked folds it into ProviderModes). ProviderModes is
 	// the live per-provider mode triple.
-	Providers            *ProviderSet     `toml:"providers,omitempty"`
-	ProviderModes        *ProviderModeSet `toml:"provider_modes,omitempty"`
-	AutorotateEnabled    *bool        `toml:"autorotate_enabled,omitempty"`
-	AutorotateIntervalS  *uint16      `toml:"autorotate_interval_s,omitempty"`
+	Providers           *ProviderSet     `toml:"providers,omitempty"`
+	ProviderModes       *ProviderModeSet `toml:"provider_modes,omitempty"`
+	AutorotateEnabled   *bool            `toml:"autorotate_enabled,omitempty"`
+	AutorotateIntervalS *uint16          `toml:"autorotate_interval_s,omitempty"`
 	// ThemeMode is the on-device palette mode: "day", "night", or "auto"
 	// (the latter follows sunrise/sunset). Empty string means "no
 	// opinion" / "don't touch on the device" for partial pending updates;
 	// see compat/tool-schemas.json for the enum.
-	ThemeMode            string       `toml:"theme_mode,omitempty"`
+	ThemeMode string `toml:"theme_mode,omitempty"`
 	// PetEnabled toggles the on-device virtual pet. Pointer so an omitted
 	// field means "no change". PetSpecies is the species enum 0..9
 	// (0=cat,1=dog,2=dragon,3=robot,4=blob,5=slime,6=duck,7=penguin,
@@ -167,20 +169,25 @@ type ConfigPayload struct {
 	// name, up to 15 chars; empty string means "use the species default
 	// name" (device-side). These are device-owned display settings, synced
 	// exactly like theme_mode / brightness; see compat/SETTINGS_REPORT.md.
-	PetEnabled           *bool        `toml:"pet_enabled,omitempty"`
-	PetSpecies           *uint8       `toml:"pet_species,omitempty"`
-	PetName              string       `toml:"pet_name,omitempty"`
+	PetEnabled *bool `toml:"pet_enabled,omitempty"`
+	// PanelEnabled toggles the on-device custom-panel screen (broker-fed
+	// charts/tables). Pointer so an omitted field means "no change"; default
+	// is false (opt-in). Device-owned display setting, synced exactly like
+	// pet_enabled / theme_mode / brightness.
+	PanelEnabled *bool  `toml:"panel_enabled,omitempty"`
+	PetSpecies   *uint8 `toml:"pet_species,omitempty"`
+	PetName      string `toml:"pet_name,omitempty"`
 	// GeminiModels overrides service.toml [gemini].models for this
 	// device. The broker honours this list when serving /usage/gemini
 	// for the device. Empty means "use the global default". Max 3 entries;
 	// excess is silently clamped on the broker side.
-	GeminiModels         []string     `toml:"gemini_models,omitempty"`
+	GeminiModels []string `toml:"gemini_models,omitempty"`
 	// LogEnabled toggles the device's diagnostic log upload (NVS key
 	// tmon_log_en). Pointer so an omitted field means "no change": dev
 	// units default ON on-device and factory units default OFF, so this is
 	// how an operator opts a production unit into log streaming (or
 	// silences a dev unit) without a reflash.
-	LogEnabled           *bool        `toml:"log_enabled,omitempty"`
+	LogEnabled *bool `toml:"log_enabled,omitempty"`
 	// FirmwareURL / FirmwareSHA256 / FirmwareVersion carry a staged OTA
 	// update through the same pending envelope as a config change. All
 	// three must be present in the pending payload for the firmware's
@@ -190,9 +197,9 @@ type ConfigPayload struct {
 	// anchor since the .bin itself is not signed; the version string
 	// must match the esp_app_desc baked into the binary so the device
 	// can refuse to re-install or downgrade.
-	FirmwareURL          string       `toml:"firmware_url,omitempty"`
-	FirmwareSHA256       string       `toml:"firmware_sha256,omitempty"`
-	FirmwareVersion      string       `toml:"firmware_version,omitempty"`
+	FirmwareURL     string `toml:"firmware_url,omitempty"`
+	FirmwareSHA256  string `toml:"firmware_sha256,omitempty"`
+	FirmwareVersion string `toml:"firmware_version,omitempty"`
 	// FirmwareManifestB64 is the base64 of the canonical-JSON Ed25519
 	// manifest produced by `firmware/components/ota/scripts/manifest.py
 	// sign`. FirmwareManifestSigB64 is the base64 of the 64-byte raw
@@ -209,7 +216,7 @@ type ConfigPayload struct {
 	// firmware refuses to apply. Tracked here so revert-via-MCP can
 	// surface "this rollback would violate anti-rollback" before it
 	// touches the device.
-	MinSecureVersion       uint32 `toml:"min_secure_version,omitempty"`
+	MinSecureVersion uint32 `toml:"min_secure_version,omitempty"`
 }
 
 type Active struct {
@@ -249,7 +256,7 @@ type Device struct {
 	// part of the config payload — the firmware never sees it; the broker
 	// uses it only to pick which GitHub asset to fetch. Always stored
 	// canonical via normalizeChannel (trim+lowercase; "stable" → "").
-	Channel string   `toml:"channel,omitempty"`
+	Channel string `toml:"channel,omitempty"`
 	// BlockedFirmwareVersion is a per-device OTA tombstone: a version the
 	// AUTO-discovery loop (ota.decide) must NOT re-stage. tokenmonitor_revert
 	// writes the version the device is being reverted FROM here, so a canary
@@ -262,9 +269,9 @@ type Device struct {
 	// (a fixed release landed), so stale tombstones don't accumulate. Device-
 	// level (sibling of Channel), NOT part of the config payload — the firmware
 	// never sees it. Mirror of py/js blocked_firmware_version.
-	BlockedFirmwareVersion string `toml:"blocked_firmware_version,omitempty"`
-	Active  Active   `toml:"active"`
-	Pending *Pending `toml:"pending,omitempty"`
+	BlockedFirmwareVersion string   `toml:"blocked_firmware_version,omitempty"`
+	Active                 Active   `toml:"active"`
+	Pending                *Pending `toml:"pending,omitempty"`
 }
 
 // normalizeChannel canonicalises a release-channel string: trim +
@@ -668,6 +675,7 @@ type ReportedSettings struct {
 	AutorotateEnabled   *bool
 	AutorotateIntervalS *uint16
 	PetEnabled          *bool
+	PanelEnabled        *bool
 	PetSpecies          *uint8
 	PetName             *string
 }
@@ -734,6 +742,13 @@ func applyReported(p *ConfigPayload, s ReportedSettings) bool {
 		if p.PetEnabled == nil || *p.PetEnabled != *s.PetEnabled {
 			v := *s.PetEnabled
 			p.PetEnabled = &v
+			changed = true
+		}
+	}
+	if s.PanelEnabled != nil {
+		if p.PanelEnabled == nil || *p.PanelEnabled != *s.PanelEnabled {
+			v := *s.PanelEnabled
+			p.PanelEnabled = &v
 			changed = true
 		}
 	}
@@ -1151,6 +1166,10 @@ func mergePayload(base, upd ConfigPayload) ConfigPayload {
 		v := *upd.PetEnabled
 		out.PetEnabled = &v
 	}
+	if upd.PanelEnabled != nil {
+		v := *upd.PanelEnabled
+		out.PanelEnabled = &v
+	}
 	if upd.PetSpecies != nil {
 		v := *upd.PetSpecies
 		out.PetSpecies = &v
@@ -1235,6 +1254,9 @@ func payloadEquivalent(a, b ConfigPayload) bool {
 		return false
 	}
 	if !ptrBoolEqual(a.PetEnabled, b.PetEnabled) {
+		return false
+	}
+	if !ptrBoolEqual(a.PanelEnabled, b.PanelEnabled) {
 		return false
 	}
 	if !ptrU8Equal(a.PetSpecies, b.PetSpecies) {

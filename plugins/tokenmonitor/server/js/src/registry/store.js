@@ -373,6 +373,9 @@ function emptyPayload() {
     // pet_enabled null = no change (default true on-device); pet_species null =
     // not picked yet (no sentinel stored); pet_name "" = use species default.
     pet_enabled: null, pet_species: null, pet_name: "",
+    // Custom panel — device-owned display setting, same shape as pet_enabled.
+    // null = no change (default false on-device, opt-in).
+    panel_enabled: null,
     // null = "no opinion" (use global default); [] = clear override.
     gemini_models: null,
     // Diagnostic log upload toggle (NVS tmon_log_en). null = no change;
@@ -414,6 +417,7 @@ function payloadToTomlObj(p) {
   if (p.pet_enabled != null) d.pet_enabled = !!p.pet_enabled;
   if (p.pet_species != null) d.pet_species = Number(p.pet_species);
   if (p.pet_name) d.pet_name = String(p.pet_name);
+  if (p.panel_enabled != null) d.panel_enabled = !!p.panel_enabled;
   if (Array.isArray(p.gemini_models) && p.gemini_models.length > 0) {
     d.gemini_models = p.gemini_models.map(String);
   }
@@ -450,6 +454,7 @@ function tomlObjToPayload(d) {
     pet_enabled: typeof d.pet_enabled === "boolean" ? d.pet_enabled : null,
     pet_species: typeof d.pet_species === "number" ? d.pet_species : null,
     pet_name: String(d.pet_name || ""),
+    panel_enabled: typeof d.panel_enabled === "boolean" ? d.panel_enabled : null,
     gemini_models: Array.isArray(d.gemini_models) ? d.gemini_models.map(String) : null,
     log_enabled: typeof d.log_enabled === "boolean" ? d.log_enabled : null,
     firmware_url: String(d.firmware_url || ""),
@@ -577,6 +582,10 @@ function applyReported(p, s) {
     const b = Boolean(s.pet_enabled);
     if (p.pet_enabled !== b) { p.pet_enabled = b; changed = true; }
   }
+  if (s.panel_enabled != null) {
+    const b = Boolean(s.panel_enabled);
+    if (p.panel_enabled !== b) { p.panel_enabled = b; changed = true; }
+  }
   if (s.pet_species != null) {
     // Clamp to the species enum 0..9 like every other numeric field. Absence
     // (null) is handled by the caller — the device omits the field until it
@@ -610,6 +619,7 @@ function mergePayload(base, upd) {
     pet_enabled: upd.pet_enabled != null ? upd.pet_enabled : base.pet_enabled,
     pet_species: upd.pet_species != null ? upd.pet_species : base.pet_species,
     pet_name: upd.pet_name || base.pet_name,
+    panel_enabled: upd.panel_enabled != null ? upd.panel_enabled : base.panel_enabled,
     gemini_models: Array.isArray(upd.gemini_models)
       ? upd.gemini_models.slice()
       : base.gemini_models,
@@ -636,6 +646,8 @@ function payloadEquivalent(a, b) {
   if ((a.theme_mode || "") !== (b.theme_mode || "")) return false;
   if ((a.pet_enabled == null) !== (b.pet_enabled == null)) return false;
   if (a.pet_enabled != null && a.pet_enabled !== b.pet_enabled) return false;
+  if ((a.panel_enabled == null) !== (b.panel_enabled == null)) return false;
+  if (a.panel_enabled != null && a.panel_enabled !== b.panel_enabled) return false;
   if ((a.pet_species == null) !== (b.pet_species == null)) return false;
   if (a.pet_species != null && a.pet_species !== b.pet_species) return false;
   if ((a.pet_name || "") !== (b.pet_name || "")) return false;

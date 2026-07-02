@@ -234,6 +234,10 @@
             "type": "boolean",
             "description": "Show the on-device virtual pet (default true). The pet is device-owned, like the display settings; the user can also toggle it on the device."
           },
+          "panel_enabled": {
+            "type": "boolean",
+            "description": "Show the on-device custom-panel screen (broker-fed charts/tables via GET /device/<id>/panel; default false, opt-in). Device-owned like the display settings; the user can also toggle it on the device."
+          },
           "pet_species": {
             "type": "number",
             "description": "Virtual pet species, 0..9: 0=cat,1=dog,2=dragon,3=robot,4=blob,5=slime,6=duck,7=penguin,8=owl,9=ghost. Out-of-range values are clamped."
@@ -429,6 +433,10 @@
           "pet_enabled": {
             "type": "boolean",
             "description": "Show the on-device virtual pet (default true). Device-owned like the display settings; pass false to hide it. Same setting as tokenmonitor_set_device_pending's pet_enabled."
+          },
+          "panel_enabled": {
+            "type": "boolean",
+            "description": "Show the on-device custom-panel screen (broker-fed charts/tables via GET /device/<id>/panel; default false, opt-in). Device-owned like the display settings; the user can also toggle it on the device."
           },
           "provider_claude": {
             "type": "boolean",

@@ -104,6 +104,11 @@ func pendingChanges(active, pending registry.ConfigPayload) []string {
 			diffs = append(diffs, "pet_enabled")
 		}
 	}
+	if pending.PanelEnabled != nil {
+		if active.PanelEnabled == nil || *active.PanelEnabled != *pending.PanelEnabled {
+			diffs = append(diffs, "panel_enabled")
+		}
+	}
 	if pending.PetSpecies != nil {
 		if active.PetSpecies == nil || *active.PetSpecies != *pending.PetSpecies {
 			diffs = append(diffs, "pet_species")
@@ -408,6 +413,10 @@ func handleSetDevicePending(d Deps) server.ToolHandlerFunc {
 		if _, ok := anyProv["pet_enabled"]; ok {
 			v := req.GetBool("pet_enabled", true)
 			update.PetEnabled = &v
+		}
+		if _, ok := anyProv["panel_enabled"]; ok {
+			v := req.GetBool("panel_enabled", false)
+			update.PanelEnabled = &v
 		}
 		if _, ok := anyProv["pet_species"]; ok {
 			sp := clamp8(uint8(req.GetFloat("pet_species", 0)), 0, 9)

@@ -47,14 +47,14 @@ const (
 // expose every TXT key we know about plus the parsed IPs so the caller
 // can both display the device and point /provision straight at it.
 type discoveredDevice struct {
-	DeviceID   string   `json:"device_id"`
-	State      string   `json:"state,omitempty"`
-	FW         string   `json:"fw,omitempty"`
-	Host       string   `json:"host"`
-	Port       int      `json:"port"`
-	IPv4       []string `json:"ipv4,omitempty"`
-	ProvisionURL string `json:"provision_url"`
-	InfoURL      string `json:"info_url"`
+	DeviceID     string   `json:"device_id"`
+	State        string   `json:"state,omitempty"`
+	FW           string   `json:"fw,omitempty"`
+	Host         string   `json:"host"`
+	Port         int      `json:"port"`
+	IPv4         []string `json:"ipv4,omitempty"`
+	ProvisionURL string   `json:"provision_url"`
+	InfoURL      string   `json:"info_url"`
 }
 
 func registerDiscoveryTools(s *server.MCPServer, d Deps) {
@@ -82,16 +82,17 @@ func registerDiscoveryTools(s *server.MCPServer, d Deps) {
 			mcp.WithString("psk_hex",
 				mcp.Description("64-hex PSK the device should sign requests with.")),
 			mcp.WithString("city", mcp.Description("Optional city for ambient weather.")),
-			mcp.WithNumber("br_day",   mcp.Description("Daytime brightness 10..100.")),
+			mcp.WithNumber("br_day", mcp.Description("Daytime brightness 10..100.")),
 			mcp.WithNumber("br_night", mcp.Description("Nighttime brightness 5..100.")),
-			mcp.WithNumber("vol",      mcp.Description("Alert volume 0..100.")),
+			mcp.WithNumber("vol", mcp.Description("Alert volume 0..100.")),
 			mcp.WithString("theme_mode",
 				mcp.Description("Display theme applied on the device: 'day' (light palette), 'night' (dark palette) or 'auto' (follows sunrise/sunset). Default on the device is auto. Same setting and wire convention as tokenmonitor_set_device_pending's theme_mode."),
 				mcp.Enum("day", "night", "auto"),
 			),
 			mcp.WithBoolean("pet_enabled", mcp.Description("Show the on-device virtual pet (default true). Device-owned like the display settings; pass false to hide it. Same setting as tokenmonitor_set_device_pending's pet_enabled.")),
+			mcp.WithBoolean("panel_enabled", mcp.Description("Show the on-device custom-panel screen (broker-fed charts/tables via GET /device/<id>/panel; default false, opt-in). Device-owned like the display settings; the user can also toggle it on the device.")),
 			mcp.WithBoolean("provider_claude", mcp.Description("Enable Claude provider.")),
-			mcp.WithBoolean("provider_codex",  mcp.Description("Enable Codex provider.")),
+			mcp.WithBoolean("provider_codex", mcp.Description("Enable Codex provider.")),
 			mcp.WithBoolean("provider_antigravity", mcp.Description("Enable Antigravity provider (tracks the `agy` CLI, successor to Gemini).")),
 			mcp.WithBoolean("provider_gemini", mcp.Description("Deprecated alias of provider_antigravity, accepted for backward compatibility.")),
 		),
@@ -187,16 +188,17 @@ func handleDiscoverDevices(_ Deps) server.ToolHandlerFunc {
 // fields stay nil when unset so the device's persist_provision treats
 // them as "no change".
 type provisionPayload struct {
-	PairingCode string                 `json:"pairing_code"`
-	BrokerURL   string                 `json:"broker_url,omitempty"`
-	PSKHex      string                 `json:"psk_hex,omitempty"`
-	City        string                 `json:"city,omitempty"`
-	BrDay       *uint8                 `json:"br_day,omitempty"`
-	BrNight     *uint8                 `json:"br_night,omitempty"`
-	Vol         *uint8                 `json:"vol,omitempty"`
-	ThemeMode   string                 `json:"theme_mode,omitempty"`
-	PetEnabled  *bool                  `json:"pet_enabled,omitempty"`
-	Providers   map[string]bool        `json:"providers,omitempty"`
+	PairingCode  string          `json:"pairing_code"`
+	BrokerURL    string          `json:"broker_url,omitempty"`
+	PSKHex       string          `json:"psk_hex,omitempty"`
+	City         string          `json:"city,omitempty"`
+	BrDay        *uint8          `json:"br_day,omitempty"`
+	BrNight      *uint8          `json:"br_night,omitempty"`
+	Vol          *uint8          `json:"vol,omitempty"`
+	ThemeMode    string          `json:"theme_mode,omitempty"`
+	PetEnabled   *bool           `json:"pet_enabled,omitempty"`
+	PanelEnabled *bool           `json:"panel_enabled,omitempty"`
+	Providers    map[string]bool `json:"providers,omitempty"`
 }
 
 func handleProvision(d Deps) server.ToolHandlerFunc {
@@ -270,6 +272,10 @@ func handleProvision(d Deps) server.ToolHandlerFunc {
 		if _, ok := args["pet_enabled"]; ok {
 			pe := req.GetBool("pet_enabled", true)
 			payload.PetEnabled = &pe
+		}
+		if _, ok := args["panel_enabled"]; ok {
+			pe := req.GetBool("panel_enabled", false)
+			payload.PanelEnabled = &pe
 		}
 		_, hasClaude := args["provider_claude"]
 		_, hasCodex := args["provider_codex"]
@@ -354,6 +360,10 @@ func handleProvision(d Deps) server.ToolHandlerFunc {
 			if payload.PetEnabled != nil {
 				v := *payload.PetEnabled
 				reg.PetEnabled = &v
+			}
+			if payload.PanelEnabled != nil {
+				v := *payload.PanelEnabled
+				reg.PanelEnabled = &v
 			}
 			if payload.Providers != nil {
 				// Provisioning carries the coarse bool set; lift it into
