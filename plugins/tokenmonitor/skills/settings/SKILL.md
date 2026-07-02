@@ -1,6 +1,6 @@
 ---
 name: settings
-description: tokenmonitor plugin — remotely change any on-device setting that the Settings panel exposes (city, day / night brightness, alert volume, enabled providers, auto-rotation, virtual pet, broker URL, passphrase) on a TokenMonitor device. Equivalent to long-pressing the mascot on the dashboard and editing a row, but driven from Claude Code via the control plane. Use this when the user says "set the wall monitor city to Madrid", "lower the night brightness", "mute the alerts", "disable Codex on device X", "rotate providers every 60 s", "change the pet to a dragon", "rename the pet", "hide the pet", "rotate the broker passphrase", "change the broker URL", or any similar reconfiguration of an already-provisioned device.
+description: tokenmonitor plugin — remotely change any on-device setting that the Settings panel exposes (city, day / night brightness, alert volume, enabled providers, auto-rotation, virtual pet, broker URL, passphrase) on a TokenMonitor device. Equivalent to long-pressing the mascot on the dashboard and editing a row, but driven from Claude Code via the control plane. Use this when the user says "set the wall monitor city to Madrid", "lower the night brightness", "mute the alerts", "disable Codex on device X", "rotate providers every 60 s", "change the pet to a dragon", "rename the pet", "hide the pet", "rotate the broker passphrase", "change the broker URL", "enable/disable the custom panel", "configure the swipe-up panel", "change what the panel shows", or any similar reconfiguration of an already-provisioned device.
 ---
 
 # /tokenmonitor:settings
@@ -27,6 +27,7 @@ field here.
 - "Change the pet to a dragon." / "Rename the pet to Sparky." / "Hide the pet."
 - "Change the broker URL on device `<id>`."
 - "Rotate the broker passphrase on the wall monitor."
+- "Enable / disable the custom (swipe-up) panel." / "Change what the panel shows."
 - "Update the wall monitor settings."
 
 ## Out of scope
@@ -106,6 +107,57 @@ as aliases.
 broker is also pointed at a panel file via its `[panel]` config section (see
 the monorepo's `docs/custom-panel.md`). Enabling it on a broker with no
 `[panel]` set just shows an empty-state message on the device.
+
+##### Enabling / disabling / configuring the custom panel
+
+The custom panel has **two independent switches** — get both right:
+
+1. **The device flag** `panel_enabled` (this skill / on-device Settings →
+   Display → Custom panel). Controls whether the device *polls for* and
+   *renders* the swipe-up screen at all.
+2. **The broker content** — a JSON file the broker serves at
+   `GET /device/<id>/panel`. Without a file the endpoint returns **404** and
+   the page drops out of the rotation even if `panel_enabled=true`.
+
+**Enable:** send `panel_enabled: true` **and** make sure the broker has a
+panel file (see "Configuring" below). One without the other shows only the
+empty-state message.
+
+**Disable:** the clean way is `panel_enabled: false` (the device stops polling
+and rendering — this is what frees the RAM the panel's render buffers hold).
+**But** `panel_enabled` only exists on brokers new enough to advertise it in
+`tokenmonitor_set_device_pending`. If the arg is **absent from the tool schema**
+(older broker — e.g. 0.9.6), you cannot toggle the device flag remotely; fall
+back to disabling the **content** broker-side so the endpoint 404s and the page
+drops from the rotation:
+
+- Per-device file: move/rename `<panel-dir>/<device-id>.json` aside, **and**
+  `<panel-dir>/default.json` if present (otherwise the device falls back to
+  the default file and the page stays).
+- Or comment out the whole `[panel]` section in the broker config and restart
+  the broker.
+
+The broker re-reads panel files on every request (mtime+size cache), so
+removing a file 404s on the **next device poll (~20 s) without a broker
+restart** — only editing the `[panel]` *section* of the config needs a restart.
+Tell the user the panel flag itself is still on and suggest bumping the broker
+so `panel_enabled` becomes pushable.
+
+**Configuring the content** is a broker-side filesystem operation, not a device
+pending. Resolve the broker's panel location from its `[panel]` section
+(`~/.config/tokenmonitor/tokenmonitor.toml`):
+
+- `dir` set → per-device `dir/<device-id>.json`, else `dir/default.json`;
+- else `file` → one shared panel for every device.
+
+Write valid PANEL_WIRE JSON there (`version:1`, 1–4 `tiles` of type
+`line`/`bar`/`pie`/`table`/`text`; caps: 4 tiles, 4 series, 64 points, 8 KB
+file; solid `#rrggbb` colors only). **Write atomically** (temp file + rename)
+so the broker never serves a half-written file — it picks up the change on the
+next request, no restart. Full field list and examples live in the monorepo's
+`docs/custom-panel.md` and `compat/PANEL_WIRE.md`. If the user asks to *change
+what the panel shows* rather than toggle it, edit that file; do **not** queue a
+device pending.
 
 #### Virtual pet
 
@@ -326,6 +378,28 @@ tokenmonitor_set_device_pending
 tokenmonitor_set_device_pending
   device_id: ab12cd34
   psk_hex: <64 hex chars>
+```
+
+### Enable the custom panel
+
+```
+tokenmonitor_set_device_pending
+  device_id: ab12cd34
+  panel_enabled: true
+# …then make sure the broker has a panel file (see "Configuring the content").
+```
+
+### Disable the custom panel
+
+```
+# Preferred — if the tool schema exposes panel_enabled:
+tokenmonitor_set_device_pending
+  device_id: ab12cd34
+  panel_enabled: false
+
+# Fallback — older broker (no panel_enabled arg): 404 the content instead.
+mv <panel-dir>/ab12cd34.json <panel-dir>/.disabled/   # and default.json if present
+# Device 404s on its next ~20 s poll and drops the panel page; no broker restart.
 ```
 
 ## Tools used (in order)
