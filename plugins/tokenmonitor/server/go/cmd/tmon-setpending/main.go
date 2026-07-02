@@ -25,10 +25,12 @@ func main() {
 	url := flag.String("url", "", "firmware_url")
 	sha := flag.String("sha", "", "firmware_sha256 (64 hex)")
 	ver := flag.String("ver", "", "firmware_version")
+	mb64 := flag.String("manifest-b64", "", "firmware_manifest_b64 (signed manifest)")
+	msig := flag.String("manifest-sig", "", "firmware_manifest_sig_b64")
 	flag.Parse()
 
 	if *id == "" || *url == "" || *sha == "" || *ver == "" {
-		fmt.Fprintln(os.Stderr, "usage: tmon-setpending -id <id> -url <url> -sha <hex> -ver <semver> [-dir <devices>]")
+		fmt.Fprintln(os.Stderr, "usage: tmon-setpending -id <id> -url <url> -sha <hex> -ver <semver> [-manifest-b64 <b64> -manifest-sig <b64>] [-dir <devices>]")
 		os.Exit(2)
 	}
 
@@ -38,9 +40,11 @@ func main() {
 		os.Exit(1)
 	}
 	dev, err := reg.SetPending(*id, registry.ConfigPayload{
-		FirmwareURL:     *url,
-		FirmwareSHA256:  *sha,
-		FirmwareVersion: *ver,
+		FirmwareURL:            *url,
+		FirmwareSHA256:         *sha,
+		FirmwareVersion:        *ver,
+		FirmwareManifestB64:    *mb64,
+		FirmwareManifestSigB64: *msig,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "SetPending:", err)
