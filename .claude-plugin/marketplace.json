@@ -17,7 +17,7 @@
       "name": "tokenmonitor",
       "source": "./plugins/tokenmonitor",
       "description": "Registers tokenmonitor-mcp, the local broker for the TokenMonitor ESP32 device. Adds 14 diagnostic and control tools (status/health/logs, device registry + provisioning, config + firmware OTA staging, revert and update checks) and four on-device skills (/tokenmonitor:configure, /tokenmonitor:settings, /tokenmonitor:theme, /tokenmonitor:firmware). Runs with leader-elected coexistence so multiple Claude Code sessions and an existing systemd daemon share the broker port cleanly. Self-contained: bundles the MCP server and resolves its runtime (Node, Python or Go) on first launch into a per-user cache — no separate go install / pipx / npm step.",
-      "version": "0.9.7",
+      "version": "0.9.8",
       "category": "mcp",
       "keywords": ["mcp", "tokenmonitor", "esp32", "iot", "hardware"]
     }
