@@ -82,7 +82,7 @@ func TestPanel_ConfiguredFile_ServesVerbatim(t *testing.T) {
 	if err := os.WriteFile(file, []byte(body), 0600); err != nil {
 		t.Fatal(err)
 	}
-	ts, reg := newPanelServer(t, func(c *config.Config) { c.Panel.File = file })
+	ts, reg := newPanelServer(t, func(c *config.Config) { c.Panel.File = config.PanelPaths{"default": file} })
 	psk := registerPanelDevice(t, reg)
 
 	resp := signedPanelRequest(t, ts, psk, panelTestID, false)
@@ -115,7 +115,7 @@ func TestPanel_NotConfigured_404(t *testing.T) {
 func TestPanel_UnknownDevice_404(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "panel.json")
 	_ = os.WriteFile(file, []byte(`{"version":1}`), 0600)
-	ts, _ := newPanelServer(t, func(c *config.Config) { c.Panel.File = file })
+	ts, _ := newPanelServer(t, func(c *config.Config) { c.Panel.File = config.PanelPaths{"default": file} })
 	resp := signedPanelRequest(t, ts, []byte("irrelevant"), panelTestID, false)
 	defer resp.Body.Close()
 	if resp.StatusCode != 404 {
@@ -130,7 +130,7 @@ func TestPanel_Oversize_422(t *testing.T) {
 	if err := os.WriteFile(file, []byte(big), 0600); err != nil {
 		t.Fatal(err)
 	}
-	ts, reg := newPanelServer(t, func(c *config.Config) { c.Panel.File = file })
+	ts, reg := newPanelServer(t, func(c *config.Config) { c.Panel.File = config.PanelPaths{"default": file} })
 	psk := registerPanelDevice(t, reg)
 	resp := signedPanelRequest(t, ts, psk, panelTestID, false)
 	defer resp.Body.Close()
@@ -145,7 +145,7 @@ func TestPanel_BadJSON_422(t *testing.T) {
 	if err := os.WriteFile(file, []byte("not json at all"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	ts, reg := newPanelServer(t, func(c *config.Config) { c.Panel.File = file })
+	ts, reg := newPanelServer(t, func(c *config.Config) { c.Panel.File = config.PanelPaths{"default": file} })
 	psk := registerPanelDevice(t, reg)
 	resp := signedPanelRequest(t, ts, psk, panelTestID, false)
 	defer resp.Body.Close()
@@ -158,7 +158,7 @@ func TestPanel_BadJSON_422(t *testing.T) {
 func TestPanel_BadSignature_401(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "panel.json")
 	_ = os.WriteFile(file, []byte(`{"version":1}`), 0600)
-	ts, reg := newPanelServer(t, func(c *config.Config) { c.Panel.File = file })
+	ts, reg := newPanelServer(t, func(c *config.Config) { c.Panel.File = config.PanelPaths{"default": file} })
 	psk := registerPanelDevice(t, reg)
 	resp := signedPanelRequest(t, ts, psk, panelTestID, true /*tamper*/)
 	defer resp.Body.Close()
@@ -179,7 +179,7 @@ func TestPanel_PerDeviceDirWins(t *testing.T) {
 
 	ts, reg := newPanelServer(t, func(c *config.Config) {
 		c.Panel.Dir = dir
-		c.Panel.File = global
+		c.Panel.File = config.PanelPaths{"default": global}
 	})
 	psk := registerPanelDevice(t, reg)
 	resp := signedPanelRequest(t, ts, psk, panelTestID, false)
@@ -187,6 +187,31 @@ func TestPanel_PerDeviceDirWins(t *testing.T) {
 	got, _ := io.ReadAll(resp.Body)
 	if string(got) != perDev {
 		t.Fatalf("expected per-device file, got %q", got)
+	}
+}
+
+// TestPanel_ExplicitPerDeviceFileWins — an explicit [panel.file].<id> entry
+// takes precedence over both the dir convention and the default file.
+func TestPanel_ExplicitPerDeviceFileWins(t *testing.T) {
+	dir := t.TempDir()
+	def := filepath.Join(dir, "def.json")
+	_ = os.WriteFile(def, []byte(`{"src":"default"}`), 0600)
+	// A dir/<id>.json exists too — the explicit entry must still win.
+	_ = os.WriteFile(filepath.Join(dir, panelTestID+".json"), []byte(`{"src":"dir"}`), 0600)
+	explicit := filepath.Join(dir, "explicit.json")
+	want := `{"src":"explicit"}`
+	_ = os.WriteFile(explicit, []byte(want), 0600)
+
+	ts, reg := newPanelServer(t, func(c *config.Config) {
+		c.Panel.Dir = dir
+		c.Panel.File = config.PanelPaths{"default": def, panelTestID: explicit}
+	})
+	psk := registerPanelDevice(t, reg)
+	resp := signedPanelRequest(t, ts, psk, panelTestID, false)
+	defer resp.Body.Close()
+	got, _ := io.ReadAll(resp.Body)
+	if string(got) != want {
+		t.Fatalf("expected explicit per-device file, got %q", got)
 	}
 }
 
@@ -198,7 +223,7 @@ func TestPanel_ServesCompatGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts, reg := newPanelServer(t, func(c *config.Config) { c.Panel.File = golden })
+	ts, reg := newPanelServer(t, func(c *config.Config) { c.Panel.File = config.PanelPaths{"default": golden} })
 	psk := registerPanelDevice(t, reg)
 	resp := signedPanelRequest(t, ts, psk, panelTestID, false)
 	defer resp.Body.Close()

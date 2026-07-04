@@ -22,13 +22,19 @@ const PSK = Buffer.from(PSK_HEX, "hex");
 const DEVID = "ab12cd34";
 
 function makeCfg(panel = {}) {
-  const p = { file: "", dir: "", ...panel };
+  const p = { file: "", dir: "", command: {}, ...panel };
+  const fileMap = () => {
+    if (p.file && typeof p.file === "object") return p.file;
+    if (typeof p.file === "string" && p.file) return { default: p.file };
+    return {};
+  };
   return {
     psk: () => Buffer.from("00".repeat(32), "hex"),
     security: { max_timestamp_skew_seconds: 60 },
     codex: { enabled: false },
     panel: p,
-    panelFileAbs: () => p.file || "",
+    panelFileExplicitAbs: (id) => (id && fileMap()[id]) || "",
+    panelFileDefaultAbs: () => fileMap().default || "",
     panelDirAbs: () => p.dir || "",
   };
 }
@@ -181,6 +187,22 @@ test("per-device <dir>/<id>.json wins", async () => {
     const res = await run({ file: join(panels, "global.json"), dir: panels });
     assert.equal(res.statusCode, 200);
     assert.equal(res.body, per);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+test("explicit [panel.file].<id> wins over dir and default", async () => {
+  const d = mkdtempSync(join(tmpdir(), "tmon-panelx-"));
+  try {
+    const panels = join(d, "panels");
+    mkdirSync(panels);
+    writeFileSync(join(panels, "def.json"), '{"src":"default"}');
+    writeFileSync(join(panels, `${DEVID}.json`), '{"src":"dir"}');
+    const explicit = join(d, "explicit.json");
+    const want = '{"src":"explicit"}';
+    writeFileSync(explicit, want);
+    const res = await run({ file: { default: join(panels, "def.json"), [DEVID]: explicit }, dir: panels });
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body, want);
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
 

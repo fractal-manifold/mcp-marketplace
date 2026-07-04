@@ -599,10 +599,14 @@ _panel_cache: dict[str, tuple[float, int, bytes]] = {}
 
 
 def _resolve_panel_path(cfg: Config, device_id: str) -> str:
-    """Pick the file to serve for device_id, most specific first:
-    <dir>/<id>.json, then <dir>/default.json, then the global file. "" = off.
+    """Pick the file to serve for device_id, most specific first: the explicit
+    [panel.file].<id> entry, then <dir>/<id>.json, then <dir>/default.json,
+    then the [panel.file].default entry (a.k.a. the legacy bare file). "" = off.
 
     device_id has passed valid_device_id (no slashes) so <id>.json is safe."""
+    explicit = cfg.panel_file_explicit_abs(device_id)
+    if explicit:
+        return explicit
     d = cfg.panel_dir_abs()
     if d:
         if device_id:
@@ -612,7 +616,7 @@ def _resolve_panel_path(cfg: Config, device_id: str) -> str:
         p = Path(d) / "default.json"
         if p.is_file():
             return str(p)
-    f = cfg.panel_file_abs()
+    f = cfg.panel_file_default_abs()
     if f:
         return f
     return ""

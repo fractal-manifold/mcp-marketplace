@@ -449,9 +449,13 @@ const PANEL_MAX_BYTES = 8 * 1024;
 // mtime+size cache: a program rewriting the file in place is picked up next poll.
 const panelCache = new Map();
 
-// resolvePanelPath: <dir>/<id>.json, then <dir>/default.json, then the global
-// file. "" ⇒ feature off. deviceID already passed validDeviceID (no slashes).
+// resolvePanelPath: the explicit [panel.file].<id> entry, then <dir>/<id>.json,
+// then <dir>/default.json, then the [panel.file].default entry (a.k.a. the
+// legacy bare file). "" ⇒ feature off. deviceID already passed validDeviceID
+// (no slashes).
 function resolvePanelPath(cfg, deviceID) {
+  const explicit = cfg.panelFileExplicitAbs ? cfg.panelFileExplicitAbs(deviceID) : "";
+  if (explicit) return explicit;
   const dir = cfg.panelDirAbs ? cfg.panelDirAbs() : "";
   if (dir) {
     if (deviceID) {
@@ -461,7 +465,7 @@ function resolvePanelPath(cfg, deviceID) {
     const d = joinPath(dir, "default.json");
     try { if (statSync(d).isFile()) return d; } catch {}
   }
-  const f = cfg.panelFileAbs ? cfg.panelFileAbs() : "";
+  const f = cfg.panelFileDefaultAbs ? cfg.panelFileDefaultAbs() : "";
   return f || "";
 }
 

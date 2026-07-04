@@ -123,6 +123,23 @@ async def test_per_device_dir_wins(tmp_path):
     assert resp.body == per.encode()
 
 
+async def test_explicit_per_device_file_wins(tmp_path):
+    # An explicit [panel.file].<id> entry beats both the dir convention and the
+    # default file.
+    d = tmp_path / "panels"
+    d.mkdir()
+    (d / "def.json").write_text('{"src":"default"}')
+    (d / f"{DEVICE_ID}.json").write_text('{"src":"dir"}')
+    explicit = tmp_path / "explicit.json"
+    want = '{"src":"explicit"}'
+    explicit.write_text(want)
+    app = _app(tmp_path, dir=str(d))
+    app["cfg"].panel.file = {"default": str(d / "def.json"), DEVICE_ID: str(explicit)}
+    resp = await _run(app)
+    assert resp.status == 200
+    assert resp.body == want.encode()
+
+
 def _compat_golden(name: str) -> str | None:
     here = Path(__file__).resolve()
     for parent in here.parents:

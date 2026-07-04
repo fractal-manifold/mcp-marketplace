@@ -21,6 +21,7 @@ import { run as leaderRun, tryListen } from "./leader.js";
 import { serve as mcpServe } from "./mcp/server.js";
 import { Publisher as MdnsPublisher } from "./mdns.js";
 import { Tailer } from "./serialTailer.js";
+import { PanelGenerator } from "./panelGenerator.js";
 
 function parseFlags(argv) {
   const out = { config: "", daemon: false, once: false, status: false, logs: false, version: false, probe: false };
@@ -130,14 +131,27 @@ async function runDaemon(cfg, logs, logger) {
   // leader by construction in daemon mode — it owns the bound socket.
   const otaAbort = new AbortController();
   ota.run(cfg, registry, otaAbort.signal, logger);
+  // Custom-panel generators: leader-scoped (daemon is always the leader).
+  // No-op when [panel.command] is unconfigured; shares the OTA abort.
+  const panelGen = new PanelGenerator(cfg, registry, logger);
+  panelGen.start(otaAbort.signal);
   // Broker self-version check: best-effort, started once at startup (not
   // leader-scoped — a daemon is the leader by construction). Shares the OTA
   // abort so it tears down with the process. Mirrors Go's go updatecheck.Run.
   updatecheck.run(state, { baked: VERSION, logger, abortSignal: otaAbort.signal });
   try {
-    await new Promise(() => {}); // run until killed
+    // SIGTERM/SIGINT → graceful shutdown so the finally runs and children are
+    // reaped. Registering a listener also overrides Node's default abrupt exit,
+    // which would otherwise orphan the detached generators (Go gets this via
+    // signal.NotifyContext).
+    await new Promise((resolve) => {
+      const done = () => resolve();
+      process.once("SIGTERM", done);
+      process.once("SIGINT", done);
+    });
   } finally {
     otaAbort.abort();
+    await panelGen.stop();
     if (mdnsPub) await mdnsPub.close();
   }
   return 0;
@@ -185,11 +199,16 @@ async function runMCP(cfg, logs, logger) {
     // Pull-OTA poller, scoped to leadership: it shares the leader's abort
     // signal, so losing the bind tears it down alongside mDNS/the tailer.
     ota.run(cfg, registry, abortCtrl.signal, logger);
+    // Custom-panel generators, scoped to leadership: torn down (SIGTERM →
+    // SIGKILL) when this peer loses the bound port.
+    const panelGen = new PanelGenerator(cfg, registry, logger);
+    panelGen.start(abortCtrl.signal);
     try {
       await new Promise((resolve) => {
         abortCtrl.signal.addEventListener("abort", resolve, { once: true });
       });
     } finally {
+      await panelGen.stop();
       if (mdnsPub) await mdnsPub.close();
       if (tailer) { tailer.stop(); tailer = null; }
     }

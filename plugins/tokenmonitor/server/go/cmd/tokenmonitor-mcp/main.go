@@ -50,6 +50,7 @@ import (
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/mcp"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/mdns"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/ota"
+	"github.com/fractal-manifold/tokenmonitor-mcp/internal/panelgen"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/registry"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/serial"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/spend"
@@ -161,6 +162,10 @@ func runDaemon(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int 
 	reg := openRegistry(logger)
 	mdnsPub := startMDNS(ctx, cfg, reg, logger)
 	defer mdnsPub.Close()
+	// Custom-panel generators: leader-scoped (daemon mode is always the
+	// leader). No-op when [panel.command] is unconfigured.
+	stopPanel := startPanelGenerators(ctx, cfg, reg, logger)
+	defer stopPanel()
 	// Pull-OTA poller: leader-only by construction (daemon mode is always
 	// the leader). Self-exits immediately when [ota] is not configured.
 	go ota.Run(ctx, cfg, reg, logger)
@@ -270,6 +275,20 @@ func startFirmwareTailer(ctx context.Context, cfg *config.Config, logger *log.Lo
 	return buf, broker.NewFirmwareLogs(buf, tailer.Connected), cancel
 }
 
+// startPanelGenerators launches the leader-scoped custom-panel generator
+// supervisor (a no-op when [panel.command] is unconfigured). The returned
+// stop func blocks until every child process has exited. Mirrors
+// startFirmwareTailer so main() can wire it into both the --daemon path and
+// the leader callback. reg may be nil; we hand panelgen a genuinely nil
+// interface in that case (never a typed-nil *registry.Registry).
+func startPanelGenerators(ctx context.Context, cfg *config.Config, reg *registry.Registry, logger *log.Logger) func() {
+	var dl panelgen.DeviceLister
+	if reg != nil {
+		dl = reg
+	}
+	return panelgen.Start(ctx, cfg, dl, logger)
+}
+
 // runMCP launches the broker (under leader-election) and the MCP stdio
 // server in parallel. Either returning is treated as a normal shutdown
 // signal for the whole process — Claude Code expects an MCP server to
@@ -322,6 +341,11 @@ func runMCP(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int {
 			// answering "I'm the broker" on the LAN.
 			mdnsPub := startMDNS(c, cfg, reg, logger)
 			defer mdnsPub.Close()
+			// Custom-panel generators, scoped to the leader's lifecycle
+			// so exactly one process spawns them; torn down (SIGTERM →
+			// SIGKILL) when this peer loses the bound port (ctx c).
+			stopPanel := startPanelGenerators(c, cfg, reg, logger)
+			defer stopPanel()
 			// Pull-OTA poller, scoped to the leader's lifecycle so only the
 			// process that owns the port stages updates. Dies when this peer
 			// loses leadership (ctx c is cancelled).

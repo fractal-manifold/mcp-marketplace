@@ -77,10 +77,17 @@ function defaults() {
     },
     // Optional custom-panel screen source. The user's own program writes a
     // self-describing JSON document (charts / tables) that the broker serves
-    // verbatim from GET /device/<id>/panel. Both empty ⇒ feature off (404).
-    // file: single global doc; dir: per-device (<dir>/<id>.json wins, then
-    // <dir>/default.json, then file).
-    panel: { file: "", dir: "" },
+    // verbatim from GET /device/<id>/panel. Everything empty ⇒ feature off (404).
+    // file: which document to serve — either a bare string (shorthand for the
+    //   "default" entry) or a [panel.file] table keyed by device id with a
+    //   "default" fallback (TOML yields a string or an object).
+    // dir: per-device dir (<dir>/<id>.json wins, then <dir>/default.json);
+    //   slots between the explicit file entry and file "default".
+    // command: optional per-device generator the broker launches itself
+    //   (leader-scoped — see panelGenerator.js). A [panel.command] table keyed
+    //   by device id with a "default" fallback; each value is an argv array
+    //   run without a shell.
+    panel: { file: "", dir: "", command: {} },
     security: { max_timestamp_skew_seconds: 60, nonce_cache_ttl_seconds: 300 },
     logging: { level: "INFO" },
     serial: { device: "", baud: 115200, lines: 2000 },
@@ -182,8 +189,42 @@ export function load(path) {
   cfg.codexSessionsPathAbs = () => expandUser(cfg.spend.codex_sessions_path);
   cfg.antigravityConvPathAbs = () => expandUser(cfg.spend.antigravity_conversations_path);
   cfg.pricingCachePathAbs = () => expandUser(cfg.pricing.cache_path);
-  cfg.panelFileAbs = () => (cfg.panel.file ? expandUser(cfg.panel.file) : "");
+  // Normalise panel.file (string shorthand or table) to an id -> path map.
+  cfg.panelFileMap = () => {
+    const f = cfg.panel.file;
+    if (f && typeof f === "object") return f;
+    if (typeof f === "string" && f) return { default: f };
+    return {};
+  };
+  // Explicit per-device document (no "default" fallback), expanded. "" when
+  // the device has no explicit entry.
+  cfg.panelFileExplicitAbs = (deviceID) => {
+    if (!deviceID) return "";
+    const v = cfg.panelFileMap()[deviceID];
+    return v ? expandUser(v) : "";
+  };
+  // The [panel.file] "default" entry (or the legacy bare file), expanded.
+  cfg.panelFileDefaultAbs = () => {
+    const v = cfg.panelFileMap().default;
+    return v ? expandUser(v) : "";
+  };
   cfg.panelDirAbs = () => (cfg.panel.dir ? expandUser(cfg.panel.dir) : "");
+  // Generator commands keyed by device id (plus a possible "default"), every
+  // argv element tilde-expanded (no shell). {} when no [panel.command] set —
+  // panelGenerator treats that as "feature off".
+  cfg.panelCommandMap = () => {
+    const cmds = cfg.panel.command || {};
+    const out = {};
+    for (const [k, argv] of Object.entries(cmds)) {
+      // Only a non-empty array of strings is a valid argv. Skip anything else
+      // (a bare string, an array with non-string elements). Go rejects it at
+      // TOML parse time; Python skips it too.
+      if (!Array.isArray(argv) || argv.length === 0) continue;
+      if (!argv.every((a) => typeof a === "string")) continue;
+      out[k] = argv.map((a) => (a.startsWith("~/") ? expandUser(a) : a));
+    }
+    return out;
+  };
   cfg.antigravityModels = () => {
     const src = (cfg.antigravity.models && cfg.antigravity.models.length > 0)
       ? cfg.antigravity.models

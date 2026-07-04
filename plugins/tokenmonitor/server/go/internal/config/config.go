@@ -171,16 +171,64 @@ type Pricing struct {
 
 // Panel feeds the device's optional custom-panel screen. The user's own
 // program writes a self-describing JSON document (charts / tables) that the
-// broker serves verbatim from GET /device/<id>/panel. Both fields empty =
+// broker serves verbatim from GET /device/<id>/panel. Everything empty =
 // feature off (endpoint answers 404).
 //
-//   - File: a single global document served to every device.
+//   - File: which document to serve, per device. Accepts either a bare
+//     string (shorthand for the "default" entry, i.e. one global document)
+//     or a [panel.file] sub-table keyed by device id with a "default"
+//     fallback. See PanelPaths.
 //   - Dir:  a directory of per-device documents; <dir>/<id>.json wins, then
-//     <dir>/default.json, then File.
+//     <dir>/default.json. Slots between the explicit per-device File entry
+//     and the File "default" — see broker.resolvePanelPath.
+//   - Command: optional per-device generator the broker itself launches
+//     (leader-scoped — see internal/panelgen). Keyed by device id with a
+//     "default" fallback; each value is an argv array run without a shell.
 type Panel struct {
-	File string `toml:"file"`
-	Dir  string `toml:"dir"`
+	File    PanelPaths    `toml:"file"`
+	Dir     string        `toml:"dir"`
+	Command PanelCommands `toml:"command"`
 }
+
+// PanelPaths maps a device id to the panel document path to serve it, with a
+// "default" key as the fallback for any device without its own entry. It
+// implements toml.Unmarshaler so `file` accepts either form:
+//
+//	file = "~/panel.json"                 # => {"default": "~/panel.json"}
+//	[panel.file]                          # per-device table
+//	default     = "~/panels/default.json"
+//	"tmon-ab12" = "~/panels/ab12.json"
+type PanelPaths map[string]string
+
+// UnmarshalTOML accepts a bare string (stored under "default") or a table of
+// id -> path. Any other shape is a config error.
+func (p *PanelPaths) UnmarshalTOML(v interface{}) error {
+	out := PanelPaths{}
+	switch t := v.(type) {
+	case string:
+		if t != "" {
+			out["default"] = t
+		}
+	case map[string]interface{}:
+		for k, raw := range t {
+			s, ok := raw.(string)
+			if !ok {
+				return fmt.Errorf("panel.file[%q]: expected string, got %T", k, raw)
+			}
+			out[k] = s
+		}
+	default:
+		return fmt.Errorf("panel.file: expected string or table, got %T", v)
+	}
+	*p = out
+	return nil
+}
+
+// PanelCommands maps a device id to the argv of a generator process, with a
+// "default" fallback. Always a [panel.command] sub-table of arrays; the argv
+// is executed directly (no shell), so argv[0] is the program and the rest are
+// its arguments.
+type PanelCommands map[string][]string
 
 type Security struct {
 	MaxTimestampSkewSeconds int `toml:"max_timestamp_skew_seconds"`
@@ -284,10 +332,49 @@ func (c *Config) CodexSessionsPath() string    { return expandUser(c.Spend.Codex
 func (c *Config) AntigravityConvPath() string { return expandUser(c.Spend.AntigravityConvPath) }
 func (c *Config) PricingCachePath() string    { return expandUser(c.Pricing.CachePath) }
 
-// PanelFile / PanelDir expand the [panel] paths; the broker resolves the
-// effective per-device file from these (see broker.resolvePanelPath).
-func (c *Config) PanelFile() string { return expandUser(c.Panel.File) }
-func (c *Config) PanelDir() string  { return expandUser(c.Panel.Dir) }
+// PanelFileExplicit returns the document path configured specifically for
+// deviceID under [panel.file] (no "default" fallback), expanded. Empty when
+// the device has no explicit entry.
+func (c *Config) PanelFileExplicit(deviceID string) string {
+	if deviceID == "" {
+		return ""
+	}
+	if p, ok := c.Panel.File[deviceID]; ok {
+		return expandUser(p)
+	}
+	return ""
+}
+
+// PanelFileDefault returns the [panel.file] "default" entry (or the legacy
+// bare `file = "..."`, which decodes to the same key), expanded.
+func (c *Config) PanelFileDefault() string { return expandUser(c.Panel.File["default"]) }
+
+// PanelDir expands the [panel] dir. The broker resolves the effective
+// per-device file from these (see broker.resolvePanelPath).
+func (c *Config) PanelDir() string { return expandUser(c.Panel.Dir) }
+
+// PanelCommandMap returns the configured generator commands keyed by device
+// id (plus the possible "default" key). Every argv element is tilde-expanded
+// (there is no shell to do it), so `~/bin/gen.py` resolves whether it is the
+// program or a script argument. Empty when no [panel.command] is configured —
+// the panelgen manager treats that as "feature off" and launches nothing.
+func (c *Config) PanelCommandMap() map[string][]string {
+	if len(c.Panel.Command) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(c.Panel.Command))
+	for k, argv := range c.Panel.Command {
+		if len(argv) == 0 {
+			continue
+		}
+		cp := make([]string, len(argv))
+		for i, a := range argv {
+			cp[i] = expandUser(a)
+		}
+		out[k] = cp
+	}
+	return out
+}
 
 func expandUser(p string) string {
 	if strings.HasPrefix(p, "~/") {
@@ -494,7 +581,7 @@ cache_ttl_seconds = 30
 # Optional custom-panel screen. Your OWN program writes a self-describing
 # JSON document (charts / tables) and the broker serves it verbatim from
 # GET /device/<id>/panel; the device draws it on an extra screen reached by
-# swiping up. Leave both empty (default) to keep the feature off — the
+# swiping up. Leave it empty (default) to keep the feature off — the
 # endpoint then answers 404, exactly like an older broker.
 #
 # Single global document served to every device:
@@ -503,6 +590,20 @@ cache_ttl_seconds = 30
 # Or a directory of per-device documents (<dir>/<id>.json wins, then
 # <dir>/default.json, then the global file):
 # dir = "~/.config/tokenmonitor/panels"
+#
+# Or spell out the document per device explicitly (falls back to "default"):
+# [panel.file]
+# default     = "~/.config/tokenmonitor/panels/default.json"
+# "tmon-ab12" = "~/.config/tokenmonitor/panels/ab12.json"
+#
+# OPTIONAL: let the broker run your generator instead of running it yourself.
+# Each command is an argv array (no shell) launched ONLY by the leader broker
+# and torn down when it loses the port, so exactly one copy runs. The child
+# gets TMON_DEVICE_ID and TMON_PANEL_PATH in its environment. Keyed by device
+# id with a "default" fallback; omit entirely to keep running it yourself.
+# [panel.command]
+# default     = ["python3", "~/bin/gen_panel.py"]
+# "tmon-ab12" = ["python3", "~/bin/gen_special.py"]
 #
 # Document format + limits (tiles<=4, points<=64, body<=8KB) live in
 # docs/custom-panel.md and compat/PANEL_WIRE.md.

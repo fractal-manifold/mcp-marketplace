@@ -123,14 +123,22 @@ class Pricing:
 class Panel:
     """Optional custom-panel screen source. The user's own program writes a
     self-describing JSON document (charts / tables) that the broker serves
-    verbatim from GET /device/<id>/panel. Both empty ⇒ feature off (404).
+    verbatim from GET /device/<id>/panel. Everything empty ⇒ feature off (404).
 
-    file: a single global document served to every device.
+    file: which document to serve, per device. Either a bare string (shorthand
+          for the "default" entry) or a [panel.file] table keyed by device id
+          with a "default" fallback — tomllib yields str or dict respectively.
     dir:  a directory of per-device docs (<dir>/<id>.json wins, then
-          <dir>/default.json, then file)."""
+          <dir>/default.json); slots between the explicit file entry and the
+          file "default".
+    command: optional per-device generator the broker launches itself
+          (leader-scoped — see panel_generator). A [panel.command] table keyed
+          by device id with a "default" fallback; each value is an argv list
+          run without a shell."""
 
-    file: str = ""
+    file: str | dict = ""
     dir: str = ""
+    command: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -247,11 +255,46 @@ class Config:
     def pricing_cache_path_abs(self) -> str:
         return str(Path(self.pricing.cache_path).expanduser())
 
-    def panel_file_abs(self) -> str:
-        return str(Path(self.panel.file).expanduser()) if self.panel.file else ""
+    def _panel_file_map(self) -> dict[str, str]:
+        """Normalise panel.file (str shorthand or table) to an id -> path map."""
+        f = self.panel.file
+        if isinstance(f, dict):
+            return f
+        if isinstance(f, str) and f:
+            return {"default": f}
+        return {}
+
+    def panel_file_explicit_abs(self, device_id: str) -> str:
+        """The document path configured specifically for device_id (no
+        "default" fallback), expanded. "" when it has no explicit entry."""
+        if not device_id:
+            return ""
+        v = self._panel_file_map().get(device_id)
+        return str(Path(v).expanduser()) if v else ""
+
+    def panel_file_default_abs(self) -> str:
+        """The [panel.file] "default" entry (or the legacy bare file), expanded."""
+        v = self._panel_file_map().get("default")
+        return str(Path(v).expanduser()) if v else ""
 
     def panel_dir_abs(self) -> str:
         return str(Path(self.panel.dir).expanduser()) if self.panel.dir else ""
+
+    def panel_command_map(self) -> dict[str, list[str]]:
+        """Generator commands keyed by device id (plus a possible "default"),
+        with every argv element tilde-expanded (there is no shell). Empty when
+        no [panel.command] is configured — panel_generator treats that as
+        "feature off"."""
+        cmds = self.panel.command or {}
+        out: dict[str, list[str]] = {}
+        for key, argv in cmds.items():
+            # Only a non-empty list of strings is a valid argv. Skip anything
+            # else (e.g. a bare string, which would otherwise iterate into
+            # individual characters). Go rejects it at TOML parse time.
+            if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+                continue
+            out[key] = [_expand_argv_elem(a) for a in argv]
+        return out
 
     def antigravity_models(self) -> list[str]:
         """Return the configured model list, clamped to MAX_ANTIGRAVITY_MODELS.
@@ -260,6 +303,12 @@ class Config:
         always sees at least Flash + Pro."""
         src = self.antigravity.models or DEFAULT_ANTIGRAVITY_MODELS
         return list(src[:MAX_ANTIGRAVITY_MODELS])
+
+
+def _expand_argv_elem(a: str) -> str:
+    """Expand a leading ~/ in an argv element, matching Go's expandUser (only
+    the ~/ prefix, not bare ~user)."""
+    return str(Path(a).expanduser()) if a.startswith("~/") else a
 
 
 def _section(raw: dict, name: str, target: object) -> None:

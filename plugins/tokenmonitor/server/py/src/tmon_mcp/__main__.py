@@ -6,9 +6,11 @@ import argparse
 import asyncio
 import json
 import logging
+import signal
 import socket
 import sys
 import time
+from contextlib import suppress
 
 from aiohttp import web
 
@@ -23,6 +25,7 @@ from .leader import try_bind, run as leader_run
 from .logbuf import Buffer, LogbufHandler
 from .mcp.server import Deps as McpDeps, serve as mcp_serve
 from .mdns import Publisher as MdnsPublisher
+from .panel_generator import PanelGenerator
 from .registry.store import Registry
 from .serial_tailer import Tailer
 from .state import Role, State
@@ -126,15 +129,29 @@ async def _run_daemon(cfg, logs: Buffer, logger: logging.Logger) -> int:
     # leader by construction in daemon mode (it owns the bound socket).
     ota_stop = asyncio.Event()
     ota_task = asyncio.create_task(ota.run(cfg, registry, ota_stop))
+    # Custom-panel generators: leader-scoped (daemon is always the leader).
+    # No-op when [panel.command] is unconfigured.
+    panel_gen = PanelGenerator(cfg, registry, logger)
+    panel_gen.start()
     # Broker self-version check: best-effort poll of the marketplace catalog so
     # /sync (and tokenmonitor_health/status) can advertise "broker outdated".
     update_task = asyncio.create_task(updatecheck.run(state, logger, stop=ota_stop))
+    # SIGTERM/SIGINT → graceful shutdown so the finally runs and children are
+    # reaped. Without this, the default SIGTERM disposition kills the process
+    # abruptly and leaves the start_new_session generators orphaned (Go gets
+    # this via signal.NotifyContext).
+    shutdown = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with suppress(NotImplementedError):
+            loop.add_signal_handler(sig, shutdown.set)
     try:
-        await asyncio.Event().wait()
+        await shutdown.wait()
     finally:
         ota_stop.set()
         await ota_task
         await update_task
+        await panel_gen.stop()
         if mdns_pub is not None:
             await mdns_pub.close()
         if tailer:
@@ -176,10 +193,15 @@ async def _run_mcp(cfg, logs: Buffer, logger: logging.Logger) -> int:
         # Pull-OTA poller, scoped to leadership: it shares the same `stop`
         # event, so losing the bind tears it down alongside mDNS/the tailer.
         ota_task = asyncio.create_task(ota.run(cfg, registry, stop))
+        # Custom-panel generators, scoped to leadership: torn down (SIGTERM →
+        # SIGKILL) when this peer loses the bound port.
+        panel_gen = PanelGenerator(cfg, registry, logger)
+        panel_gen.start()
         try:
             await stop.wait()
         finally:
             await ota_task
+            await panel_gen.stop()
             if mdns_pub is not None:
                 await mdns_pub.close()
             if tailer:

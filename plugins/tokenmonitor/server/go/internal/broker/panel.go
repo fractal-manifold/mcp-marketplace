@@ -46,12 +46,17 @@ var (
 )
 
 // resolvePanelPath picks the file to serve for deviceID. Resolution order,
-// most specific first: <dir>/<id>.json, then <dir>/default.json, then the
-// global [panel] file. Returns "" when the feature is not configured.
+// most specific first: the explicit [panel.file].<id> entry, then
+// <dir>/<id>.json, then <dir>/default.json, then the [panel.file].default
+// entry (a.k.a. the legacy bare `file`). Returns "" when the feature is not
+// configured.
 //
 // deviceID has already passed registry.ValidDeviceID (strict charset, no
 // slashes) before this is called, so <id>.json is traversal-safe.
 func resolvePanelPath(cfg *config.Config, deviceID string) string {
+	if p := cfg.PanelFileExplicit(deviceID); p != "" {
+		return p
+	}
 	if dir := cfg.PanelDir(); dir != "" {
 		if deviceID != "" {
 			p := filepath.Join(dir, deviceID+".json")
@@ -64,7 +69,7 @@ func resolvePanelPath(cfg *config.Config, deviceID string) string {
 			return p
 		}
 	}
-	if f := cfg.PanelFile(); f != "" {
+	if f := cfg.PanelFileDefault(); f != "" {
 		return f
 	}
 	return ""
