@@ -93,12 +93,37 @@ type devIDLister interface {
 }
 
 // Publisher owns the zeroconf server and a goroutine that re-announces
-// the TXT record whenever the device list changes. Construct via Start;
-// stop with Close (or by cancelling the context passed to Start).
+// the TXT record whenever the device list changes and re-registers the
+// whole service whenever the interface addresses change (DHCP renew,
+// network switch) — zeroconf snapshots the A/AAAA records *and* binds
+// its multicast sockets at Register time, so both go stale otherwise.
+// Construct via Start; stop with Close (or by cancelling the context
+// passed to Start).
 type Publisher struct {
-	server *zeroconf.Server
-	mu     sync.Mutex
-	lastTxt string
+	server   *zeroconf.Server
+	mu       sync.Mutex
+	lastTxt  string
+	lastIfp  string // fingerprint of the advertised interface addresses
+	instance string
+	port     int
+	closed   bool
+}
+
+// ifaceFingerprint condenses the advertised interfaces + their addresses
+// into a comparable string so refreshLoop can detect address churn.
+func ifaceFingerprint(ifaces []net.Interface) string {
+	var parts []string
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			parts = append(parts, iface.Name+"/"+a.String())
+		}
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ";")
 }
 
 // hostShort derives a 6-hex tag from the OS hostname so two laptops on
@@ -195,7 +220,13 @@ func Start(ctx context.Context, bind string, port int, lister devIDLister, logge
 			instance, ServiceType, port, len(devs), names)
 	}
 
-	p := &Publisher{server: srv, lastTxt: strings.Join(txt, ";")}
+	p := &Publisher{
+		server:   srv,
+		lastTxt:  strings.Join(txt, ";"),
+		lastIfp:  ifaceFingerprint(ifaces),
+		instance: instance,
+		port:     port,
+	}
 
 	go p.refreshLoop(ctx, lister, logger)
 	return p, nil
@@ -223,12 +254,63 @@ func (p *Publisher) refreshLoop(ctx context.Context, lister devIDLister, logger 
 		}
 		txt := buildTXT(devs)
 		joined := strings.Join(txt, ";")
+
+		// Interface addresses changed (DHCP renew, network switch): the
+		// registered A records and the multicast sockets are both stale —
+		// re-register from scratch. This is what lets a device rediscover
+		// the broker after the host moves LANs. A nil server (previous
+		// re-register failed, or initial addrs vanished) retries here too.
+		ifaces := physicalMulticastIfaces()
+		ifp := ifaceFingerprint(ifaces)
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return
+		}
+		srv := p.server
+		needRepub := ifp != p.lastIfp || srv == nil
+		p.mu.Unlock()
+
+		if needRepub {
+			if srv != nil {
+				srv.Shutdown()
+			}
+			newSrv, err := zeroconf.Register(p.instance, ServiceType, "local.", p.port, txt, ifaces)
+			p.mu.Lock()
+			if p.closed {
+				p.mu.Unlock()
+				if newSrv != nil {
+					newSrv.Shutdown()
+				}
+				return
+			}
+			if err != nil {
+				// server == nil keeps needRepub true next tick.
+				p.server = nil
+				p.lastIfp = ifp
+				p.mu.Unlock()
+				if logger != nil {
+					logger.Printf("mdns: republish: %v", err)
+				}
+				continue
+			}
+			p.server = newSrv
+			p.lastIfp = ifp
+			p.lastTxt = joined
+			p.mu.Unlock()
+			if logger != nil {
+				logger.Printf("mdns: addresses changed, republished %s.%s.local. port=%d devs=%d",
+					p.instance, ServiceType, p.port, len(devs))
+			}
+			continue
+		}
+
 		p.mu.Lock()
 		changed := joined != p.lastTxt
 		if changed {
 			p.lastTxt = joined
 		}
-		srv := p.server
+		srv = p.server
 		p.mu.Unlock()
 		if changed && srv != nil {
 			srv.SetText(txt)
@@ -245,6 +327,7 @@ func (p *Publisher) Close() {
 	p.mu.Lock()
 	srv := p.server
 	p.server = nil
+	p.closed = true
 	p.mu.Unlock()
 	if srv != nil {
 		srv.Shutdown()

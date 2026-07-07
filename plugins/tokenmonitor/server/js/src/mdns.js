@@ -76,6 +76,16 @@ function txtEqual(a, b) {
   return a.v === b.v && a.runtime === b.runtime && a.devs === b.devs;
 }
 
+// A records to advertise. When bind is 0.0.0.0/empty, pin to the
+// LAN-reachable physical IPv4s so we don't advertise Docker bridges and
+// VPN tunnels that the device can't route to. A literal bind never
+// changes at runtime; the wildcard set is re-read on every refresh tick.
+function advertisedIps(bind) {
+  return (!bind || bind === "0.0.0.0" || bind === "::")
+    ? physicalIPv4s()
+    : [bind];
+}
+
 /**
  * Publisher owns the Bonjour service and the refresh interval. Construct
  * via `start(...)`; release with `close()`. Both are idempotent.
@@ -86,6 +96,43 @@ export class Publisher {
     this._service = null;
     this._timer = null;
     this._lastTxt = null;
+    this._lastIps = null;   // joined advertised-IP list; null = nothing published
+    this._instance = null;
+    this._port = 0;
+  }
+
+  // Create a fresh Bonjour instance (multicast sockets bind to the
+  // current interfaces here — reusing one across a network change would
+  // keep stale group memberships) and publish. Records _lastTxt/_lastIps
+  // only on success; throws on failure with everything torn back down.
+  _openAndPublish(ips, txt) {
+    this._bonjour = new Bonjour();
+    try {
+      const opts = { name: this._instance, type: SERVICE_TYPE, port: this._port, txt };
+      if (ips.length > 0) opts.host = ips[0];
+      this._service = this._bonjour.publish(opts);
+    } catch (e) {
+      try { this._bonjour.destroy(); } catch {}
+      this._bonjour = null;
+      this._service = null;
+      throw e;
+    }
+    this._lastTxt = txt;
+    this._lastIps = ips.join(",");
+  }
+
+  async _teardown() {
+    if (this._service && typeof this._service.stop === "function") {
+      await new Promise((resolve) => {
+        try { this._service.stop(() => resolve()); }
+        catch { resolve(); }
+      });
+    }
+    this._service = null;
+    if (this._bonjour) {
+      try { this._bonjour.destroy(); } catch {}
+      this._bonjour = null;
+    }
   }
 
   static async start(bind, port, lister, logger) {
@@ -103,31 +150,38 @@ export class Publisher {
     catch (e) { logger?.warn?.(`mdns: initial device list: ${e.message}`); devs = []; }
     const txt = buildTxt(devs);
 
-    const instance = `tmon-broker-${hostShort()}`;
-    // When bind is 0.0.0.0/empty, pin the A records to the LAN-reachable
-    // physical IPv4s so we don't advertise Docker bridges and VPN
-    // tunnels that the device can't route to.
-    const explicit = (!bind || bind === "0.0.0.0" || bind === "::")
-      ? physicalIPv4s()
-      : [bind];
-    pub._bonjour = new Bonjour();
-    try {
-      const opts = { name: instance, type: SERVICE_TYPE, port, txt };
-      if (explicit.length > 0) opts.host = explicit[0];
-      pub._service = pub._bonjour.publish(opts);
-    } catch (e) {
-      try { pub._bonjour.destroy(); } catch {}
-      pub._bonjour = null;
-      throw e;
-    }
-    pub._lastTxt = txt;
-    logger?.info?.(`mdns: published ${instance}._${SERVICE_TYPE}._tcp.local. port=${port} devs=${devs.length} ips=${explicit.join(",")}`);
+    pub._instance = `tmon-broker-${hostShort()}`;
+    pub._port = port;
+    const explicit = advertisedIps(bind);
+    pub._openAndPublish(explicit, txt);
+    logger?.info?.(`mdns: published ${pub._instance}._${SERVICE_TYPE}._tcp.local. port=${port} devs=${devs.length} ips=${explicit.join(",")}`);
 
-    pub._timer = setInterval(() => {
+    pub._timer = setInterval(async () => {
       let cur = [];
       try { cur = lister.listDeviceIds(); }
       catch (e) { logger?.warn?.(`mdns: refresh device list: ${e.message}`); return; }
       const next = buildTxt(cur);
+
+      // Interface addresses changed (DHCP renew, network switch): the
+      // pinned A record and the multicast sockets are both stale — tear
+      // the whole advertisement down and republish fresh. This is what
+      // lets a device rediscover the broker after the host moves LANs.
+      const ips = advertisedIps(bind);
+      if (ips.join(",") !== pub._lastIps) {
+        logger?.info?.(`mdns: addresses changed (${pub._lastIps || "none"} -> ${ips.join(",") || "none"}), republishing`);
+        await pub._teardown();
+        try {
+          pub._openAndPublish(ips, next);
+          logger?.info?.(`mdns: republished, ips=${ips.join(",")}`);
+        } catch (e) {
+          // Leave _lastIps null so the next tick retries the republish.
+          pub._lastIps = null;
+          pub._lastTxt = null;
+          logger?.warn?.(`mdns: republish: ${e.message}`);
+        }
+        return;
+      }
+
       if (txtEqual(next, pub._lastTxt)) return;
       pub._lastTxt = next;
       try {
@@ -138,7 +192,7 @@ export class Publisher {
           pub._service.updateTxt(next);
         } else if (pub._service && typeof pub._service.stop === "function") {
           pub._service.stop(() => {
-            pub._service = pub._bonjour.publish({ name: instance, type: SERVICE_TYPE, port, txt: next });
+            pub._service = pub._bonjour.publish({ name: pub._instance, type: SERVICE_TYPE, port, txt: next });
           });
         }
         logger?.info?.(`mdns: TXT updated, devs=${cur.length}`);
@@ -155,19 +209,9 @@ export class Publisher {
       clearInterval(this._timer);
       this._timer = null;
     }
-    if (this._service && typeof this._service.stop === "function") {
-      await new Promise((resolve) => {
-        try { this._service.stop(() => resolve()); }
-        catch { resolve(); }
-      });
-    }
-    this._service = null;
-    if (this._bonjour) {
-      try { this._bonjour.destroy(); } catch {}
-      this._bonjour = null;
-    }
+    await this._teardown();
   }
 }
 
 // Exported for tests.
-export const _internal = { buildTxt, isLoopback, hostShort, txtEqual };
+export const _internal = { buildTxt, isLoopback, hostShort, txtEqual, advertisedIps };
