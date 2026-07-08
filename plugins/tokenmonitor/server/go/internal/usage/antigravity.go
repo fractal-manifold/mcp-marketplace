@@ -293,16 +293,26 @@ type geminiLoadCodeAssistDoc struct {
 }
 
 // geminiQuotaDoc mirrors the real v1internal:retrieveUserQuotaSummary
-// response, captured live from agy 1.0.13 (2026-06-30):
+// response. First captured live from agy 1.0.13 (2026-06-30) with the Gemini
+// group EXHAUSTED; re-captured 2026-07-08 after the weekly reset with BOTH
+// groups full — that full-quota shape (and the extra fields below) is what
+// this struct is validated against:
 //
 //	{"groups":[
-//	  {"displayName":"Gemini Models","buckets":[
-//	     {"bucketId":"gemini-weekly","window":"weekly","resetTime":"…","remainingFraction":0}]},
-//	  {"displayName":"Claude and GPT models","buckets":[
-//	     {"bucketId":"3p-weekly","window":"weekly","resetTime":"…","remainingFraction":0.906058}]}]}
+//	  {"displayName":"Gemini Models","description":"Models within this group: …",
+//	   "buckets":[{"bucketId":"gemini-weekly","displayName":"Weekly Limit",
+//	     "window":"weekly","resetTime":"2026-07-15T13:56:28Z","remainingFraction":1}]},
+//	  {"displayName":"Claude and GPT models","description":"…",
+//	   "buckets":[{"bucketId":"3p-weekly","displayName":"Weekly Limit",
+//	     "window":"weekly","resetTime":"2026-07-15T13:56:28Z","remainingFraction":1}]}],
+//	 "description":"Within each group, models share a weekly limit. …"}
 //
 // Top-level `groups[]` (NOT quotaSummaryGroups). remainingFraction is
-// REMAINING (0 = exhausted; pct_used = (1-remainingFraction)*100).
+// REMAINING (0 = exhausted → 100% used; 1 = full → 0% used;
+// pct_used = (1-remainingFraction)*100). The bucket-level `displayName`
+// ("Weekly Limit") and the group / doc-level `description` fields appeared in
+// the 2026-07-08 capture; they carry no data we render, so they are parsed
+// (Description) or ignored and never affect the wire.
 type geminiQuotaDoc struct {
 	Groups []geminiQuotaGroup `json:"groups"`
 }
@@ -315,6 +325,7 @@ type geminiQuotaGroup struct {
 
 type geminiBucket struct {
 	BucketID          string  `json:"bucketId"`
+	DisplayName       string  `json:"displayName"`
 	Window            string  `json:"window"`
 	ResetTime         string  `json:"resetTime"`
 	RemainingFraction float64 `json:"remainingFraction"`
@@ -323,8 +334,9 @@ type geminiBucket struct {
 // antigravityApplyQuota maps the real retrieveUserQuotaSummary response onto
 // the device snapshot. Each group becomes one weekly slot; the "Gemini Models"
 // group drives the headline weekly bar (maintainer's choice), falling back to
-// the first group if no Gemini group is present. Verified against a live
-// capture (agy 1.0.13, 2026-06-30). Mirror of the JS broker's
+// the first group if no Gemini group is present. Verified against live captures
+// (agy 1.0.13): exhausted 2026-06-30, full quota (remainingFraction=1 → 0%
+// used, both groups) 2026-07-08. Mirror of the JS broker's
 // antigravityApplyQuota().
 func antigravityApplyQuota(snap *Snapshot, q *geminiQuotaDoc, now time.Time) {
 	if q == nil {

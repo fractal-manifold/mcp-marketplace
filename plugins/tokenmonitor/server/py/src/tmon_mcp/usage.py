@@ -581,11 +581,13 @@ def _gemini_reset_eta(iso: str, now_unix: float) -> int:
 
 def _antigravity_apply_quota(snap: Snapshot, quota: dict, now_unix: float) -> None:
     """Map the real retrieveUserQuotaSummary response —
-    {groups:[{displayName,description,buckets:[{window,resetTime,remainingFraction}]}]}
+    {groups:[{displayName,description,buckets:[{bucketId,displayName,window,resetTime,remainingFraction}]}]}
     — onto the device snapshot. Each group becomes one weekly slot; the
     "Gemini Models" group drives the headline weekly bar (maintainer's choice),
     falling back to the first group if no Gemini group is present. Verified
-    against a live capture (agy 1.0.13, 2026-06-30)."""
+    against live captures (agy 1.0.13): exhausted 2026-06-30, full quota
+    (remainingFraction=1 -> 0% used, both groups) 2026-07-08. The extra
+    bucket/group displayName + description fields are ignored."""
     groups = quota.get("groups") if isinstance(quota, dict) else None
     if not isinstance(groups, list):
         groups = []

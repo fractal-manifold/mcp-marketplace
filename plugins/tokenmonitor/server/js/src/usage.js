@@ -470,11 +470,13 @@ function geminiResetEta(iso, nowSec) {
 }
 
 // antigravityApplyQuota maps the real retrieveUserQuotaSummary response —
-// {groups:[{displayName,description,buckets:[{window,resetTime,remainingFraction}]}]}
+// {groups:[{displayName,description,buckets:[{bucketId,displayName,window,resetTime,remainingFraction}]}]}
 // — onto the device snapshot. Each group becomes one weekly slot; the
 // "Gemini Models" group drives the headline weekly bar (maintainer's choice),
 // falling back to the first group if no Gemini group is present. Verified
-// against a live capture (agy 1.0.13, 2026-06-30).
+// against live captures (agy 1.0.13): exhausted 2026-06-30, full quota
+// (remainingFraction=1 → 0% used, both groups) 2026-07-08. The extra
+// bucket/group displayName + description fields are ignored.
 function antigravityApplyQuota(snap, quota, nowSec) {
   const groups = Array.isArray(quota?.groups) ? quota.groups : [];
   let headlineSet = false;
