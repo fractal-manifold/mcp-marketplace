@@ -301,17 +301,27 @@ class ClaudeFetcher:
         )
         five = doc.get("five_hour") or {}
         seven = doc.get("seven_day") or {}
-        ome = doc.get("seven_day_omelette")
         if isinstance(five, dict):
             snap.session_pct = float(five.get("utilization") or 0)
             snap.session_reset_eta_seconds = _seconds_until_iso(five.get("resets_at") or "", now)
         if isinstance(seven, dict):
             snap.weekly_pct = float(seven.get("utilization") or 0)
             snap.weekly_reset_eta_seconds = _seconds_until_iso(seven.get("resets_at") or "", now)
-        if isinstance(ome, dict):
+        # The "design" card is now the Fable model: a weekly, model-scoped
+        # entry in `limits` (the legacy `seven_day_omelette` codename object
+        # is retired). Keep the design_* wire keys; feed them from the Fable
+        # limit. present iff a weekly_scoped limit scoped to model "Fable".
+        for lim in doc.get("limits") or []:
+            if not isinstance(lim, dict) or lim.get("kind") != "weekly_scoped":
+                continue
+            scope = lim.get("scope") or {}
+            model = (scope.get("model") or {}) if isinstance(scope, dict) else {}
+            if not isinstance(model, dict) or model.get("display_name") != "Fable":
+                continue
             snap.design_present = True
-            snap.design_pct = float(ome.get("utilization") or 0)
-            snap.design_reset_eta_seconds = _seconds_until_iso(ome.get("resets_at") or "", now)
+            snap.design_pct = float(lim.get("percent") or 0)
+            snap.design_reset_eta_seconds = _seconds_until_iso(lim.get("resets_at") or "", now)
+            break
         extra = doc.get("extra_usage") or {}
         snap.tier = "paid" if extra.get("is_enabled") else "unknown"
         return snap

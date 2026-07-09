@@ -211,7 +211,6 @@ export class ClaudeFetcher {
     snap.weekly_window_seconds = CLAUDE_WEEKLY_WINDOW;
     const five = doc.five_hour;
     const seven = doc.seven_day;
-    const ome = doc.seven_day_omelette;
     if (five && typeof five === "object") {
       snap.session_pct = Number(five.utilization || 0);
       snap.session_reset_eta_seconds = secondsUntilISO(five.resets_at || "", now);
@@ -220,10 +219,18 @@ export class ClaudeFetcher {
       snap.weekly_pct = Number(seven.utilization || 0);
       snap.weekly_reset_eta_seconds = secondsUntilISO(seven.resets_at || "", now);
     }
-    if (ome && typeof ome === "object") {
+    // The "design" card is now the Fable model: a weekly, model-scoped
+    // entry in `limits` (the legacy seven_day_omelette codename object is
+    // retired). Keep the design_* wire keys; feed them from the Fable
+    // limit. present iff a weekly_scoped limit scoped to model "Fable".
+    for (const lim of Array.isArray(doc.limits) ? doc.limits : []) {
+      if (!lim || typeof lim !== "object" || lim.kind !== "weekly_scoped") continue;
+      const model = (lim.scope && lim.scope.model) || {};
+      if (model.display_name !== "Fable") continue;
       snap.design_present = true;
-      snap.design_pct = Number(ome.utilization || 0);
-      snap.design_reset_eta_seconds = secondsUntilISO(ome.resets_at || "", now);
+      snap.design_pct = Number(lim.percent || 0);
+      snap.design_reset_eta_seconds = secondsUntilISO(lim.resets_at || "", now);
+      break;
     }
     const extra = doc.extra_usage || {};
     snap.tier = extra.is_enabled ? "paid" : "unknown";

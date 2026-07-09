@@ -12,15 +12,21 @@ import (
 	"time"
 )
 
-// claudeSample is the real response shape captured from
-// scripts/proto-usage-claude.py on 2026-05-25. Drift tests live in
-// live_test.go (env-gated); this one only checks that we map the
-// canonical shape into a Snapshot correctly.
+// claudeSample is the real response shape captured on 2026-07-09: the
+// third "design" card now comes from the Fable model's weekly_scoped entry
+// in `limits`, and the legacy `seven_day_omelette` codename object is null.
+// Drift tests live in live_test.go (env-gated); this one only checks that
+// we map the canonical shape into a Snapshot correctly.
 const claudeSample = `{
   "five_hour":          {"utilization": 70.0, "resets_at": "2026-05-25T02:50:00.000000+00:00"},
   "seven_day":          {"utilization": 93.0, "resets_at": "2026-05-25T08:00:00.000000+00:00"},
-  "seven_day_omelette": {"utilization": 0.0,  "resets_at": null},
+  "seven_day_omelette": null,
   "seven_day_sonnet":   {"utilization": 4.0,  "resets_at": "2026-05-25T08:00:00.000000+00:00"},
+  "limits": [
+    {"kind": "session",       "group": "session", "percent": 70, "resets_at": "2026-05-25T02:50:00.000000+00:00", "scope": null},
+    {"kind": "weekly_all",    "group": "weekly",  "percent": 93, "resets_at": "2026-05-25T08:00:00.000000+00:00", "scope": null},
+    {"kind": "weekly_scoped", "group": "weekly",  "percent": 12, "resets_at": "2026-05-25T02:50:00.000000+00:00", "scope": {"model": {"id": null, "display_name": "Fable"}}}
+  ],
   "extra_usage":        {"is_enabled": false, "monthly_limit": null}
 }`
 
@@ -77,13 +83,13 @@ func TestClaudeFetcher_HappyPath(t *testing.T) {
 		t.Errorf("weekly_pct: %v", snap.WeeklyPct)
 	}
 	if !snap.DesignPresent {
-		t.Errorf("design_present: want true")
+		t.Errorf("design_present: want true (Fable weekly_scoped limit present)")
 	}
-	if snap.DesignPct != 0 {
-		t.Errorf("design_pct: %v", snap.DesignPct)
+	if snap.DesignPct != 12 {
+		t.Errorf("design_pct: want 12 (Fable percent), got %v", snap.DesignPct)
 	}
-	if snap.DesignResetETASeconds != 0 {
-		t.Errorf("design_reset_eta: want 0 (resets_at null), got %d", snap.DesignResetETASeconds)
+	if snap.DesignResetETASeconds != 60 {
+		t.Errorf("design_reset_eta: want 60 (Fable resets_at = now+60s), got %d", snap.DesignResetETASeconds)
 	}
 	if snap.SessionResetETASeconds != 60 {
 		t.Errorf("session_reset_eta: want 60 (= 1 min), got %d", snap.SessionResetETASeconds)
@@ -93,6 +99,41 @@ func TestClaudeFetcher_HappyPath(t *testing.T) {
 	}
 	if snap.WeeklyWindowSeconds != claudeWeeklyWindow {
 		t.Errorf("weekly_window: %d", snap.WeeklyWindowSeconds)
+	}
+}
+
+// When no weekly_scoped Fable limit is present, the design card is hidden
+// (design_present=false), even if other scoped limits exist.
+func TestClaudeFetcher_NoFableLimit(t *testing.T) {
+	const body = `{
+  "five_hour":   {"utilization": 10.0, "resets_at": null},
+  "seven_day":   {"utilization": 20.0, "resets_at": null},
+  "limits": [
+    {"kind": "session",       "group": "session", "percent": 10, "resets_at": null, "scope": null},
+    {"kind": "weekly_scoped", "group": "weekly",  "percent": 5,  "resets_at": null, "scope": {"model": {"id": null, "display_name": "Opus"}}}
+  ],
+  "extra_usage": {"is_enabled": true}
+}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	now, _ := time.Parse(time.RFC3339, "2026-05-25T02:49:00Z")
+	f := &ClaudeFetcher{
+		OAuthPath: writeClaudeCreds(t, now.Add(time.Hour).UnixMilli()),
+		HTTP:      &http.Client{Transport: rewriteHost(srv.URL)},
+		Now:       func() time.Time { return now },
+	}
+	snap, err := f.Fetch(context.Background())
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if snap.DesignPresent {
+		t.Errorf("design_present: want false (no Fable limit)")
+	}
+	if snap.DesignPct != 0 {
+		t.Errorf("design_pct: want 0, got %v", snap.DesignPct)
 	}
 }
 

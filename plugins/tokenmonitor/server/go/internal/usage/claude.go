@@ -20,6 +20,10 @@ const (
 	// product constants.
 	claudeSessionWindow = 5 * 3600
 	claudeWeeklyWindow  = 7 * 86400
+	// The design_* wire fields are fed from the Fable model's weekly,
+	// model-scoped entry in the `limits` array.
+	claudeWeeklyScopedKind = "weekly_scoped"
+	claudeFableModel       = "Fable"
 )
 
 // ClaudeFetcher reads ~/.claude/.credentials.json and hits the Anthropic
@@ -96,15 +100,18 @@ func (f *ClaudeFetcher) Fetch(ctx context.Context) (Snapshot, error) {
 //
 //	GET /api/oauth/usage
 //
-// (sampled 2026-05-25 from a Max plan). Extra keys
-// `seven_day_sonnet`, `tangelo`, `iguana_necktie`,
-// `omelette_promotional`, `seven_day_cowork`, `seven_day_oauth_apps` are
-// ignored — they're either codenames or unused tiers.
+// (`limits` shape sampled 2026-07-09). The third "design" card is now the
+// Fable model — a weekly, model-scoped entry in the `limits` array. The
+// legacy `seven_day_omelette` codename object is retired (comes back null),
+// so we source the design_* wire fields from `limits` instead. Extra keys
+// `seven_day_sonnet`, `tangelo`, `iguana_necktie`, `omelette_promotional`,
+// `seven_day_cowork`, `seven_day_oauth_apps`, `spend` are ignored — they're
+// either codenames or unused tiers.
 type claudeUsageDoc struct {
-	FiveHour          *claudeWindow `json:"five_hour"`
-	SevenDay          *claudeWindow `json:"seven_day"`
-	SevenDayOmelette  *claudeWindow `json:"seven_day_omelette"`
-	ExtraUsage        *struct {
+	FiveHour   *claudeWindow `json:"five_hour"`
+	SevenDay   *claudeWindow `json:"seven_day"`
+	Limits     []claudeLimit `json:"limits"`
+	ExtraUsage *struct {
 		IsEnabled bool `json:"is_enabled"`
 	} `json:"extra_usage"`
 }
@@ -112,6 +119,19 @@ type claudeUsageDoc struct {
 type claudeWindow struct {
 	Utilization *float64 `json:"utilization"`
 	ResetsAt    *string  `json:"resets_at"`
+}
+
+// claudeLimit is one entry of the `limits` array. The Fable card is the
+// `weekly_scoped` entry whose scope.model.display_name is "Fable".
+type claudeLimit struct {
+	Kind     string  `json:"kind"`
+	Percent  float64 `json:"percent"`
+	ResetsAt *string `json:"resets_at"`
+	Scope    *struct {
+		Model *struct {
+			DisplayName string `json:"display_name"`
+		} `json:"model"`
+	} `json:"scope"`
 }
 
 func claudeMap(d claudeUsageDoc, now time.Time) Snapshot {
@@ -136,18 +156,24 @@ func claudeMap(d claudeUsageDoc, now time.Time) Snapshot {
 			snap.WeeklyResetETASeconds = secondsUntilISO(*d.SevenDay.ResetsAt, now)
 		}
 	}
-	// `seven_day_omelette` (Claude Design codename) is an object even for
-	// users without access — we report design_present iff the object
-	// exists. Utilization may be 0 with resets_at=null, which we encode
-	// as a present-but-unused card.
-	if d.SevenDayOmelette != nil {
+	// The "design" card is now the Fable model: a weekly, model-scoped
+	// limit in `limits`. We keep the design_* wire keys for firmware
+	// back-compat and report design_present iff a weekly_scoped limit
+	// scoped to model "Fable" exists. Percent may be 0 (present-but-unused
+	// card).
+	for _, lim := range d.Limits {
+		if lim.Kind != claudeWeeklyScopedKind || lim.Scope == nil || lim.Scope.Model == nil {
+			continue
+		}
+		if lim.Scope.Model.DisplayName != claudeFableModel {
+			continue
+		}
 		snap.DesignPresent = true
-		if d.SevenDayOmelette.Utilization != nil {
-			snap.DesignPct = *d.SevenDayOmelette.Utilization
+		snap.DesignPct = lim.Percent
+		if lim.ResetsAt != nil {
+			snap.DesignResetETASeconds = secondsUntilISO(*lim.ResetsAt, now)
 		}
-		if d.SevenDayOmelette.ResetsAt != nil {
-			snap.DesignResetETASeconds = secondsUntilISO(*d.SevenDayOmelette.ResetsAt, now)
-		}
+		break
 	}
 	if d.ExtraUsage != nil && d.ExtraUsage.IsEnabled {
 		snap.Tier = "paid"
