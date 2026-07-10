@@ -118,6 +118,17 @@ class Snapshot:
     slots: list[Slot] = field(default_factory=list)
 
 
+def _session_weekly_slots(s: "Snapshot") -> list[Slot]:
+    """Standard two-card slot layout (Session + Weekly) rendered with
+    broker-supplied labels — the same path Antigravity uses. Providers append
+    their own extra slots (e.g. Claude's "Fable") after these. Legacy
+    session_/weekly_/design_ fields stay populated for older firmware."""
+    return [
+        Slot("Session", s.session_pct, s.session_window_seconds, s.session_reset_eta_seconds),
+        Slot("Weekly", s.weekly_pct, s.weekly_window_seconds, s.weekly_reset_eta_seconds),
+    ]
+
+
 class Fetcher(Protocol):
     async def fetch(self, session: aiohttp.ClientSession) -> Snapshot: ...
 
@@ -324,6 +335,13 @@ class ClaudeFetcher:
             break
         extra = doc.get("extra_usage") or {}
         snap.tier = "paid" if extra.get("is_enabled") else "unknown"
+        # Unified slots layout: Session / Weekly, plus Fable when the
+        # model-scoped limit exists. Rendered via the same path Antigravity uses.
+        snap.slots = _session_weekly_slots(snap)
+        if snap.design_present:
+            snap.slots.append(
+                Slot("Fable", snap.design_pct, snap.weekly_window_seconds, snap.design_reset_eta_seconds)
+            )
         return snap
 
 
@@ -390,6 +408,8 @@ class CodexFetcher:
             if isinstance(lim, (int, float)) and lim > 0:
                 snap.weekly_window_seconds = int(lim)
             snap.weekly_reset_eta_seconds = _codex_eta(secondary)
+        # Unified slots layout (Session / Weekly); Codex has no third bucket.
+        snap.slots = _session_weekly_slots(snap)
         return snap
 
 

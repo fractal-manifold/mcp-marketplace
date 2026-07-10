@@ -178,6 +178,18 @@ func claudeMap(d claudeUsageDoc, now time.Time) Snapshot {
 	if d.ExtraUsage != nil && d.ExtraUsage.IsEnabled {
 		snap.Tier = "paid"
 	}
+	// Unified slots layout: the device renders broker-labelled cards via the
+	// same path Antigravity uses (Session / Weekly, plus Fable when the
+	// model-scoped limit exists) instead of the legacy hardcoded pill titles.
+	snap.Slots = sessionWeeklySlots(snap)
+	if snap.DesignPresent {
+		snap.Slots = append(snap.Slots, Slot{
+			Label:           claudeFableModel,
+			Pct:             snap.DesignPct,
+			WindowSeconds:   claudeWeeklyWindow,
+			ResetETASeconds: snap.DesignResetETASeconds,
+		})
+	}
 	return snap
 }
 

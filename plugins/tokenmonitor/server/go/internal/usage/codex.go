@@ -145,6 +145,9 @@ func codexMap(d codexUsageDoc) Snapshot {
 	if snap.Tier == "" {
 		snap.Tier = "unknown"
 	}
+	// Unified slots layout (Session / Weekly) so the device renders
+	// broker-labelled cards; Codex has no third bucket. See sessionWeeklySlots.
+	snap.Slots = sessionWeeklySlots(snap)
 	return snap
 }
 

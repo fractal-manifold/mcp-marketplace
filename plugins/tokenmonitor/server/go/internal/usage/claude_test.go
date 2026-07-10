@@ -91,6 +91,20 @@ func TestClaudeFetcher_HappyPath(t *testing.T) {
 	if snap.DesignResetETASeconds != 60 {
 		t.Errorf("design_reset_eta: want 60 (Fable resets_at = now+60s), got %d", snap.DesignResetETASeconds)
 	}
+	// Unified slots layout: Session, Weekly, Fable (Fable present here).
+	wantSlots := []Slot{
+		{Label: "Session", Pct: 70, WindowSeconds: claudeSessionWindow, ResetETASeconds: 60},
+		{Label: "Weekly", Pct: 93, WindowSeconds: claudeWeeklyWindow, ResetETASeconds: snap.WeeklyResetETASeconds},
+		{Label: "Fable", Pct: 12, WindowSeconds: claudeWeeklyWindow, ResetETASeconds: 60},
+	}
+	if len(snap.Slots) != len(wantSlots) {
+		t.Fatalf("slots: want %d, got %d (%+v)", len(wantSlots), len(snap.Slots), snap.Slots)
+	}
+	for i, w := range wantSlots {
+		if snap.Slots[i] != w {
+			t.Errorf("slots[%d]: want %+v, got %+v", i, w, snap.Slots[i])
+		}
+	}
 	if snap.SessionResetETASeconds != 60 {
 		t.Errorf("session_reset_eta: want 60 (= 1 min), got %d", snap.SessionResetETASeconds)
 	}
@@ -134,6 +148,10 @@ func TestClaudeFetcher_NoFableLimit(t *testing.T) {
 	}
 	if snap.DesignPct != 0 {
 		t.Errorf("design_pct: want 0, got %v", snap.DesignPct)
+	}
+	// No Fable → only Session + Weekly slots, no third card.
+	if len(snap.Slots) != 2 {
+		t.Errorf("slots: want 2 (Session, Weekly), got %d (%+v)", len(snap.Slots), snap.Slots)
 	}
 }
 

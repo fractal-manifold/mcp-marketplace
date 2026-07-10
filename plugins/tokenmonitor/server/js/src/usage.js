@@ -57,6 +57,18 @@ function emptySnapshot() {
   };
 }
 
+// sessionWeeklySlots builds the standard two-card slot layout (Session +
+// Weekly) that the device renders with broker-supplied labels — the same
+// path Antigravity uses. Providers append their own extra slots (e.g.
+// Claude's "Fable") after these. Legacy session_/weekly_/design_ fields stay
+// populated for older firmware that ignores slots.
+function sessionWeeklySlots(snap) {
+  return [
+    { label: "Session", pct: snap.session_pct, window_seconds: snap.session_window_seconds, reset_eta_seconds: snap.session_reset_eta_seconds },
+    { label: "Weekly", pct: snap.weekly_pct, window_seconds: snap.weekly_window_seconds, reset_eta_seconds: snap.weekly_reset_eta_seconds },
+  ];
+}
+
 // -----------------------------------------------------------------------
 // Cache
 // -----------------------------------------------------------------------
@@ -234,6 +246,17 @@ export class ClaudeFetcher {
     }
     const extra = doc.extra_usage || {};
     snap.tier = extra.is_enabled ? "paid" : "unknown";
+    // Unified slots layout: Session / Weekly, plus Fable when the
+    // model-scoped limit exists. Rendered via the same path Antigravity uses.
+    snap.slots = sessionWeeklySlots(snap);
+    if (snap.design_present) {
+      snap.slots.push({
+        label: "Fable",
+        pct: snap.design_pct,
+        window_seconds: snap.weekly_window_seconds,
+        reset_eta_seconds: snap.design_reset_eta_seconds,
+      });
+    }
     return snap;
   }
 }
@@ -295,6 +318,8 @@ export class CodexFetcher {
       if (Number.isFinite(lim) && lim > 0) snap.weekly_window_seconds = lim;
       snap.weekly_reset_eta_seconds = codexEta(secondary);
     }
+    // Unified slots layout (Session / Weekly); Codex has no third bucket.
+    snap.slots = sessionWeeklySlots(snap);
     return snap;
   }
 }

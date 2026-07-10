@@ -68,6 +68,18 @@ type Slot struct {
 	ResetETASeconds  uint32  `json:"reset_eta_seconds"`
 }
 
+// sessionWeeklySlots builds the standard two-card slot layout (Session +
+// Weekly) that the device renders with broker-supplied labels — the same
+// path Antigravity uses. Providers append their own extra slots (e.g.
+// Claude's "Fable") after these. The legacy session_/weekly_/design_ wire
+// fields stay populated alongside for older firmware that ignores slots.
+func sessionWeeklySlots(s Snapshot) []Slot {
+	return []Slot{
+		{Label: "Session", Pct: s.SessionPct, WindowSeconds: s.SessionWindowSeconds, ResetETASeconds: s.SessionResetETASeconds},
+		{Label: "Weekly", Pct: s.WeeklyPct, WindowSeconds: s.WeeklyWindowSeconds, ResetETASeconds: s.WeeklyResetETASeconds},
+	}
+}
+
 // Provider names served at /usage/{name}.
 const (
 	ProviderClaude      = "claude"

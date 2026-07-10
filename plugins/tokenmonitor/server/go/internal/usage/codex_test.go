@@ -93,6 +93,19 @@ func TestCodexFetcher_HappyPath(t *testing.T) {
 	if snap.DesignPresent {
 		t.Errorf("design_present: want false for codex")
 	}
+	// Codex emits exactly Session + Weekly slots (no third bucket).
+	wantSlots := []Slot{
+		{Label: "Session", Pct: 33, WindowSeconds: 18000, ResetETASeconds: 14007},
+		{Label: "Weekly", Pct: 6, WindowSeconds: 604800, ResetETASeconds: 582744},
+	}
+	if len(snap.Slots) != len(wantSlots) {
+		t.Fatalf("slots: want %d, got %d (%+v)", len(wantSlots), len(snap.Slots), snap.Slots)
+	}
+	for i, w := range wantSlots {
+		if snap.Slots[i] != w {
+			t.Errorf("slots[%d]: want %+v, got %+v", i, w, snap.Slots[i])
+		}
+	}
 }
 
 func TestCodexFetcher_MissingRateLimit(t *testing.T) {
