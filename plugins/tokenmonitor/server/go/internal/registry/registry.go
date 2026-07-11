@@ -30,6 +30,8 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"golang.org/x/sys/unix"
+
+	"github.com/fractal-manifold/tokenmonitor-mcp/internal/textutil"
 )
 
 // SchemaVersion identifies the on-disk TOML layout. Bump when fields move
@@ -759,10 +761,7 @@ func applyReported(p *ConfigPayload, s ReportedSettings) bool {
 		clampSet(&p.PetSpecies, *s.PetSpecies, 0, 9)
 	}
 	if s.PetName != nil {
-		name := *s.PetName
-		if len(name) > 15 {
-			name = name[:15]
-		}
+		name := textutil.ClipRunes(*s.PetName, 15)
 		if p.PetName != name {
 			p.PetName = name
 			changed = true
@@ -1257,6 +1256,9 @@ func payloadEquivalent(a, b ConfigPayload) bool {
 		return false
 	}
 	if !ptrBoolEqual(a.PanelEnabled, b.PanelEnabled) {
+		return false
+	}
+	if !ptrBoolEqual(a.LogEnabled, b.LogEnabled) {
 		return false
 	}
 	if !ptrU8Equal(a.PetSpecies, b.PetSpecies) {

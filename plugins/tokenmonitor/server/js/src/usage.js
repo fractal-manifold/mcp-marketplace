@@ -4,6 +4,8 @@
 
 import { execFileSync } from "node:child_process";
 
+import { clipCodePoints } from "./textutil.js";
+
 export const PROVIDER_CLAUDE = "claude";
 export const PROVIDER_CODEX = "codex";
 export const PROVIDER_ANTIGRAVITY = "antigravity";
@@ -543,7 +545,7 @@ function antigravityApplyQuota(snap, quota, nowSec) {
 function antigravityGroupLabel(displayName) {
   let s = String(displayName || "").trim().replace(/\s+models$/i, "");
   if (!s) return "Quota";
-  return s.length > 15 ? s.slice(0, 15) : s;
+  return clipCodePoints(s, 15);
 }
 
 // -----------------------------------------------------------------------

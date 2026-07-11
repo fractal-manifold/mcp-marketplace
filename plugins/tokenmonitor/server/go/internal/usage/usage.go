@@ -145,6 +145,11 @@ type Cache struct {
 	mu        sync.Mutex
 	entries   map[string]entry
 	inFlights map[string]chan result // per-provider singleflight
+	// results holds the outcome of the most recent in-flight fetch per
+	// provider, published just before its channel is closed. Closing a
+	// channel wakes ALL waiters (a buffered send only reaches one), so the
+	// waiters read the shared result from here instead of off the channel.
+	results map[string]result
 }
 
 type entry struct {
@@ -168,6 +173,7 @@ func NewCache(ttl time.Duration, fetchers map[string]Fetcher) *Cache {
 		fetchers:  fetchers,
 		entries:   make(map[string]entry, len(fetchers)),
 		inFlights: make(map[string]chan result),
+		results:   make(map[string]result),
 	}
 }
 
@@ -193,17 +199,20 @@ func (c *Cache) Get(ctx context.Context, provider string) (Snapshot, error) {
 	}
 
 	// Singleflight: if a fetch for this provider is already in flight,
-	// wait on its channel instead of issuing a duplicate request.
+	// wait for its broadcast instead of issuing a duplicate request.
 	if ch, busy := c.inFlights[provider]; busy {
 		c.mu.Unlock()
 		select {
-		case res := <-ch:
+		case <-ch: // closed by the leader once results[provider] is published
+			c.mu.Lock()
+			res := c.results[provider]
+			c.mu.Unlock()
 			return res.snap, res.err
 		case <-ctx.Done():
 			return Snapshot{}, ctx.Err()
 		}
 	}
-	ch := make(chan result, 1)
+	ch := make(chan result) // used only as a broadcast signal via close
 	c.inFlights[provider] = ch
 	c.mu.Unlock()
 
@@ -212,6 +221,7 @@ func (c *Cache) Get(ctx context.Context, provider string) (Snapshot, error) {
 
 	c.mu.Lock()
 	delete(c.inFlights, provider)
+	var res result
 	if err == nil {
 		// A degraded snapshot (Fetch succeeded but a quota sub-RPC failed)
 		// still replaces last-good in the cache; the Degraded marker travels
@@ -220,6 +230,7 @@ func (c *Cache) Get(ctx context.Context, provider string) (Snapshot, error) {
 		snap.FetchedAtUnix = now.Unix()
 		snap.StaleSeconds = 0
 		c.entries[provider] = entry{snap: snap, fetched: now, hasValue: true}
+		res = result{snap: snap}
 	} else if hadValue {
 		// Return the previous good value with bumped stale_seconds AND
 		// the error, so the broker can pick between "serve stale" and
@@ -231,16 +242,14 @@ func (c *Cache) Get(ctx context.Context, provider string) (Snapshot, error) {
 		// snapshot — a transient 502 shouldn't poison the cache.
 		e.lastErr = err
 		c.entries[provider] = e
-		c.mu.Unlock()
-		ch <- result{snap: stale, err: err}
-		close(ch)
-		return stale, err
+		res = result{snap: stale, err: err}
+	} else {
+		res = result{snap: snap, err: err}
 	}
+	c.results[provider] = res
 	c.mu.Unlock()
-
-	ch <- result{snap: snap, err: err}
-	close(ch)
-	return snap, err
+	close(ch) // wake every waiter; they read c.results under the lock
+	return res.snap, res.err
 }
 
 // AntigravityFetcher returns the cached AntigravityFetcher when one is

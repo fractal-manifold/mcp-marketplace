@@ -127,18 +127,29 @@ func TestCache_UnknownProvider(t *testing.T) {
 }
 
 func TestCache_Singleflight(t *testing.T) {
-	// Two concurrent gets for the same cold cache entry should result in
-	// exactly one upstream call.
+	// Concurrent gets for the same cold cache entry should result in
+	// exactly one upstream call, and EVERY waiter must receive the real
+	// snapshot — not a zero value. (Regression: the old implementation
+	// did one buffered send + close, so only one waiter got the result
+	// and the rest read Snapshot{} off the closed channel.)
 	stub := &stubFetcher{snap: Snapshot{SessionPct: 7}, delay: 50 * time.Millisecond}
 	c := NewCache(time.Minute, map[string]Fetcher{"x": stub})
 
 	var wg sync.WaitGroup
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 8; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := c.Get(context.Background(), "x"); err != nil {
+			snap, err := c.Get(context.Background(), "x")
+			if err != nil {
 				t.Errorf("get: %v", err)
+				return
+			}
+			if snap.SessionPct != 7 {
+				t.Errorf("waiter got session_pct %v, want 7", snap.SessionPct)
+			}
+			if snap.FetchedAtUnix == 0 {
+				t.Error("waiter got zero fetched_at_unix")
 			}
 		}()
 	}

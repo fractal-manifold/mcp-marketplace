@@ -688,12 +688,16 @@ function handleDeviceLogs({ cfg, cache, state, registry, logger, deviceID }, req
   let aborted = false;
   req.on("data", (c) => {
     total += c.length;
-    if (total > devlog.MAX_BODY_BYTES) { aborted = true; req.destroy(); return; }
+    // Streamed body over the cap → respond 413 FIRST, then tear down the read
+    // side (destroy() without an error emits neither `error` nor `end`, so a
+    // response written afterwards would never go out and the device would see
+    // a bare connection reset instead of the 413 that Go/Python return).
+    if (total > devlog.MAX_BODY_BYTES) { if (!aborted) { aborted = true; finishErr(413, "body too large"); } req.destroy(); return; }
     chunks.push(c);
   });
   req.on("error", () => { if (!aborted) { aborted = true; try { finishErr(400, "read error"); } catch {} } });
   req.on("end", () => {
-    if (aborted) return finishErr(413, "body too large");
+    if (aborted) return;
     const body = Buffer.concat(chunks).toString("utf8");
     const lines = devlog.stampLines(body, new Date());
     try { devlog.append(registry.dir, deviceID, lines); }

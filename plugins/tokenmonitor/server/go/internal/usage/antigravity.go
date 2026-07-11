@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/fractal-manifold/tokenmonitor-mcp/internal/textutil"
 )
 
 const (
@@ -397,10 +399,7 @@ func antigravityGroupLabel(displayName string) string {
 	if s == "" {
 		return "Quota"
 	}
-	if len(s) > 15 {
-		s = s[:15]
-	}
-	return s
+	return textutil.ClipRunes(s, 15)
 }
 
 // geminiUsedPct converts a REMAINING fraction into a used-percentage,

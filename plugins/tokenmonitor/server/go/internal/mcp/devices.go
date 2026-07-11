@@ -18,6 +18,7 @@ import (
 
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/config"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/registry"
+	"github.com/fractal-manifold/tokenmonitor-mcp/internal/textutil"
 )
 
 // deviceSummary is the trimmed view exposed by tokenmonitor_list_devices.
@@ -423,10 +424,7 @@ func handleSetDevicePending(d Deps) server.ToolHandlerFunc {
 			update.PetSpecies = &sp
 		}
 		if v := req.GetString("pet_name", ""); v != "" {
-			if len(v) > 15 {
-				v = v[:15]
-			}
-			update.PetName = v
+			update.PetName = textutil.ClipRunes(v, 15)
 		}
 
 		// gemini_models: comma-separated list. Empty string clears the

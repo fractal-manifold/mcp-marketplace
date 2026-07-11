@@ -6,6 +6,8 @@ import { join } from "node:path";
 
 import TOML from "@iarna/toml";
 
+import { clipCodePoints } from "../textutil.js";
+
 // flock(2) interprocess exclusion is mandatory per compat/SECURITY.md.
 // We refuse to construct a Registry without it: silently downgrading to
 // no-op locks would let two tokenmonitor-mcp processes corrupt the same device
@@ -594,7 +596,7 @@ function applyReported(p, s) {
     if (p.pet_species !== v) { p.pet_species = v; changed = true; }
   }
   if (s.pet_name != null) {
-    const name = String(s.pet_name).slice(0, 15);
+    const name = clipCodePoints(s.pet_name, 15);
     if (p.pet_name !== name) { p.pet_name = name; changed = true; }
   }
   return changed;

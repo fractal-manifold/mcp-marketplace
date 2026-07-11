@@ -16,6 +16,7 @@ import * as ota from "../ota.js";
 import * as devlog from "../devlog.js";
 import { validDeviceID, effectiveChannel, providerModeEnabled, providerModeFromBool, validProviderMode } from "../registry/store.js";
 import { firmwarePath } from "../config.js";
+import { clipCodePoints } from "../textutil.js";
 
 function compatDir() {
   let dir = dirname(fileURLToPath(import.meta.url));
@@ -455,7 +456,7 @@ function setDevicePendingTool(deps, args) {
     const v = Number.parseInt(args.pet_species, 10);
     if (Number.isFinite(v)) upd.pet_species = clamp(v, 0, 9);
   }
-  if (args.pet_name) upd.pet_name = String(args.pet_name).slice(0, 15);
+  if (args.pet_name) upd.pet_name = clipCodePoints(args.pet_name, 15);
   // Custom panel — device-owned display setting, same handling shape as
   // pet_enabled above (default false / opt-in on-device).
   if ("panel_enabled" in args) upd.panel_enabled = !!args.panel_enabled;

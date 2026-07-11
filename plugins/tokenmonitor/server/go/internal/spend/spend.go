@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/fractal-manifold/tokenmonitor-mcp/internal/textutil"
 )
 
 // Provider names served at /spend/{name}.
@@ -163,12 +165,7 @@ var (
 	reGemini = regexp.MustCompile(`^gemini-[\d.]+-([a-z]+)`)
 )
 
-func clip15(s string) string {
-	if len(s) > 15 {
-		return s[:15]
-	}
-	return s
-}
+func clip15(s string) string { return textutil.ClipRunes(s, 15) }
 
 // LabelFor pretty-names a model id (≤15 chars). Mirrors labelFor in JS.
 func LabelFor(model string) string {

@@ -474,6 +474,29 @@ func TestSetPending_NoOpDropsPending(t *testing.T) {
 	}
 }
 
+func TestSetPending_LogEnabledOnlyStages(t *testing.T) {
+	// Regression: payloadEquivalent used to omit LogEnabled, so a pending
+	// that ONLY toggled diagnostic log upload was dropped as a no-op and
+	// the device never received it.
+	r := newReg(t)
+	if _, err := r.Register(testID, ConfigPayload{
+		PSKHex: testPSK, BrokerURL: "http://a", City: "Madrid",
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	on := true
+	dev, err := r.SetPending(testID, ConfigPayload{LogEnabled: &on})
+	if err != nil {
+		t.Fatalf("SetPending: %v", err)
+	}
+	if dev.Pending == nil {
+		t.Fatal("log_enabled-only update must stage a pending, got none")
+	}
+	if dev.Pending.LogEnabled == nil || !*dev.Pending.LogEnabled {
+		t.Errorf("pending payload lost log_enabled: %+v", dev.Pending.LogEnabled)
+	}
+}
+
 func TestMaybePromote_RequiresPendingPSKAndExactVersion(t *testing.T) {
 	r := newReg(t)
 	if _, err := r.Register(testID, ConfigPayload{PSKHex: testPSK, BrokerURL: "http://a"}); err != nil {

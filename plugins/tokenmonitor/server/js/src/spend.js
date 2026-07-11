@@ -8,6 +8,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { Pricing } from "./pricing.js";
+import { clipCodePoints } from "./textutil.js";
 
 export const PROVIDER_CLAUDE = "claude";
 export const PROVIDER_CODEX = "codex";
@@ -126,7 +127,7 @@ export function labelFor(model) {
   if (mm) return clip(mm[1][0].toUpperCase() + mm[1].slice(1));
   return clip(m);
 }
-function clip(s) { return s.length > 15 ? s.slice(0, 15) : s; }
+function clip(s) { return clipCodePoints(s, 15); }
 
 // -----------------------------------------------------------------------
 // File walking with a per-file record cache (incremental parsing)
