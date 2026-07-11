@@ -1050,11 +1050,11 @@ func handleDeviceSync(cfg *config.Config, cache *auth.NonceCache, logger *log.Lo
 
 // handleDeviceLogs receives a diagnostic log batch the device POSTs to
 // /device/{id}/logs and appends it to the per-device log file. Auth is
-// identical to /sync (HMAC over method+path+ts+nonce+device+cfgver). The
-// signature does NOT cover the body — that is acceptable: the body is
-// scrubbed of secrets on-device and is diagnostic only, so a tamperer who
-// is somehow on-path can corrupt debug text but cannot forge a privileged
-// action. The body is capped (MaxBodyBytes) to bound abuse.
+// identical to /sync (HMAC over method+path+ts+nonce+device+cfgver); when
+// the device sends X-Tmon-Body-Sha256 the signature also covers the body
+// (HMAC v3, compat/HMAC_CANONICAL.md). Requests without the header verify
+// under the legacy v2 canonical (pre-v3 firmware). The body is capped
+// (MaxBodyBytes) to bound abuse.
 func handleDeviceLogs(cfg *config.Config, cache *auth.NonceCache, logger *log.Logger, reg *registry.Registry, w http.ResponseWriter, r *http.Request) {
 	if reg == nil {
 		writeError(w, http.StatusNotFound, "device registry not configured")
@@ -1085,8 +1085,19 @@ func handleDeviceLogs(cfg *config.Config, cache *auth.NonceCache, logger *log.Lo
 		return
 	}
 
+	// Body FIRST (size-bounded), then body-aware auth: the v3 signature
+	// covers sha256(body) via X-Tmon-Body-Sha256, so verification needs
+	// the raw bytes. Reading before auth is safe — the cap bounds memory
+	// and nothing is parsed or stored until the signature checks out.
+	r.Body = http.MaxBytesReader(w, r.Body, devlog.MaxBodyBytes)
+	raw, rerr := io.ReadAll(r.Body)
+	if rerr != nil {
+		writeError(w, http.StatusRequestEntityTooLarge, "body too large")
+		return
+	}
+
 	signedPath := r.URL.Path
-	if _, verr := auth.VerifyMulti(
+	if _, verr := auth.VerifyMultiBody(
 		[][]byte{active, pending},
 		"POST", signedPath,
 		r.Header.Get("X-Tmon-Timestamp"),
@@ -1094,19 +1105,14 @@ func handleDeviceLogs(cfg *config.Config, cache *auth.NonceCache, logger *log.Lo
 		r.Header.Get("X-Tmon-Signature"),
 		r.Header.Get("X-Tmon-Device"),
 		r.Header.Get("X-Tmon-Config-Version"),
+		r.Header.Get("X-Tmon-Body-Sha256"),
+		raw,
 		cache,
 		time.Duration(cfg.Security.MaxTimestampSkewSeconds)*time.Second,
 		time.Now(),
 	); verr != nil {
 		logger.Printf("auth rejected /device/%s/logs from %s: %v", deviceID, r.RemoteAddr, verr)
 		writeError(w, http.StatusUnauthorized, "unauthorized")
-		return
-	}
-
-	r.Body = http.MaxBytesReader(w, r.Body, devlog.MaxBodyBytes)
-	raw, rerr := io.ReadAll(r.Body)
-	if rerr != nil {
-		writeError(w, http.StatusRequestEntityTooLarge, "body too large")
 		return
 	}
 
@@ -1171,8 +1177,19 @@ func handleDeviceSettings(cfg *config.Config, cache *auth.NonceCache, logger *lo
 		return
 	}
 
+	// Body FIRST (size-bounded), then body-aware auth: the v3 signature
+	// covers sha256(body) via X-Tmon-Body-Sha256, so verification needs
+	// the raw bytes. Reading before auth is safe — the cap bounds memory
+	// and nothing is parsed or stored until the signature checks out.
+	r.Body = http.MaxBytesReader(w, r.Body, 512)
+	raw, rerr := io.ReadAll(r.Body)
+	if rerr != nil { // includes the 512-byte cap being exceeded
+		writeError(w, http.StatusBadRequest, "bad settings body")
+		return
+	}
+
 	signedPath := r.URL.Path
-	if _, verr := auth.VerifyMulti(
+	if _, verr := auth.VerifyMultiBody(
 		[][]byte{active, pending},
 		"POST", signedPath,
 		r.Header.Get("X-Tmon-Timestamp"),
@@ -1180,19 +1197,14 @@ func handleDeviceSettings(cfg *config.Config, cache *auth.NonceCache, logger *lo
 		r.Header.Get("X-Tmon-Signature"),
 		r.Header.Get("X-Tmon-Device"),
 		r.Header.Get("X-Tmon-Config-Version"),
+		r.Header.Get("X-Tmon-Body-Sha256"),
+		raw,
 		cache,
 		time.Duration(cfg.Security.MaxTimestampSkewSeconds)*time.Second,
 		time.Now(),
 	); verr != nil {
 		logger.Printf("auth rejected /device/%s/settings from %s: %v", deviceID, r.RemoteAddr, verr)
 		writeError(w, http.StatusUnauthorized, "unauthorized")
-		return
-	}
-
-	r.Body = http.MaxBytesReader(w, r.Body, 512)
-	raw, rerr := io.ReadAll(r.Body)
-	if rerr != nil { // includes the 512-byte cap being exceeded
-		writeError(w, http.StatusBadRequest, "bad settings body")
 		return
 	}
 	// Canonical body handling shared with the Python/JS brokers: an empty

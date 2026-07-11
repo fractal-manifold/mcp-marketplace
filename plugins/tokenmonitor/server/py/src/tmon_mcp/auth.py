@@ -34,12 +34,40 @@ def compute_signature(
     return _hmac.new(psk, msg, hashlib.sha256).hexdigest()
 
 
+def compute_signature_body(
+    psk: bytes,
+    method: str,
+    path: str,
+    ts: str,
+    nonce: str,
+    device: str,
+    config_version: str,
+    body_sha256: str,
+) -> str:
+    """Canonical HMAC v3 (body-covering): the v2 string with
+    "\\n" + BODY_SHA256 appended, where body_sha256 is the lowercase-hex
+    SHA-256 of the raw request body (the X-Tmon-Body-Sha256 header value).
+    Only used when that header is present; requests without it keep the
+    v2 form."""
+    msg = (
+        f"{method}\n{path}\n{ts}\n{nonce}\n{device}\n{config_version}\n{body_sha256}"
+    ).encode("ascii")
+    return _hmac.new(psk, msg, hashlib.sha256).hexdigest()
+
+
 _HEX32_RE = re.compile(r"^[0-9A-Fa-f]{32}$")
+_LOWER_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _DECIMAL_RE = re.compile(r"^-?[0-9]+$")
 
 
 def _is_hex32(s: str) -> bool:
     return bool(_HEX32_RE.fullmatch(s))
+
+
+def _is_lower_hex64(s: str) -> bool:
+    # X-Tmon-Body-Sha256 is STRICT lowercase (no case folding, unlike the
+    # nonce) — its verbatim bytes are part of the canonical input.
+    return bool(_LOWER_HEX64_RE.fullmatch(s))
 
 
 def _parse_strict_int(s: str) -> int | None:
@@ -64,6 +92,7 @@ ERR_BAD_NONCE_FORMAT = AuthError("bad nonce format")
 ERR_BAD_SIGNATURE = AuthError("bad signature")
 ERR_NONCE_REPLAY = AuthError("nonce replay")
 ERR_NON_ASCII_HEADER = AuthError("non-ascii auth header")
+ERR_BAD_BODY_DIGEST = AuthError("bad body digest")
 
 
 def _auth_headers_ascii(*values: str) -> bool:
@@ -190,6 +219,79 @@ def verify_multi(
         expected = compute_signature(
             psk, method, path, ts_str, nonce_lc,
             device_header, config_version_header,
+        )
+        if _hmac.compare_digest(sig_lc, expected):
+            matched = i
+            break
+    if matched < 0:
+        raise ERR_BAD_SIGNATURE
+    if not cache.check_and_add(nonce_lc, now_ts):
+        raise ERR_NONCE_REPLAY
+    return VerifyResult(psk_index=matched)
+
+
+def verify_multi_body(
+    psks: list[bytes | None],
+    method: str,
+    path: str,
+    ts_header: str,
+    nonce_header: str,
+    sig_header: str,
+    device_header: str = "",
+    config_version_header: str = "",
+    body_sha_header: str = "",
+    body: bytes = b"",
+    cache: NonceCache | None = None,
+    max_skew_seconds: int = 60,
+    now: float | None = None,
+) -> VerifyResult:
+    """Body-aware verify_multi (HMAC v3). Mirrors auth.VerifyMultiBody.
+
+    body_sha_header comes from X-Tmon-Body-Sha256 verbatim. Absent header →
+    legacy v2 path (old firmware until it gets the OTA). Present → strict
+    lowercase 64-hex gate, sha256(body) must match, and the digest joins the
+    canonical string. Stripping the header cannot downgrade a v3-signed
+    request: its signature only verifies under the v3 canonical.
+    """
+    if cache is None:
+        raise TypeError("verify_multi_body() requires a NonceCache")
+    if not body_sha_header:
+        return verify_multi(
+            psks, method, path, ts_header, nonce_header, sig_header,
+            device_header, config_version_header,
+            cache=cache, max_skew_seconds=max_skew_seconds, now=now,
+        )
+    if not ts_header or not nonce_header or not sig_header:
+        raise ERR_MISSING_HEADERS
+    if not _auth_headers_ascii(
+        ts_header, nonce_header, sig_header,
+        device_header, config_version_header, body_sha_header,
+    ):
+        raise ERR_NON_ASCII_HEADER
+    if not _is_lower_hex64(body_sha_header):
+        raise ERR_BAD_BODY_DIGEST
+    # Digest is public (a hash of the body the sender already sent) — plain
+    # compare is fine; only the HMAC below needs constant time.
+    if hashlib.sha256(body).hexdigest() != body_sha_header:
+        raise ERR_BAD_BODY_DIGEST
+    ts = _parse_strict_int(ts_header)
+    if ts is None:
+        raise ERR_BAD_TIMESTAMP
+    now_ts = time.time() if now is None else now
+    if abs(int(now_ts) - ts) > max_skew_seconds:
+        raise ERR_TIMESTAMP_SKEW
+    if not _is_hex32(nonce_header):
+        raise ERR_BAD_NONCE_FORMAT
+    nonce_lc = nonce_header.lower()
+    sig_lc = sig_header.lower()
+
+    matched = -1
+    for i, psk in enumerate(psks):
+        if not psk:
+            continue
+        expected = compute_signature_body(
+            psk, method, path, ts_header, nonce_lc,
+            device_header, config_version_header, body_sha_header,
         )
         if _hmac.compare_digest(sig_lc, expected):
             matched = i

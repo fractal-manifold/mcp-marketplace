@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -100,6 +101,71 @@ test("v1 form is no longer reproduced (bump regression test)", { skip }, () => {
     assert.equal(got, v.v2_expected_hex);
     assert.notEqual(got, v.v1_expected_hex_rejected_now);
   }
+});
+
+test("HMAC v3 body_vectors match byte-for-byte and verify end-to-end", { skip }, () => {
+  const vs = data.body_vectors || [];
+  assert.ok(vs.length > 0, "body_vectors missing from hmac.json");
+  for (const v of vs) {
+    const psk = Buffer.from(v.psk_utf8, "utf8");
+    const body = Buffer.from(v.body_utf8, "utf8");
+    const digest = createHash("sha256").update(body).digest("hex");
+    assert.equal(digest, v.body_sha256, `body digest ${v.name}`);
+    const got = auth.computeSignatureBody(
+      psk, v.method, v.path, v.timestamp, v.nonce,
+      v.device, v.config_version, v.body_sha256,
+    );
+    assert.equal(got, v.expected_hex, `vector ${v.name}`);
+    // Stripping X-Tmon-Body-Sha256 cannot downgrade: the v2 form differs.
+    const v2 = auth.computeSignature(
+      psk, v.method, v.path, v.timestamp, v.nonce, v.device, v.config_version,
+    );
+    assert.notEqual(v2, got);
+    if (v.v2_form_must_differ) assert.equal(v2, v.v2_form_must_differ);
+    // End-to-end verify.
+    const cache = new auth.NonceCache(300);
+    const res = auth.verifyMultiBody(
+      [psk], v.method, v.path, v.timestamp, v.nonce, got,
+      v.device, v.config_version, v.body_sha256, body,
+      cache, 60, Number(v.timestamp),
+    );
+    assert.equal(res.pskIndex, 0);
+  }
+});
+
+test("HMAC v3 body_reject_vectors: malformed/mismatching digest rejected pre-HMAC", { skip }, () => {
+  const rvs = data.body_reject_vectors || [];
+  assert.ok(rvs.length > 0, "body_reject_vectors missing from hmac.json");
+  const psk = Buffer.from("active-32-bytes-of-secret-mat!!!", "utf8");
+  for (const rv of rvs) {
+    assert.equal(rv.must_reject, true, rv.name);
+    const cache = new auth.NonceCache(300);
+    assert.throws(
+      () => auth.verifyMultiBody(
+        [psk], "POST", "/device/ab12cd34/settings",
+        "1700000180", "3333333333333333cccccccccccccccc", "0".repeat(64),
+        "ab12cd34", "42",
+        rv.body_sha256_header, Buffer.from(rv.body_utf8, "utf8"),
+        cache, 60, 1700000180,
+      ),
+      (e) => e instanceof auth.AuthError && e.kind === auth.ERR_BAD_BODY_DIGEST,
+      rv.name,
+    );
+  }
+});
+
+test("verifyMultiBody without header falls back to legacy v2", () => {
+  const psk = Buffer.from("active-32-bytes-of-secret-mat!!!", "utf8");
+  const cache = new auth.NonceCache(300);
+  const ts = "1700000180";
+  const nonce = "3333333333333333cccccccccccccccc";
+  const sig = auth.computeSignature(psk, "POST", "/device/ab12cd34/settings", ts, nonce, "ab12cd34", "42");
+  const res = auth.verifyMultiBody(
+    [psk], "POST", "/device/ab12cd34/settings", ts, nonce, sig,
+    "ab12cd34", "42", "", Buffer.from('{"vol":25}', "utf8"),
+    cache, 60, 1700000180,
+  );
+  assert.equal(res.pskIndex, 0);
 });
 
 test("Verify happy path", () => {

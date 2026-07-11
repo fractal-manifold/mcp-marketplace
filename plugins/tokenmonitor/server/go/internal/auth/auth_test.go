@@ -1,6 +1,8 @@
 package auth
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -360,6 +362,98 @@ func TestComputeSignature_CompatVectors(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Loads the v3 body_vectors / body_reject_vectors from compat/vectors/hmac.json:
+// the body-covering canonical must reproduce expected_hex, must differ from the
+// v2 form of the same fields (no downgrade-by-header-stripping), and malformed
+// or mismatching X-Tmon-Body-Sha256 values must be rejected before any HMAC.
+func TestComputeSignatureBody_CompatVectors(t *testing.T) {
+	path := findCompatVectors(t)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var doc struct {
+		BodyVectors []struct {
+			Name             string `json:"name"`
+			PSKUTF8          string `json:"psk_utf8"`
+			Method           string `json:"method"`
+			Path             string `json:"path"`
+			Timestamp        string `json:"timestamp"`
+			Nonce            string `json:"nonce"`
+			Device           string `json:"device"`
+			ConfigVersion    string `json:"config_version"`
+			BodyUTF8         string `json:"body_utf8"`
+			BodySHA256       string `json:"body_sha256"`
+			ExpectedHex      string `json:"expected_hex"`
+			V2FormMustDiffer string `json:"v2_form_must_differ"`
+		} `json:"body_vectors"`
+		BodyRejectVectors []struct {
+			Name             string `json:"name"`
+			BodyUTF8         string `json:"body_utf8"`
+			BodySHA256Header string `json:"body_sha256_header"`
+		} `json:"body_reject_vectors"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parse hmac.json: %v", err)
+	}
+	if len(doc.BodyVectors) == 0 {
+		t.Fatal("body_vectors empty")
+	}
+	for _, v := range doc.BodyVectors {
+		v := v
+		t.Run(v.Name, func(t *testing.T) {
+			gotDigest := sha256Hex([]byte(v.BodyUTF8))
+			if gotDigest != v.BodySHA256 {
+				t.Fatalf("body digest:\n  got  %s\n  want %s", gotDigest, v.BodySHA256)
+			}
+			got := ComputeSignatureBody([]byte(v.PSKUTF8), v.Method, v.Path,
+				v.Timestamp, v.Nonce, v.Device, v.ConfigVersion, v.BodySHA256)
+			if got != v.ExpectedHex {
+				t.Fatalf("v3 vector %q:\n  got  %s\n  want %s", v.Name, got, v.ExpectedHex)
+			}
+			v2 := ComputeSignature([]byte(v.PSKUTF8), v.Method, v.Path,
+				v.Timestamp, v.Nonce, v.Device, v.ConfigVersion)
+			if v2 == got {
+				t.Fatalf("v3 hash equals v2 hash — header stripping would downgrade")
+			}
+			if v.V2FormMustDiffer != "" && v2 != v.V2FormMustDiffer {
+				t.Fatalf("v2 form:\n  got  %s\n  want %s", v2, v.V2FormMustDiffer)
+			}
+			// End-to-end: a request signed under v3 verifies through VerifyMultiBody.
+			cache := NewNonceCache(time.Minute)
+			ts, _ := strconv.ParseInt(v.Timestamp, 10, 64)
+			_, err := VerifyMultiBody([][]byte{[]byte(v.PSKUTF8)}, v.Method, v.Path,
+				v.Timestamp, v.Nonce, got, v.Device, v.ConfigVersion,
+				v.BodySHA256, []byte(v.BodyUTF8),
+				cache, time.Minute, time.Unix(ts, 0))
+			if err != nil {
+				t.Fatalf("VerifyMultiBody rejected its own vector: %v", err)
+			}
+		})
+	}
+	for _, r := range doc.BodyRejectVectors {
+		r := r
+		t.Run(r.Name, func(t *testing.T) {
+			// Otherwise-plausible headers: the digest gate must fire first.
+			cache := NewNonceCache(time.Minute)
+			_, err := VerifyMultiBody([][]byte{[]byte("active-32-bytes-of-secret-mat!!!")},
+				"POST", "/device/ab12cd34/settings",
+				"1700000180", "3333333333333333cccccccccccccccc",
+				strings.Repeat("0", 64), "ab12cd34", "42",
+				r.BodySHA256Header, []byte(r.BodyUTF8),
+				cache, time.Minute, time.Unix(1700000180, 0))
+			if !errors.Is(err, ErrBadBodyDigest) {
+				t.Fatalf("want ErrBadBodyDigest, got %v", err)
+			}
+		})
+	}
+}
+
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 // findCompatVectors walks up from the test working directory looking for

@@ -7,7 +7,7 @@
 // for the byte-exact contract and ../compat/vectors/hmac.json for the
 // pinned test vectors every implementation must reproduce.
 
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 
 export function computeSignature(psk, method, path, ts, nonce, device = "", configVersion = "") {
   // psk: Buffer (or string interpreted as utf-8). method/path/ts/nonce/device/configVersion: strings.
@@ -27,11 +27,40 @@ export function computeSignature(psk, method, path, ts, nonce, device = "", conf
   return mac.digest("hex");
 }
 
+// Canonical HMAC v3 (body-covering): the v2 string with "\n" + BODY_SHA256
+// appended, where bodySha256 is the lowercase-hex SHA-256 of the raw request
+// body (the X-Tmon-Body-Sha256 header value, verbatim).
+export function computeSignatureBody(psk, method, path, ts, nonce, device, configVersion, bodySha256) {
+  const key = Buffer.isBuffer(psk) ? psk : Buffer.from(psk, "utf8");
+  const mac = createHmac("sha256", key);
+  mac.update(method);
+  mac.update("\n");
+  mac.update(path);
+  mac.update("\n");
+  mac.update(ts);
+  mac.update("\n");
+  mac.update(nonce);
+  mac.update("\n");
+  mac.update(device);
+  mac.update("\n");
+  mac.update(configVersion);
+  mac.update("\n");
+  mac.update(bodySha256);
+  return mac.digest("hex");
+}
+
 const HEX32_RE = /^[0-9A-Fa-f]{32}$/;
+// X-Tmon-Body-Sha256 is STRICT lowercase (no case folding, unlike the nonce)
+// — its verbatim bytes are part of the canonical input.
+const LOWER_HEX64_RE = /^[0-9a-f]{64}$/;
 const DECIMAL_RE = /^-?[0-9]+$/;
 
 function isHex32(s) {
   return HEX32_RE.test(s);
+}
+
+function isLowerHex64(s) {
+  return LOWER_HEX64_RE.test(s);
 }
 
 function parseStrictInt(s) {
@@ -56,6 +85,7 @@ export const ERR_BAD_NONCE_FORMAT = "bad nonce format";
 export const ERR_BAD_SIGNATURE = "bad signature";
 export const ERR_NONCE_REPLAY = "nonce replay";
 export const ERR_NON_ASCII_HEADER = "non-ascii auth header";
+export const ERR_BAD_BODY_DIGEST = "bad body digest";
 
 // Auth headers are ASCII-only (compat/HMAC_CANONICAL.md). Reject any value
 // carrying a code unit >= 0x80 with a plain 401, mirroring the py/js/Go gate,
@@ -135,6 +165,46 @@ export function verifyMulti(psks, method, path, tsHeader, nonceHeader, sigHeader
     const psk = psks[i];
     if (!psk || psk.length === 0) continue;
     if (constantTimeEqualHex(sigLC, computeSignature(psk, method, path, tsStr, nonceLC, dev, ver))) {
+      matched = i;
+      break;
+    }
+  }
+  if (matched < 0) throw new AuthError(ERR_BAD_SIGNATURE);
+  if (!cache.checkAndAdd(nonceLC, nowTs)) throw new AuthError(ERR_NONCE_REPLAY);
+  return { pskIndex: matched };
+}
+
+// Body-aware verifyMulti (HMAC v3). bodyShaHeader comes from
+// X-Tmon-Body-Sha256 verbatim; body is the raw request body (Buffer).
+// Absent header → legacy v2 path (old firmware until it gets the OTA).
+// Present → strict lowercase 64-hex gate, sha256(body) must match, and the
+// digest joins the canonical string. Stripping the header cannot downgrade a
+// v3-signed request: its signature only verifies under the v3 canonical.
+export function verifyMultiBody(psks, method, path, tsHeader, nonceHeader, sigHeader, deviceHeader, configVersionHeader, bodyShaHeader, body, cache, maxSkewSeconds, now) {
+  if (!bodyShaHeader) {
+    return verifyMulti(psks, method, path, tsHeader, nonceHeader, sigHeader, deviceHeader, configVersionHeader, cache, maxSkewSeconds, now);
+  }
+  if (!tsHeader || !nonceHeader || !sigHeader) throw new AuthError(ERR_MISSING_HEADERS);
+  if (!allASCII(tsHeader, nonceHeader, sigHeader, deviceHeader, configVersionHeader, bodyShaHeader)) throw new AuthError(ERR_NON_ASCII_HEADER);
+  if (!isLowerHex64(bodyShaHeader)) throw new AuthError(ERR_BAD_BODY_DIGEST);
+  // Digest is public (a hash of the body the sender already sent) — plain
+  // compare is fine; only the HMAC below needs constant time.
+  const actual = createHash("sha256").update(body ?? Buffer.alloc(0)).digest("hex");
+  if (actual !== bodyShaHeader) throw new AuthError(ERR_BAD_BODY_DIGEST);
+  const ts = parseStrictInt(tsHeader);
+  if (ts === null) throw new AuthError(ERR_BAD_TIMESTAMP);
+  const nowTs = now ?? Math.floor(Date.now() / 1000);
+  if (Math.abs(Math.floor(nowTs) - ts) > maxSkewSeconds) throw new AuthError(ERR_TIMESTAMP_SKEW);
+  if (!isHex32(nonceHeader)) throw new AuthError(ERR_BAD_NONCE_FORMAT);
+  const nonceLC = nonceHeader.toLowerCase();
+  const sigLC = sigHeader.toLowerCase();
+  const dev = deviceHeader ?? "";
+  const ver = configVersionHeader ?? "";
+  let matched = -1;
+  for (let i = 0; i < psks.length; i++) {
+    const psk = psks[i];
+    if (!psk || psk.length === 0) continue;
+    if (constantTimeEqualHex(sigLC, computeSignatureBody(psk, method, path, tsHeader, nonceLC, dev, ver, bodyShaHeader))) {
       matched = i;
       break;
     }

@@ -839,8 +839,10 @@ async def _handle_device_sync(req: web.Request) -> web.Response:
 
 async def _handle_device_logs(req: web.Request) -> web.Response:
     """Receive a diagnostic log batch the device POSTs and append it to the
-    per-device log file. Auth is identical to /sync; the signature does not
-    cover the body (scrubbed, diagnostic-only). Body is size-capped."""
+    per-device log file. Auth is identical to /sync; when the device sends
+    X-Tmon-Body-Sha256 the signature also covers the body (HMAC v3, see
+    compat/HMAC_CANONICAL.md). Body is size-capped and read before auth —
+    safe, since nothing is parsed or stored until the signature checks out."""
     cfg: Config = req.app["cfg"]
     cache: auth.NonceCache = req.app["cache"]
     registry: Registry | None = req.app["registry"]
@@ -859,9 +861,16 @@ async def _handle_device_logs(req: web.Request) -> web.Response:
         log.warning("registry lookup %s: %s", device_id, e)
         return _error(500, "registry error")
 
+    # Body FIRST (size-bounded), then body-aware auth.
+    if req.content_length is not None and req.content_length > devlog.MAX_BODY_BYTES:
+        return _error(413, "body too large")
+    raw = await req.read()
+    if len(raw) > devlog.MAX_BODY_BYTES:
+        return _error(413, "body too large")
+
     signed_path = req.path
     try:
-        auth.verify_multi(
+        auth.verify_multi_body(
             [active, pending],
             "POST", signed_path,
             req.headers.get("X-Tmon-Timestamp", ""),
@@ -869,18 +878,14 @@ async def _handle_device_logs(req: web.Request) -> web.Response:
             req.headers.get("X-Tmon-Signature", ""),
             req.headers.get("X-Tmon-Device", ""),
             req.headers.get("X-Tmon-Config-Version", ""),
+            req.headers.get("X-Tmon-Body-Sha256", ""),
+            raw,
             cache,
             cfg.security.max_timestamp_skew_seconds,
         )
     except auth.AuthError as e:
         log.info("auth rejected /device/%s/logs from %s: %s", device_id, req.remote, e)
         return _error(401, "unauthorized")
-
-    if req.content_length is not None and req.content_length > devlog.MAX_BODY_BYTES:
-        return _error(413, "body too large")
-    raw = await req.read()
-    if len(raw) > devlog.MAX_BODY_BYTES:
-        return _error(413, "body too large")
 
     lines = devlog.stamp_lines(raw.decode("utf-8", errors="replace"))
     try:
@@ -895,7 +900,8 @@ async def _handle_device_settings(req: web.Request) -> web.Response:
     """Apply a device-reported display-settings update to the registry
     (compat/SETTINGS_REPORT.md). The device owns these fields, so this
     converges the broker's stored config — no version bump, no reverts. Auth is
-    identical to /logs; the signature does not cover the body."""
+    identical to /logs; when the device sends X-Tmon-Body-Sha256 the signature
+    also covers the body (HMAC v3)."""
     cfg: Config = req.app["cfg"]
     cache: auth.NonceCache = req.app["cache"]
     registry: Registry | None = req.app["registry"]
@@ -914,9 +920,16 @@ async def _handle_device_settings(req: web.Request) -> web.Response:
         log.warning("registry lookup %s: %s", device_id, e)
         return _error(500, "registry error")
 
+    # Body FIRST (size-bounded), then body-aware auth.
+    if req.content_length is not None and req.content_length > 512:
+        return _error(400, "bad settings body")
+    raw = await req.read()
+    if len(raw) > 512:
+        return _error(400, "bad settings body")
+
     signed_path = req.path
     try:
-        auth.verify_multi(
+        auth.verify_multi_body(
             [active, pending],
             "POST", signed_path,
             req.headers.get("X-Tmon-Timestamp", ""),
@@ -924,18 +937,14 @@ async def _handle_device_settings(req: web.Request) -> web.Response:
             req.headers.get("X-Tmon-Signature", ""),
             req.headers.get("X-Tmon-Device", ""),
             req.headers.get("X-Tmon-Config-Version", ""),
+            req.headers.get("X-Tmon-Body-Sha256", ""),
+            raw,
             cache,
             cfg.security.max_timestamp_skew_seconds,
         )
     except auth.AuthError as e:
         log.info("auth rejected /device/%s/settings from %s: %s", device_id, req.remote, e)
         return _error(401, "unauthorized")
-
-    if req.content_length is not None and req.content_length > 512:
-        return _error(400, "bad settings body")
-    raw = await req.read()
-    if len(raw) > 512:
-        return _error(400, "bad settings body")
     try:
         text = raw.decode("utf-8").strip()
     except UnicodeDecodeError:

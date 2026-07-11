@@ -145,6 +145,81 @@ def test_non_ascii_auth_header_rejected():
     assert matched, "no reject vectors exercised"
 
 
+def test_body_vectors_v3():
+    """v3 (body-covering) canonical: the digest of body_utf8 must match
+    body_sha256, compute_signature_body must reproduce expected_hex, the v2
+    form of the same fields must differ (stripping X-Tmon-Body-Sha256 cannot
+    downgrade), and verify_multi_body must accept the whole request."""
+    import hashlib
+
+    data = _load_vectors()
+    vectors = data.get("body_vectors", [])
+    assert vectors, "body_vectors missing from hmac.json"
+    for v in vectors:
+        psk = v["psk_utf8"].encode("utf-8")
+        body = v["body_utf8"].encode("utf-8")
+        assert hashlib.sha256(body).hexdigest() == v["body_sha256"], v["name"]
+        got = auth.compute_signature_body(
+            psk, v["method"], v["path"], v["timestamp"], v["nonce"],
+            v["device"], v["config_version"], v["body_sha256"],
+        )
+        assert got == v["expected_hex"], f"vector {v['name']!r}: got {got}"
+        v2 = auth.compute_signature(
+            psk, v["method"], v["path"], v["timestamp"], v["nonce"],
+            v["device"], v["config_version"],
+        )
+        assert v2 != got, "v3 hash equals v2 hash — header stripping would downgrade"
+        if "v2_form_must_differ" in v:
+            assert v2 == v["v2_form_must_differ"]
+        # End-to-end verify.
+        cache = auth.NonceCache(ttl_seconds=300)
+        res = auth.verify_multi_body(
+            [psk], v["method"], v["path"], v["timestamp"], v["nonce"], got,
+            v["device"], v["config_version"], v["body_sha256"], body,
+            cache, 60, float(v["timestamp"]),
+        )
+        assert res.psk_index == 0
+
+
+def test_body_reject_vectors():
+    """Malformed or mismatching X-Tmon-Body-Sha256 must be rejected as a bad
+    body digest before any HMAC is computed."""
+    data = _load_vectors()
+    rejects = data.get("body_reject_vectors", [])
+    assert rejects, "body_reject_vectors missing from hmac.json"
+    psk = b"active-32-bytes-of-secret-mat!!!"
+    for rv in rejects:
+        assert rv.get("must_reject") is True, rv["name"]
+        cache = auth.NonceCache(ttl_seconds=300)
+        with pytest.raises(auth.AuthError) as exc:
+            auth.verify_multi_body(
+                [psk], "POST", "/device/ab12cd34/settings",
+                "1700000180", "3333333333333333cccccccccccccccc", "0" * 64,
+                "ab12cd34", "42",
+                rv["body_sha256_header"], rv["body_utf8"].encode("utf-8"),
+                cache, 60, 1700000180.0,
+            )
+        assert "body digest" in str(exc.value), rv["name"]
+
+
+def test_verify_multi_body_absent_header_is_legacy_v2():
+    """No X-Tmon-Body-Sha256 → verify_multi_body must behave exactly like
+    verify_multi (old firmware until it gets the OTA)."""
+    psk = b"active-32-bytes-of-secret-mat!!!"
+    cache = auth.NonceCache(ttl_seconds=300)
+    ts = "1700000180"
+    nonce = "3333333333333333cccccccccccccccc"
+    sig = auth.compute_signature(
+        psk, "POST", "/device/ab12cd34/settings", ts, nonce, "ab12cd34", "42",
+    )
+    res = auth.verify_multi_body(
+        [psk], "POST", "/device/ab12cd34/settings", ts, nonce, sig,
+        "ab12cd34", "42", "", b'{"vol":25}',
+        cache, 60, 1700000180.0,
+    )
+    assert res.psk_index == 0
+
+
 def test_verify_happy_path():
     psk = b"psk-32-bytes-of-secret-material!"
     cache = auth.NonceCache(ttl_seconds=300)

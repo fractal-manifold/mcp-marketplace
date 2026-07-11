@@ -653,8 +653,10 @@ function handleDeviceSync({ cfg, cache, state, registry, logger, deviceID }, req
 }
 
 // Receive a diagnostic log batch the device POSTs and append it to the
-// per-device log file. Auth is identical to /sync; the signature does not
-// cover the body (scrubbed, diagnostic-only). Body is size-capped.
+// per-device log file. Auth is identical to /sync; when the device sends
+// X-Tmon-Body-Sha256 the signature also covers the body (HMAC v3, see
+// compat/HMAC_CANONICAL.md). Body is size-capped and assembled before auth —
+// safe, since nothing is parsed or stored until the signature checks out.
 function handleDeviceLogs({ cfg, cache, state, registry, logger, deviceID }, req, res) {
   let recordStatus = 202;
   const finishErr = (s, m) => { recordStatus = s; writeError(res, s, m); };
@@ -670,16 +672,6 @@ function handleDeviceLogs({ cfg, cache, state, registry, logger, deviceID }, req
     logger.warn(`registry lookup ${deviceID}: ${e.message}`); return finishErr(500, "registry error");
   }
   const signedPath = `/device/${deviceID}/logs`;
-  try {
-    auth.verifyMulti(
-      [active, pending],
-      "POST", signedPath,
-      req.headers["x-tmon-timestamp"] || "", req.headers["x-tmon-nonce"] || "", req.headers["x-tmon-signature"] || "",
-      req.headers["x-tmon-device"] || "", req.headers["x-tmon-config-version"] || "",
-      cache, cfg.security.max_timestamp_skew_seconds,
-    );
-  } catch (e) { logger.info(`auth rejected ${signedPath}: ${e.message}`); return finishErr(401, "unauthorized"); }
-
   const cl = Number.parseInt(req.headers["content-length"] || "", 10);
   if (Number.isFinite(cl) && cl > devlog.MAX_BODY_BYTES) return finishErr(413, "body too large");
 
@@ -698,7 +690,20 @@ function handleDeviceLogs({ cfg, cache, state, registry, logger, deviceID }, req
   req.on("error", () => { if (!aborted) { aborted = true; try { finishErr(400, "read error"); } catch {} } });
   req.on("end", () => {
     if (aborted) return;
-    const body = Buffer.concat(chunks).toString("utf8");
+    const raw = Buffer.concat(chunks);
+    // Body-aware auth AFTER the size-bounded body is assembled: the v3
+    // canonical covers sha256(body), so the signature can't be checked sooner.
+    try {
+      auth.verifyMultiBody(
+        [active, pending],
+        "POST", signedPath,
+        req.headers["x-tmon-timestamp"] || "", req.headers["x-tmon-nonce"] || "", req.headers["x-tmon-signature"] || "",
+        req.headers["x-tmon-device"] || "", req.headers["x-tmon-config-version"] || "",
+        req.headers["x-tmon-body-sha256"] || "", raw,
+        cache, cfg.security.max_timestamp_skew_seconds,
+      );
+    } catch (e) { logger.info(`auth rejected ${signedPath}: ${e.message}`); return finishErr(401, "unauthorized"); }
+    const body = raw.toString("utf8");
     const lines = devlog.stampLines(body, new Date());
     try { devlog.append(registry.dir, deviceID, lines); }
     catch (e) { logger.warn(`devlog append ${deviceID}: ${e.message}`); return finishErr(500, "log store error"); }
@@ -717,7 +722,8 @@ function validUint(v, max) {
 // mirrors it into the registry (compat/SETTINGS_REPORT.md). The device owns
 // these fields, so this converges the broker's stored config to the device's
 // state instead of pushing a change — no version bump, no reverts. Auth is
-// identical to /logs; the signature does not cover the body.
+// identical to /logs; when the device sends X-Tmon-Body-Sha256 the signature
+// also covers the body (HMAC v3).
 function handleDeviceSettings({ cfg, cache, state, registry, logger, deviceID }, req, res) {
   let recordStatus = 204;
   const finishErr = (s, m) => { recordStatus = s; writeError(res, s, m); };
@@ -733,16 +739,6 @@ function handleDeviceSettings({ cfg, cache, state, registry, logger, deviceID },
     logger.warn(`registry lookup ${deviceID}: ${e.message}`); return finishErr(500, "registry error");
   }
   const signedPath = `/device/${deviceID}/settings`;
-  try {
-    auth.verifyMulti(
-      [active, pending],
-      "POST", signedPath,
-      req.headers["x-tmon-timestamp"] || "", req.headers["x-tmon-nonce"] || "", req.headers["x-tmon-signature"] || "",
-      req.headers["x-tmon-device"] || "", req.headers["x-tmon-config-version"] || "",
-      cache, cfg.security.max_timestamp_skew_seconds,
-    );
-  } catch (e) { logger.info(`auth rejected ${signedPath}: ${e.message}`); return finishErr(401, "unauthorized"); }
-
   const cl = Number.parseInt(req.headers["content-length"] || "", 10);
   if (Number.isFinite(cl) && cl > 512) return finishErr(400, "bad settings body");
 
@@ -759,7 +755,20 @@ function handleDeviceSettings({ cfg, cache, state, registry, logger, deviceID },
   req.on("error", () => { if (!aborted) { aborted = true; try { finishErr(400, "bad settings body"); } catch {} } });
   req.on("end", () => {
     if (aborted) return;
-    const raw = Buffer.concat(chunks).toString("utf8");
+    const rawBuf = Buffer.concat(chunks);
+    // Body-aware auth AFTER the size-bounded body is assembled: the v3
+    // canonical covers sha256(body), so the signature can't be checked sooner.
+    try {
+      auth.verifyMultiBody(
+        [active, pending],
+        "POST", signedPath,
+        req.headers["x-tmon-timestamp"] || "", req.headers["x-tmon-nonce"] || "", req.headers["x-tmon-signature"] || "",
+        req.headers["x-tmon-device"] || "", req.headers["x-tmon-config-version"] || "",
+        req.headers["x-tmon-body-sha256"] || "", rawBuf,
+        cache, cfg.security.max_timestamp_skew_seconds,
+      );
+    } catch (e) { logger.info(`auth rejected ${signedPath}: ${e.message}`); return finishErr(401, "unauthorized"); }
+    const raw = rawBuf.toString("utf8");
     // Canonical body handling shared with the Go/Python brokers: an empty
     // (or whitespace-only) body is a no-op; anything present must be a single
     // JSON object; null / arrays / scalars are rejected.
