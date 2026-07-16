@@ -302,24 +302,45 @@ export class CodexFetcher {
     const doc = await readJSON(resp);
 
     const snap = emptySnapshot();
-    snap.session_window_seconds = CODEX_SESSION_FALLBACK;
-    snap.weekly_window_seconds = CODEX_WEEKLY_FALLBACK;
     snap.tier = String(doc.plan_type || "unknown");
     const rl = doc.rate_limit || {};
     const primary = rl.primary_window;
     const secondary = rl.secondary_window;
+
+    // As of 2026-07 OpenAI collapsed Codex to a SINGLE weekly limit:
+    // primary_window.limit_window_seconds is now 7d and secondary_window is
+    // null. When secondary is absent we render Codex weekly-only (like
+    // Antigravity): hide the session card and surface primary as the Weekly
+    // bucket. The legacy two-window path (primary=Session ~5h, secondary=Weekly
+    // 7d) is kept for any account/plan that still returns both windows.
+    if (!secondary || typeof secondary !== "object") {
+      snap.session_window_seconds = 0;
+      snap.weekly_window_seconds = CODEX_WEEKLY_FALLBACK;
+      if (primary && typeof primary === "object") {
+        snap.weekly_pct = Number(primary.used_percent || 0);
+        const lim = Number(primary.limit_window_seconds);
+        if (Number.isFinite(lim) && lim > 0) snap.weekly_window_seconds = lim;
+        snap.weekly_reset_eta_seconds = codexEta(primary);
+      }
+      snap.slots = [
+        { label: "Weekly", pct: snap.weekly_pct, window_seconds: snap.weekly_window_seconds, reset_eta_seconds: snap.weekly_reset_eta_seconds },
+      ];
+      return snap;
+    }
+
+    // Legacy two-window model.
+    snap.session_window_seconds = CODEX_SESSION_FALLBACK;
+    snap.weekly_window_seconds = CODEX_WEEKLY_FALLBACK;
     if (primary && typeof primary === "object") {
       snap.session_pct = Number(primary.used_percent || 0);
       const lim = Number(primary.limit_window_seconds);
       if (Number.isFinite(lim) && lim > 0) snap.session_window_seconds = lim;
       snap.session_reset_eta_seconds = codexEta(primary);
     }
-    if (secondary && typeof secondary === "object") {
-      snap.weekly_pct = Number(secondary.used_percent || 0);
-      const lim = Number(secondary.limit_window_seconds);
-      if (Number.isFinite(lim) && lim > 0) snap.weekly_window_seconds = lim;
-      snap.weekly_reset_eta_seconds = codexEta(secondary);
-    }
+    snap.weekly_pct = Number(secondary.used_percent || 0);
+    const lim = Number(secondary.limit_window_seconds);
+    if (Number.isFinite(lim) && lim > 0) snap.weekly_window_seconds = lim;
+    snap.weekly_reset_eta_seconds = codexEta(secondary);
     // Unified slots layout (Session / Weekly); Codex has no third bucket.
     snap.slots = sessionWeeklySlots(snap);
     return snap;

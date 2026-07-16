@@ -388,26 +388,46 @@ class CodexFetcher:
         except aiohttp.ClientError as e:
             raise Transport(str(e)) from e
 
-        snap = Snapshot(
-            session_window_seconds=CODEX_SESSION_FALLBACK,
-            weekly_window_seconds=CODEX_WEEKLY_FALLBACK,
-            tier=str(doc.get("plan_type") or "unknown"),
-        )
+        snap = Snapshot(tier=str(doc.get("plan_type") or "unknown"))
         rl = doc.get("rate_limit") or {}
-        primary = rl.get("primary_window") or {}
-        secondary = rl.get("secondary_window") or {}
+        primary = rl.get("primary_window")
+        secondary = rl.get("secondary_window")
+
+        # As of 2026-07 OpenAI collapsed Codex to a SINGLE weekly limit:
+        # primary_window.limit_window_seconds is now 7d and secondary_window is
+        # null. When secondary is absent we render Codex weekly-only (like
+        # Antigravity): hide the session card and surface primary as the Weekly
+        # bucket. The legacy two-window path (primary=Session ~5h,
+        # secondary=Weekly 7d) is kept for any account/plan that still returns
+        # both windows.
+        if not isinstance(secondary, dict):
+            snap.session_window_seconds = 0
+            snap.weekly_window_seconds = CODEX_WEEKLY_FALLBACK
+            if isinstance(primary, dict):
+                snap.weekly_pct = float(primary.get("used_percent") or 0)
+                lim = primary.get("limit_window_seconds")
+                if isinstance(lim, (int, float)) and lim > 0:
+                    snap.weekly_window_seconds = int(lim)
+                snap.weekly_reset_eta_seconds = _codex_eta(primary)
+            snap.slots = [
+                Slot("Weekly", snap.weekly_pct, snap.weekly_window_seconds, snap.weekly_reset_eta_seconds)
+            ]
+            return snap
+
+        # Legacy two-window model.
+        snap.session_window_seconds = CODEX_SESSION_FALLBACK
+        snap.weekly_window_seconds = CODEX_WEEKLY_FALLBACK
         if isinstance(primary, dict):
             snap.session_pct = float(primary.get("used_percent") or 0)
             lim = primary.get("limit_window_seconds")
             if isinstance(lim, (int, float)) and lim > 0:
                 snap.session_window_seconds = int(lim)
             snap.session_reset_eta_seconds = _codex_eta(primary)
-        if isinstance(secondary, dict):
-            snap.weekly_pct = float(secondary.get("used_percent") or 0)
-            lim = secondary.get("limit_window_seconds")
-            if isinstance(lim, (int, float)) and lim > 0:
-                snap.weekly_window_seconds = int(lim)
-            snap.weekly_reset_eta_seconds = _codex_eta(secondary)
+        snap.weekly_pct = float(secondary.get("used_percent") or 0)
+        lim = secondary.get("limit_window_seconds")
+        if isinstance(lim, (int, float)) and lim > 0:
+            snap.weekly_window_seconds = int(lim)
+        snap.weekly_reset_eta_seconds = _codex_eta(secondary)
         # Unified slots layout (Session / Weekly); Codex has no third bucket.
         snap.slots = _session_weekly_slots(snap)
         return snap

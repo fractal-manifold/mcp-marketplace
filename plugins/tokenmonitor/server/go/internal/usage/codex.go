@@ -119,12 +119,45 @@ type codexWindow struct {
 }
 
 func codexMap(d codexUsageDoc) Snapshot {
-	snap := Snapshot{
-		SessionWindowSeconds: codexSessionWindowFallback,
-		WeeklyWindowSeconds:  codexWeeklyWindowFallback,
-		Tier:                 d.PlanType,
+	snap := Snapshot{Tier: d.PlanType}
+	if snap.Tier == "" {
+		snap.Tier = "unknown"
 	}
-	if w := d.RateLimit.PrimaryWindow; w != nil {
+	primary := d.RateLimit.PrimaryWindow
+	secondary := d.RateLimit.SecondaryWindow
+
+	// As of 2026-07 OpenAI collapsed Codex to a SINGLE weekly limit:
+	// primary_window.limit_window_seconds is now 7d and secondary_window is
+	// null. When secondary is absent we render Codex weekly-only (like
+	// Antigravity): hide the session card (SessionWindowSeconds=0) and surface
+	// primary as the Weekly bucket. The legacy two-window path (primary=Session
+	// ~5h, secondary=Weekly 7d) is kept for any account/plan that still returns
+	// both windows.
+	if secondary == nil {
+		snap.SessionWindowSeconds = 0
+		snap.WeeklyWindowSeconds = codexWeeklyWindowFallback
+		if w := primary; w != nil {
+			if w.UsedPercent != nil {
+				snap.WeeklyPct = *w.UsedPercent
+			}
+			if w.LimitWindowSeconds != nil && *w.LimitWindowSeconds > 0 {
+				snap.WeeklyWindowSeconds = *w.LimitWindowSeconds
+			}
+			snap.WeeklyResetETASeconds = codexResetETA(w)
+		}
+		snap.Slots = []Slot{{
+			Label:           "Weekly",
+			Pct:             snap.WeeklyPct,
+			WindowSeconds:   snap.WeeklyWindowSeconds,
+			ResetETASeconds: snap.WeeklyResetETASeconds,
+		}}
+		return snap
+	}
+
+	// Legacy two-window model.
+	snap.SessionWindowSeconds = codexSessionWindowFallback
+	snap.WeeklyWindowSeconds = codexWeeklyWindowFallback
+	if w := primary; w != nil {
 		if w.UsedPercent != nil {
 			snap.SessionPct = *w.UsedPercent
 		}
@@ -133,7 +166,7 @@ func codexMap(d codexUsageDoc) Snapshot {
 		}
 		snap.SessionResetETASeconds = codexResetETA(w)
 	}
-	if w := d.RateLimit.SecondaryWindow; w != nil {
+	if w := secondary; w != nil {
 		if w.UsedPercent != nil {
 			snap.WeeklyPct = *w.UsedPercent
 		}
@@ -141,9 +174,6 @@ func codexMap(d codexUsageDoc) Snapshot {
 			snap.WeeklyWindowSeconds = *w.LimitWindowSeconds
 		}
 		snap.WeeklyResetETASeconds = codexResetETA(w)
-	}
-	if snap.Tier == "" {
-		snap.Tier = "unknown"
 	}
 	// Unified slots layout (Session / Weekly) so the device renders
 	// broker-labelled cards; Codex has no third bucket. See sessionWeeklySlots.

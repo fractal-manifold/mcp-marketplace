@@ -81,8 +81,11 @@ func TestLiveCodex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Codex live fetch failed (URL or schema may have drifted): %v", err)
 	}
-	if snap.SessionWindowSeconds == 0 || snap.WeeklyWindowSeconds == 0 {
-		t.Errorf("expected non-zero window seconds, snapshot=%+v", snap)
+	// Since 2026-07 OpenAI serves a single weekly window (session hidden →
+	// SessionWindowSeconds==0). Only the weekly window must be non-zero; a
+	// legacy account that still returns both windows also satisfies this.
+	if snap.WeeklyWindowSeconds == 0 {
+		t.Errorf("expected non-zero weekly window seconds, snapshot=%+v", snap)
 	}
 	if snap.SessionPct < 0 || snap.SessionPct > 100 {
 		t.Errorf("session_pct out of range: %v", snap.SessionPct)
