@@ -182,7 +182,16 @@ ensure_js() {
     _verdir="$cache_root/$(bundle_version)"
     _rt="$_verdir/js"
     _ready="$_rt/.tmon-ready"
+    _js_unavail="$_verdir/.js-unavailable"
     mkdir -p "$_verdir"
+    # Skip js fast if a prior run already proved this version's native deps
+    # can't be built here (e.g. fs-ext won't compile on a very new node ABI):
+    # no point re-running npm install on every spawn just to fall through
+    # again. The marker is per-version, so a version bump re-attempts js.
+    if [ -f "$_js_unavail" ] && [ ! -f "$_ready" ]; then
+        log "js: skipped (native deps unbuildable for this version; using another runtime)"
+        return 1
+    fi
     if needs_setup "$_ready" "$script_dir/js"; then
         acquire_lock "$_verdir/.lock-js" || return 1
         if needs_setup "$_ready" "$script_dir/js"; then
@@ -201,10 +210,12 @@ ensure_js() {
                     ( cd "$_rt" && npm rebuild fs-ext --loglevel=error ) 1>&2 || true
                 fi
                 if [ ! -f "$_rt/node_modules/fs-ext/build/Release/fs_ext.node" ]; then
+                    : > "$_js_unavail"
                     release_lock "$_verdir/.lock-js"
                     log "js: fs-ext failed to build — per-device auth unavailable; falling back to another runtime"
                     return 1
                 fi
+                rm -f "$_js_unavail"
                 : > "$_ready"
             else
                 release_lock "$_verdir/.lock-js"
