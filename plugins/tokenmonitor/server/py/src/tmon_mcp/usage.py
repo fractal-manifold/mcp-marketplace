@@ -157,6 +157,7 @@ class Cache:
         self._fetchers = fetchers
         self._entries: dict[str, _Entry] = {}
         self._inflight: dict[str, asyncio.Task[Snapshot]] = {}
+        self._cooldowns: dict[str, float] = {}  # provider -> until (429 back-off)
         self._lock = asyncio.Lock()
         self._now: Callable[[], float] = time.time
 
@@ -182,6 +183,19 @@ class Cache:
                 snap = Snapshot(**asdict(entry.snap))
                 snap.stale_seconds = int(now - entry.fetched)
                 return snap
+
+            # 429 back-off: while upstream told us to wait (Retry-After), do
+            # NOT re-hit it on every poll — that is what turns a transient
+            # rate-limit into a persistent one. Serve the last snapshot
+            # stale-200 if we have one, else surface RateLimited with the
+            # remaining wait.
+            until = self._cooldowns.get(provider)
+            if until is not None and now < until:
+                if entry is not None:
+                    snap = Snapshot(**asdict(entry.snap))
+                    snap.stale_seconds = int(now - entry.fetched)
+                    return snap
+                raise RateLimited(int(until - now) + 1)
 
             task = self._inflight.get(provider)
             if task is None:
@@ -211,6 +225,7 @@ class Cache:
             snap.stale_seconds = 0
             async with self._lock:
                 self._entries[provider] = _Entry(snap=snap, fetched=now)
+                self._cooldowns.pop(provider, None)
                 self._inflight.pop(provider, None)
             return snap
         except Exception as e:
@@ -218,6 +233,11 @@ class Cache:
                 entry = self._entries.get(provider)
                 if entry is not None:
                     entry.last_err = e
+                if isinstance(e, RateLimited):
+                    # Honor Retry-After (clamped to [60s, 1h]); default 60s
+                    # when the upstream gave no hint.
+                    secs = min(e.retry_after, 3600) if e.retry_after > 0 else 60
+                    self._cooldowns[provider] = self._now() + secs
                 self._inflight.pop(provider, None)
             raise
 

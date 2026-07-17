@@ -118,6 +118,103 @@ func TestCache_ReturnsStaleOnError(t *testing.T) {
 	}
 }
 
+func TestCache_RateLimitBackoff_ColdSuppresses(t *testing.T) {
+	// A cold 429 must not be re-hit on every poll: after the first attempt
+	// the cache serves RateLimited from the cooldown until Retry-After
+	// elapses, then allows exactly one fresh attempt.
+	stub := &stubFetcher{err: &RateLimitedError{RetryAfter: 600 * time.Second}}
+	c := NewCache(30*time.Second, map[string]Fetcher{"x": stub})
+	now := time.Unix(1000, 0)
+	c.now = func() time.Time { return now }
+
+	if _, err := c.Get(context.Background(), "x"); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("expected ErrRateLimited, got %v", err)
+	}
+	if stub.calls != 1 {
+		t.Fatalf("calls: %d", stub.calls)
+	}
+	now = now.Add(30 * time.Second)
+	if _, err := c.Get(context.Background(), "x"); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("expected ErrRateLimited in cooldown, got %v", err)
+	}
+	now = now.Add(300 * time.Second)
+	c.Get(context.Background(), "x")
+	if stub.calls != 1 {
+		t.Fatalf("must not re-hit upstream during cooldown, got %d calls", stub.calls)
+	}
+	now = now.Add(600 * time.Second)
+	c.Get(context.Background(), "x")
+	if stub.calls != 2 {
+		t.Fatalf("expected one fresh attempt after window, got %d calls", stub.calls)
+	}
+}
+
+func TestCache_RateLimitBackoff_ServesStale(t *testing.T) {
+	stub := &stubFetcher{snap: Snapshot{SessionPct: 42}}
+	c := NewCache(30*time.Second, map[string]Fetcher{"x": stub})
+	now := time.Unix(1000, 0)
+	c.now = func() time.Time { return now }
+
+	if got, _ := c.Get(context.Background(), "x"); got.SessionPct != 42 {
+		t.Fatalf("first: got %v", got.SessionPct)
+	}
+	now = now.Add(31 * time.Second)
+	stub.err = &RateLimitedError{RetryAfter: 600 * time.Second}
+	got, err := c.Get(context.Background(), "x")
+	if !errors.Is(err, ErrRateLimited) || got.SessionPct != 42 {
+		t.Fatalf("stale-with-error: got %v err %v", got.SessionPct, err)
+	}
+	if stub.calls != 2 {
+		t.Fatalf("calls: %d", stub.calls)
+	}
+	now = now.Add(5 * time.Second)
+	got, err = c.Get(context.Background(), "x")
+	if err != nil || got.SessionPct != 42 {
+		t.Fatalf("cooldown stale-200: got %v err %v", got.SessionPct, err)
+	}
+	if stub.calls != 2 {
+		t.Fatalf("must not re-hit upstream during cooldown, got %d calls", stub.calls)
+	}
+}
+
+func TestCache_RateLimitBackoff_SuccessClears(t *testing.T) {
+	stub := &stubFetcher{err: &RateLimitedError{RetryAfter: 600 * time.Second}}
+	c := NewCache(30*time.Second, map[string]Fetcher{"x": stub})
+	now := time.Unix(1000, 0)
+	c.now = func() time.Time { return now }
+
+	if _, err := c.Get(context.Background(), "x"); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("expected ErrRateLimited, got %v", err)
+	}
+	now = now.Add(601 * time.Second)
+	stub.err = nil
+	stub.snap = Snapshot{SessionPct: 7}
+	got, err := c.Get(context.Background(), "x")
+	if err != nil || got.SessionPct != 7 {
+		t.Fatalf("recovery: got %v err %v", got.SessionPct, err)
+	}
+	if stub.calls != 2 {
+		t.Fatalf("calls: %d", stub.calls)
+	}
+}
+
+func TestCache_PlainUpstreamErrorNoCooldown(t *testing.T) {
+	stub := &stubFetcher{snap: Snapshot{SessionPct: 11}}
+	c := NewCache(1*time.Second, map[string]Fetcher{"x": stub})
+	now := time.Unix(1000, 0)
+	c.now = func() time.Time { return now }
+
+	c.Get(context.Background(), "x")
+	stub.err = ErrUpstream
+	now = now.Add(2 * time.Second)
+	c.Get(context.Background(), "x")
+	now = now.Add(2 * time.Second)
+	c.Get(context.Background(), "x")
+	if stub.calls != 3 {
+		t.Fatalf("plain upstream error must not arm cooldown, got %d calls", stub.calls)
+	}
+}
+
 func TestCache_UnknownProvider(t *testing.T) {
 	c := NewCache(time.Minute, map[string]Fetcher{"x": &stubFetcher{}})
 	_, err := c.Get(context.Background(), "y")

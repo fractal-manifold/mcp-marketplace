@@ -220,6 +220,7 @@ func handleProvision(d Deps) server.ToolHandlerFunc {
 		brokerURL := strings.TrimSpace(req.GetString("broker_url", ""))
 		pskHex := strings.ToLower(strings.TrimSpace(req.GetString("psk_hex", "")))
 		pskGenerated := false
+		pskReused := false
 		if pskHex != "" {
 			if len(pskHex) != 64 {
 				return mcp.NewToolResultError("psk_hex must be 64 hex chars"), nil
@@ -228,18 +229,31 @@ func handleProvision(d Deps) server.ToolHandlerFunc {
 				return mcp.NewToolResultError("psk_hex is not valid hex"), nil
 			}
 		} else if brokerURL != "" {
-			// No PSK supplied for a full provision — generate one. The
-			// user never has to memorise a passphrase or pick a key:
-			// pairing-code physical-presence proof + a fresh 32-byte
-			// random PSK is strictly stronger than the old
-			// SHA-256(passphrase) derivation, and the secret stays
-			// machine-only (broker registry + device NVS).
-			b := make([]byte, 32)
-			if _, err := rand.Read(b); err != nil {
-				return mcp.NewToolResultErrorFromErr("psk gen", err), nil
+			// No PSK supplied. If this device already has an active PSK in
+			// the registry (a benign re-provision — not a fresh device),
+			// REUSE it and re-push it so the two never drift: rotating the
+			// key on every reconfigure risks desyncing a device whose push
+			// silently fails. Only a genuinely new device mints a fresh
+			// 32-byte random PSK — strictly stronger than the old
+			// SHA-256(passphrase) derivation, secret staying machine-only
+			// (broker registry + device NVS).
+			existing := ""
+			if d.Registry != nil {
+				if dev, err := d.Registry.Load(deviceID); err == nil && dev != nil {
+					existing = dev.Active.PSKHex
+				}
 			}
-			pskHex = hex.EncodeToString(b)
-			pskGenerated = true
+			if existing != "" {
+				pskHex = existing
+				pskReused = true
+			} else {
+				b := make([]byte, 32)
+				if _, err := rand.Read(b); err != nil {
+					return mcp.NewToolResultErrorFromErr("psk gen", err), nil
+				}
+				pskHex = hex.EncodeToString(b)
+				pskGenerated = true
+			}
 		}
 
 		payload := provisionPayload{
@@ -401,6 +415,7 @@ func handleProvision(d Deps) server.ToolHandlerFunc {
 			Registered   bool   `json:"registered"`
 			Reregistered bool   `json:"reregistered,omitempty"`
 			PSKGenerated bool   `json:"psk_generated,omitempty"`
+			PSKReused    bool   `json:"psk_reused,omitempty"`
 			Note         string `json:"note,omitempty"`
 			DeviceResp   any    `json:"device_response,omitempty"`
 		}{
@@ -409,6 +424,7 @@ func handleProvision(d Deps) server.ToolHandlerFunc {
 			Registered:   registered,
 			Reregistered: reregistered,
 			PSKGenerated: pskGenerated,
+			PSKReused:    pskReused,
 		}
 		if registryErr != nil {
 			out.Note = "device provisioned but registry write failed: " + registryErr.Error()

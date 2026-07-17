@@ -81,6 +81,7 @@ export class Cache {
     this.fetchers = fetchers;            // { [provider]: { fetch(): Promise<Snapshot> } }
     this.entries = new Map();            // provider -> { snap, fetched }
     this.inflight = new Map();           // provider -> Promise<Snapshot>
+    this.cooldowns = new Map();          // provider -> { until }  (429 back-off)
     this.now = () => Date.now();
   }
 
@@ -103,6 +104,17 @@ export class Cache {
     if (entry && now - entry.fetched < this.ttlMs) {
       const snap = { ...entry.snap, stale_seconds: Math.floor((now - entry.fetched) / 1000) };
       return snap;
+    }
+    // 429 back-off: while upstream told us to wait (Retry-After), do NOT
+    // re-hit it on every poll — that is what turns a transient rate-limit
+    // into a persistent one. Serve the last snapshot stale-200 if we have
+    // one, else surface RateLimited with the remaining wait.
+    const cd = this.cooldowns.get(provider);
+    if (cd && now < cd.until) {
+      if (entry) {
+        return { ...entry.snap, stale_seconds: Math.floor((now - entry.fetched) / 1000) };
+      }
+      throw new RateLimited(Math.ceil((cd.until - now) / 1000));
     }
     let pending = this.inflight.get(provider);
     if (!pending) {
@@ -130,7 +142,16 @@ export class Cache {
       snap.fetched_at_unix = Math.floor(now / 1000);
       snap.stale_seconds = 0;
       this.entries.set(provider, { snap, fetched: now });
+      this.cooldowns.delete(provider);
       return snap;
+    } catch (e) {
+      if (e instanceof RateLimited) {
+        // Honor Retry-After (clamped to [60s, 1h]); default 60s when the
+        // upstream gave no hint.
+        const secs = e.retryAfter > 0 ? Math.min(e.retryAfter, 3600) : 60;
+        this.cooldowns.set(provider, { until: this.now() + secs * 1000 });
+      }
+      throw e;
     } finally {
       this.inflight.delete(provider);
     }

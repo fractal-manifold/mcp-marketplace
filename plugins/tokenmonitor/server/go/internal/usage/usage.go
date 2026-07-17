@@ -144,6 +144,7 @@ type Cache struct {
 	fetchers  map[string]Fetcher
 	mu        sync.Mutex
 	entries   map[string]entry
+	cooldowns map[string]time.Time   // provider -> until (429 back-off)
 	inFlights map[string]chan result // per-provider singleflight
 	// results holds the outcome of the most recent in-flight fetch per
 	// provider, published just before its channel is closed. Closing a
@@ -172,6 +173,7 @@ func NewCache(ttl time.Duration, fetchers map[string]Fetcher) *Cache {
 		now:       time.Now,
 		fetchers:  fetchers,
 		entries:   make(map[string]entry, len(fetchers)),
+		cooldowns: make(map[string]time.Time),
 		inFlights: make(map[string]chan result),
 		results:   make(map[string]result),
 	}
@@ -196,6 +198,22 @@ func (c *Cache) Get(ctx context.Context, provider string) (Snapshot, error) {
 		snap.StaleSeconds = uint32(c.now().Sub(e.fetched) / time.Second)
 		c.mu.Unlock()
 		return snap, nil
+	}
+
+	// 429 back-off: while upstream told us to wait (Retry-After), do NOT
+	// re-hit it on every poll — that is what turns a transient rate-limit
+	// into a persistent one. Serve the last snapshot stale-200 if we have
+	// one, else surface RateLimited with the remaining wait.
+	if until, ok := c.cooldowns[provider]; ok && c.now().Before(until) {
+		if hadValue {
+			snap := e.snap
+			snap.StaleSeconds = uint32(c.now().Sub(e.fetched) / time.Second)
+			c.mu.Unlock()
+			return snap, nil
+		}
+		remaining := until.Sub(c.now())
+		c.mu.Unlock()
+		return Snapshot{}, &RateLimitedError{RetryAfter: remaining}
 	}
 
 	// Singleflight: if a fetch for this provider is already in flight,
@@ -230,6 +248,7 @@ func (c *Cache) Get(ctx context.Context, provider string) (Snapshot, error) {
 		snap.FetchedAtUnix = now.Unix()
 		snap.StaleSeconds = 0
 		c.entries[provider] = entry{snap: snap, fetched: now, hasValue: true}
+		delete(c.cooldowns, provider)
 		res = result{snap: snap}
 	} else if hadValue {
 		// Return the previous good value with bumped stale_seconds AND
@@ -245,6 +264,20 @@ func (c *Cache) Get(ctx context.Context, provider string) (Snapshot, error) {
 		res = result{snap: stale, err: err}
 	} else {
 		res = result{snap: snap, err: err}
+	}
+	// Arm the 429 back-off. Honor Retry-After (clamped to [.., 1h]); default
+	// 60s when upstream gave no hint.
+	if err != nil {
+		var rl *RateLimitedError
+		if errors.As(err, &rl) {
+			d := rl.RetryAfter
+			if d <= 0 {
+				d = 60 * time.Second
+			} else if d > time.Hour {
+				d = time.Hour
+			}
+			c.cooldowns[provider] = now.Add(d)
+		}
 	}
 	c.results[provider] = res
 	c.mu.Unlock()

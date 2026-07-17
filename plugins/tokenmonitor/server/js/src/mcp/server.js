@@ -667,16 +667,29 @@ async function provisionTool(deps, args) {
   const brokerURL = String(args.broker_url || "").trim();
   let pskHex = String(args.psk_hex || "").trim().toLowerCase();
   let pskGenerated = false;
+  let pskReused = false;
   if (pskHex) {
     if (pskHex.length !== 64) return { error: "psk_hex must be 64 hex chars" };
     if (!/^[0-9a-fA-F]{64}$/.test(pskHex)) return { error: "psk_hex is not valid hex" };
   } else if (brokerURL) {
-    // No PSK supplied — generate one. 32 crypto-random bytes; the user
-    // never has to memorise a passphrase, and the secret stays on the
-    // broker registry + device NVS only.
-    const { randomBytes } = await import("node:crypto");
-    pskHex = randomBytes(32).toString("hex");
-    pskGenerated = true;
+    // No PSK supplied. If this device already has an active PSK in the
+    // registry (a benign re-provision — not a fresh device), REUSE it and
+    // re-push it so the two never drift: rotating the key on every
+    // reconfigure risks desyncing a device whose push silently fails.
+    // Only a genuinely new device mints a fresh 32-byte random PSK.
+    let existing = "";
+    if (deps.registry) {
+      try { existing = deps.registry.load(deviceID)?.active?.payload?.psk_hex || ""; }
+      catch { /* NotFound → new device */ }
+    }
+    if (existing) {
+      pskHex = existing;
+      pskReused = true;
+    } else {
+      const { randomBytes } = await import("node:crypto");
+      pskHex = randomBytes(32).toString("hex");
+      pskGenerated = true;
+    }
   }
   const payload = { pairing_code: code };
   if (brokerURL) payload.broker_url = brokerURL;
@@ -734,6 +747,7 @@ async function provisionTool(deps, args) {
   try { deviceResp = JSON.parse(respText); } catch { deviceResp = respText; }
   const out = { ok: true, device_id: deviceID, registered: false, device_response: deviceResp };
   if (pskGenerated) out.psk_generated = true;
+  if (pskReused) out.psk_reused = true;
   if (deps.registry && brokerURL && pskHex) {
     const regModes = payload.providers
       ? { claude: providerModeFromBool(!!payload.providers.claude), codex: providerModeFromBool(!!payload.providers.codex), gemini: providerModeFromBool(!!payload.providers.gemini) }

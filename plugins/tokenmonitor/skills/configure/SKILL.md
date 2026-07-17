@@ -79,12 +79,16 @@ Resolve only the broker URL before asking the user anything else:
   `~/.config/tokenmonitor/tokenmonitor.toml` (`[server] bind =
   "0.0.0.0"`) and restart the broker. (The legacy `service.toml` is
   still read for back-compat, but `tokenmonitor.toml` is the primary config.)
-- **psk_hex** — DO NOT ask the user. The broker auto-generates a fresh
-  32-byte random PSK on every `tokenmonitor_provision` call where
-  `psk_hex` is omitted (recommended). The PSK lives on the broker
-  registry + device NVS only; the user never has to memorise or pick
-  one. Pass `psk_hex` only if reproducing a known key (e.g. migrating
-  a device between brokers).
+- **psk_hex** — DO NOT ask the user. When `psk_hex` is omitted
+  (recommended), the broker mints a fresh 32-byte random PSK **only for a
+  device it has never seen**. Re-running provision on a device already in
+  the registry **reuses its existing PSK** (and re-pushes it) rather than
+  rotating the key — so a benign reconfigure can't desync a working device
+  whose push silently fails. The response echoes `psk_generated: true`
+  (new device) or `psk_reused: true` (existing device). The PSK lives on
+  the broker registry + device NVS only; the user never has to memorise or
+  pick one. Pass `psk_hex` explicitly only to force a specific key (e.g.
+  migrating a device between brokers or a deliberate rotation).
 - **city** — **ASK the user** for their city during setup (it drives the
   ambient weather widget). Pose a short free-text question, e.g. "¿En qué
   ciudad está el dispositivo? (para el tiempo en pantalla)". The user may
@@ -185,7 +189,9 @@ them so the device defaults stand). Expected return on success:
 ```
 
 `psk_generated: true` confirms the broker created a fresh random PSK
-and stored it in the registry; nothing else is needed from the user.
+and stored it in the registry; `psk_reused: true` instead means this
+device was already registered and kept its existing PSK (a re-run that
+did not rotate the key). Either way nothing else is needed from the user.
 
 If `registered` is false and `note` is present, tell the user the
 device was provisioned but the local registry write failed (rare; e.g.

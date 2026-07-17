@@ -191,6 +191,20 @@ ensure_js() {
             cp -R "$script_dir/js" "$_rt"
             log "installing JS deps (first run, ~once per version) in $_rt"
             if ( cd "$_rt" && npm install --omit=dev --no-audit --no-fund --loglevel=error ) 1>&2; then
+                # fs-ext is a native module (flock(2)); per-device auth is
+                # DISABLED without its compiled .node — and every device on a
+                # per-device PSK then fails with "bad signature". On very new
+                # node ABIs `npm install` can leave it uncompiled without
+                # failing, so verify and explicitly rebuild.
+                if [ ! -f "$_rt/node_modules/fs-ext/build/Release/fs_ext.node" ]; then
+                    log "js: fs-ext native module not built; rebuilding (required for per-device auth)"
+                    ( cd "$_rt" && npm rebuild fs-ext --loglevel=error ) 1>&2 || true
+                fi
+                if [ ! -f "$_rt/node_modules/fs-ext/build/Release/fs_ext.node" ]; then
+                    release_lock "$_verdir/.lock-js"
+                    log "js: fs-ext failed to build — per-device auth unavailable; falling back to another runtime"
+                    return 1
+                fi
                 : > "$_ready"
             else
                 release_lock "$_verdir/.lock-js"

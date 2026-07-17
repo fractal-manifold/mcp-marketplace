@@ -71,7 +71,19 @@ function buildLogger(buf, level) {
 
 function openRegistry(logger) {
   try { return new Registry(devicesPath()); }
-  catch (e) { logger.warn(`registry: ${e.message} (per-device control plane disabled)`); return null; }
+  catch (e) {
+    if (/flock/.test(e.message)) {
+      // fs-ext native module missing/uncompiled. This is a deployment bug,
+      // not a normal "no devices yet" state (the dir is auto-created). Do
+      // NOT downgrade quietly: without per-device PSKs every device on a
+      // per-device key authenticates against the global PSK and is REJECTED
+      // (bad signature). Make it loud and actionable.
+      logger.error(`registry: ${e.message} — per-device auth DISABLED; devices on a per-device PSK will be REJECTED (bad signature). Fix: rebuild js deps (npm rebuild fs-ext in the runtime dir) or run the py/go runtime.`);
+    } else {
+      logger.warn(`registry: ${e.message} (per-device control plane disabled)`);
+    }
+    return null;
+  }
 }
 
 function runOnce(cfg) {

@@ -877,6 +877,7 @@ async def _provision(deps: Deps, args: dict) -> dict:
     broker_url = (args.get("broker_url") or "").strip()
     psk_hex = (args.get("psk_hex") or "").strip().lower()
     psk_generated = False
+    psk_reused = False
     if psk_hex:
         if len(psk_hex) != 64:
             return {"error": "psk_hex must be 64 hex chars"}
@@ -885,12 +886,24 @@ async def _provision(deps: Deps, args: dict) -> dict:
         except ValueError:
             return {"error": "psk_hex is not valid hex"}
     elif broker_url:
-        # No PSK supplied — generate one. crypto-strong 32 bytes; the user
-        # never has to memorise a passphrase, and the secret stays on the
-        # broker registry + device NVS only.
-        import secrets
-        psk_hex = secrets.token_hex(32)
-        psk_generated = True
+        # No PSK supplied. If this device already has an active PSK in the
+        # registry (a benign re-provision — not a fresh device), REUSE it and
+        # re-push it so the two never drift: rotating the key on every
+        # reconfigure risks desyncing a device whose push silently fails.
+        # Only a genuinely new device mints a fresh 32-byte random PSK.
+        existing = ""
+        if deps.registry is not None:
+            try:
+                existing = deps.registry.load(device_id).active.payload.psk_hex or ""
+            except Exception:
+                existing = ""  # NotFound → new device
+        if existing:
+            psk_hex = existing
+            psk_reused = True
+        else:
+            import secrets
+            psk_hex = secrets.token_hex(32)
+            psk_generated = True
 
     payload: dict[str, Any] = {"pairing_code": code}
     if broker_url:
@@ -944,6 +957,8 @@ async def _provision(deps: Deps, args: dict) -> dict:
     out: dict[str, Any] = {"ok": True, "device_id": device_id, "registered": False, "device_response": device_resp}
     if psk_generated:
         out["psk_generated"] = True
+    if psk_reused:
+        out["psk_reused"] = True
     if deps.registry is not None and broker_url and psk_hex:
         reg_payload = ConfigPayload(broker_url=broker_url, psk_hex=psk_hex, city=payload.get("city", ""))
         for k in ("br_day", "br_night", "vol"):
