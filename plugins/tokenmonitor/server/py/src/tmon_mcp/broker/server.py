@@ -128,8 +128,11 @@ def make_app(
     app.router.add_post("/device/{device_id}/settings", _handle_device_settings)
     app.router.add_get("/usage/{provider}", _handle_usage)
     app.router.add_get("/spend/{provider}", _handle_spend)
+    # add_get registers HEAD too (allow_head=True by default), routed to the
+    # same handler — FileResponse serves HEAD (headers only) correctly. A
+    # separate add_head() would double-register HEAD on the resource and
+    # raise "method HEAD is already registered" on modern aiohttp.
     app.router.add_get("/firmware/{name}", _handle_firmware)
-    app.router.add_head("/firmware/{name}", _handle_firmware)
     # Catch-all: a "*" route shadows aiohttp's own 405, so distinguish a wrong
     # method on a KNOWN path (405) from an unknown path (404) manually, keeping
     # the JSON error shape. Matches the Go/JS routers.
