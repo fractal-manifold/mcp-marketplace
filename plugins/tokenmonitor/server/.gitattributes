@@ -1,0 +1,8 @@
+# SHA256SUMS is the trust root the launcher verifies prebuilt downloads
+# against — keep it LF-only so hashes match byte-for-byte on every platform
+# (a CRLF checkout would break `awk`/`sha256sum` line parsing on the value).
+bin/SHA256SUMS text eol=lf
+
+# Any prebuilt Go binary that ends up here locally is a binary blob (it is
+# git-ignored and never committed, but guard against accidental text munging).
+bin/tokenmonitor-mcp-go-* binary

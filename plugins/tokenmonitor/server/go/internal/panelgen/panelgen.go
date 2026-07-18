@@ -26,7 +26,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/config"
@@ -252,7 +251,8 @@ func (m *Manager) runOnce(ctx context.Context, id string, argv []string) (time.D
 	cmd := exec.Command(argv[0], argv[1:]...)
 	// Own process group so we can signal the child AND any grandchildren it
 	// spawns, and so a Ctrl-C to the broker's own group doesn't hit it twice.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// The per-OS SysProcAttr lives in proc_{unix,windows}.go.
+	setSysProcAttr(cmd)
 	cmd.Env = append(os.Environ(),
 		"TMON_DEVICE_ID="+id,
 		"TMON_PANEL_PATH="+m.targetPath(id),
@@ -287,12 +287,12 @@ func (m *Manager) runOnce(ctx context.Context, id string, argv []string) (time.D
 // ignored (or never received) the SIGTERM — killpg on an already-empty group
 // is a harmless ESRCH.
 func (m *Manager) terminate(pid int, waitCh <-chan error) {
-	_ = syscall.Kill(-pid, syscall.SIGTERM)
+	signalGroupTerm(pid)
 	select {
 	case <-waitCh:
-		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		signalGroupKill(pid)
 	case <-time.After(m.termGrace):
-		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		signalGroupKill(pid)
 		<-waitCh
 	}
 }

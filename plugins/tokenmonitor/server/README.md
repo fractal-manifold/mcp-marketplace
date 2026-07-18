@@ -9,10 +9,11 @@ Layout:
 
 ```
 server/
-  tokenmonitor-mcp                  bundle-mode launcher (POSIX sh); .mcp.json execs this
+  tokenmonitor-mcp         bundle-mode launcher (POSIX sh); .mcp.json execs this
   install.sh               optional standalone PATH-mode installer
-  VERSION                  vendored copy of the monorepo-root VERSION (see below)
+  VERSION                  canonical broker version axis (NOT vendored; see below)
   compat/tool-schemas.json vendored copy of the monorepo compat/ (see below)
+  bin/SHA256SUMS           trust root for fetched prebuilt Go binaries (see below)
   js/                      Node.js runtime (src/ + test/)
   py/                      Python runtime (src/ + tests/)
   go/                      Go runtime (cmd/ internal/ go.mod … + *_test.go)
@@ -26,15 +27,29 @@ with `runtime=` in `~/.config/tokenmonitor/launcher.conf`). Dependencies
 — including native ones (serialport, fs-ext, cryptography) — are resolved on
 first run into `~/.cache/tokenmonitor/<version>/`, not committed here.
 
-## The two vendored files (`VERSION`, `compat/tool-schemas.json`)
+**Toolchain-free Go path.** When the Go runtime is selected but there is **no**
+`go` toolchain to compile the bundled source, the launcher downloads a
+prebuilt, statically-linked Go binary for the host (`linux|darwin|windows` ×
+`amd64|arm64`) from the broker GitHub release (`broker-v<VERSION>`), verifies
+it against `bin/SHA256SUMS` (fail-closed), caches it, and runs it. So a host
+needs *either* a toolchain *or* network + curl/wget — never both, and never a
+native-module compile. `TMON_PREBUILT_BASE_URL` overrides the base URL. Only
+`bin/SHA256SUMS` is committed; the binaries live in the release (see
+`docs/releasing.md` Procedure C) and are listed in `go/THIRD_PARTY_NOTICES.md`.
 
-`compat/` and `VERSION` are authoritative in the **monorepo root**
-(`tokenmonitor`), shared with the firmware and host tooling. Because the
-published plugin is cloned standalone (without the monorepo around it), the
-server needs those two files present to start, so they are vendored here. They
-are kept in sync by `tools/tmtools/plugin/vendor_contract.py` in the monorepo;
-`tools/tests/plugin_vendor_sync_test.py` fails if they drift. Do **not** edit
-these two files here — change them in the monorepo and re-vendor.
+## Vendored vs. canonical files (`compat/tool-schemas.json`, `VERSION`)
+
+`compat/tool-schemas.json` is a **vendored** copy of the monorepo-root
+`compat/` (authoritative in the `tokenmonitor` monorepo, shared with the
+firmware and host tooling). Because the published plugin is cloned standalone
+(without the monorepo around it), the server needs it present to start, so it
+is vendored here and kept in sync by `tools/tmtools/plugin/vendor_contract.py`;
+`tools/tests/plugin_vendor_sync_test.py` fails if it drifts. Do **not** edit it
+here — change it in the monorepo and re-vendor.
+
+`VERSION` is **not** vendored: it is the canonical broker version axis
+(`docs/releasing.md` row #6) and is bumped in place. There is no monorepo-root
+`VERSION` file — the broker version lives only here.
 
 The runtime loaders (`py/src/tmon_mcp/mcp/server.py`, `js/src/mcp/server.js`)
 and the version loaders walk *up* for `compat/tool-schemas.json` / `VERSION`

@@ -25,12 +25,14 @@ code; this skill bridges that gap end-to-end without leaving Claude Code.
   enough, there is no separate `go install` / `pipx` / `npm` step.
   Verify with `tokenmonitor_status`. If it errors, the bundled server
   failed to start: the launcher (`server/tokenmonitor-mcp`) auto-selects one of
-  the Go / Python / JS impls and needs ONE language toolchain on the
-  user's PATH (node+npm, python3+uv/pip, or go), resolving that runtime's
-  dependencies on first launch (one-time, can be slow). It logs the
-  chosen runtime — or an install hint when none is usable — to stderr,
-  visible in Claude Code's MCP server logs for `tokenmonitor`. Tell the
-  user to make sure a toolchain is installed and reload the plugin, then
+  the Go / Python / JS impls. It needs EITHER one language toolchain on the
+  user's PATH (node+npm, python3+uv/pip, or go) to build/install from the
+  bundled source, OR — for the toolchain-free Go path — network access plus
+  curl/wget to download a verified prebuilt Go binary for the platform. Either
+  way it resolves on first launch (one-time, can be slow). It logs the chosen
+  runtime — or an install hint when none is usable — to stderr, visible in
+  Claude Code's MCP server logs for `tokenmonitor`. Tell the user to make sure
+  a toolchain (or network + curl/wget) is available and reload the plugin, then
   stop.
 - The device is on the same LAN segment as the laptop (mDNS does not
   cross VLANs).

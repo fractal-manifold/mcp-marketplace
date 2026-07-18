@@ -1,7 +1,7 @@
 {
   "name": "tokenmonitor",
   "version": "0.10.2",
-  "description": "Registers tokenmonitor-mcp, the local broker for the TokenMonitor ESP32 device. Bundles its own MCP server (Node/Python/Go), resolved on first launch.",
+  "description": "Registers tokenmonitor-mcp, the local broker for the TokenMonitor ESP32 device. Bundles its own MCP server (Node/Python/Go), resolved on first launch — building locally or, with no toolchain, fetching a verified prebuilt Go binary.",
   "mcpServers": {
     "tokenmonitor": {
       "command": "sh",

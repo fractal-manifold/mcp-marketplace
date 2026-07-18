@@ -9,3 +9,10 @@ py/venv/
 **/*.egg-info/
 go/tokenmonitor-mcp
 go/tokenmonitor-mcp-go
+
+# Prebuilt Go binaries: built by `make -C go release-bins` into bin/ and
+# UPLOADED to the broker GitHub release — the launcher fetches them on demand
+# for toolchain-free hosts (see docs/releasing.md). Only bin/SHA256SUMS is
+# tracked in git (the trust root the launcher verifies downloads against); the
+# multi-megabyte binaries themselves are never committed.
+bin/tokenmonitor-mcp-go-*

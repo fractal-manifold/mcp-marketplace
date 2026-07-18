@@ -18,7 +18,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"golang.org/x/sys/unix"
+	"github.com/fractal-manifold/tokenmonitor-mcp/internal/filelock"
 )
 
 const (
@@ -121,10 +121,10 @@ func Append(dir, deviceID string, lines []string) error {
 		return fmt.Errorf("devlog: open lock: %w", err)
 	}
 	defer lf.Close()
-	if err := unix.Flock(int(lf.Fd()), unix.LOCK_EX); err != nil {
+	if err := filelock.Lock(lf); err != nil {
 		return fmt.Errorf("devlog: flock: %w", err)
 	}
-	defer unix.Flock(int(lf.Fd()), unix.LOCK_UN)
+	defer filelock.Unlock(lf)
 
 	existing, _ := Read(dir, deviceID)
 	all := append(existing, lines...)

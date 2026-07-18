@@ -29,8 +29,8 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
-	"golang.org/x/sys/unix"
 
+	"github.com/fractal-manifold/tokenmonitor-mcp/internal/filelock"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/textutil"
 )
 
@@ -398,10 +398,10 @@ func (r *Registry) withLock(deviceID string, fn func(dataPath string) error) err
 		return fmt.Errorf("registry: open lock %s: %w", lockPath, err)
 	}
 	defer lf.Close()
-	if err := unix.Flock(int(lf.Fd()), unix.LOCK_EX); err != nil {
+	if err := filelock.Lock(lf); err != nil {
 		return fmt.Errorf("registry: flock %s: %w", lockPath, err)
 	}
-	defer unix.Flock(int(lf.Fd()), unix.LOCK_UN)
+	defer filelock.Unlock(lf)
 	return fn(r.path(deviceID))
 }
 

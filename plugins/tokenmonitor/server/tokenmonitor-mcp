@@ -270,7 +270,11 @@ ensure_py() {
 ensure_go() {
     _verdir="$cache_root/$(bundle_version)"
     _rt="$_verdir/go"
-    _bin="$_rt/tokenmonitor-mcp-go"
+    # Windows executables need the .exe suffix both for the local `go build -o`
+    # target and for the fetched asset — an extensionless PE won't launch.
+    _exe=""
+    case "$(detect_platform)" in windows-*) _exe=".exe" ;; esac
+    _bin="$_rt/tokenmonitor-mcp-go$_exe"
     _ready="$_rt/.tmon-ready"
     # Fresh cached binary -> run it.
     if [ -x "$_bin" ] && ! needs_setup "$_ready" "$script_dir/go"; then
@@ -278,13 +282,21 @@ ensure_go() {
         exec "$_bin" "$@"
     fi
     if ! command -v go >/dev/null 2>&1; then
-        # No toolchain to (re)build. A stale-but-present binary still beats
-        # falling through to no runtime at all.
-        if [ -x "$_bin" ]; then
-            log "go: toolchain gone, using existing cached binary (may be stale)"
+        # No toolchain to build from source. Fetch a prebuilt binary on demand
+        # (verified against the committed bin/SHA256SUMS) into the same cache
+        # slot the local build would use, then run it. This is the toolchain-
+        # free path; a host WITH go never reaches it (it builds above).
+        if fetch_prebuilt_go "$_verdir" "$_rt" "$_bin"; then
+            log "using prebuilt go ($_bin)"
             exec "$_bin" "$@"
         fi
-        log "go: toolchain not found (and no cached binary)"
+        # Fetch unavailable/failed. A stale-but-present binary still beats
+        # falling through to no runtime at all.
+        if [ -x "$_bin" ]; then
+            log "go: no toolchain and prebuilt fetch failed; using cached binary (may be stale)"
+            exec "$_bin" "$@"
+        fi
+        log "go: no toolchain, and could not fetch a prebuilt binary"
         return 1
     fi
     mkdir -p "$_verdir"
@@ -296,7 +308,7 @@ ensure_go() {
         log "compiling Go impl (first run, ~once per version) in $_rt"
         if ( cd "$_rt" && CGO_ENABLED=0 go build -trimpath \
                  -ldflags="-s -w -X main.Version=$(bundle_version)" \
-                 -o tokenmonitor-mcp-go ./cmd/tokenmonitor-mcp ) 1>&2; then
+                 -o "tokenmonitor-mcp-go$_exe" ./cmd/tokenmonitor-mcp ) 1>&2; then
             : > "$_ready"
         else
             release_lock "$_verdir/.lock-go"
@@ -307,6 +319,134 @@ ensure_go() {
     release_lock "$_verdir/.lock-go"
     log "using go ($_bin)"
     exec "$_bin" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Prebuilt Go binary (fetch-on-demand, no-toolchain fallback)
+# ---------------------------------------------------------------------------
+#
+# The plugin ships the Go SOURCE (built locally by ensure_go when `go` is on
+# PATH). When there is NO Go toolchain to compile with, ensure_go instead
+# downloads a prebuilt, statically-linked binary for this host from the broker
+# release, verifies it against the committed bin/SHA256SUMS, caches it in the
+# same slot a local build would use, and runs it. So: `go` present -> build
+# from source (no download); `go` absent -> fetch (no toolchain). Either way
+# no scripting runtime / native-module install is needed.
+#
+# The device never phones home regardless; this is a one-time install-step
+# download on the user's machine, exactly like the npm/pip/go paths already do
+# — but toolchain-free. Base URL is overridable via TMON_PREBUILT_BASE_URL
+# (tests / mirrors / air-gapped internal hosts).
+#
+# POSIX sh: no `local`; helpers use dp_/vp_/fp_ prefixes so they can't clobber
+# the ensure_* vars (_bin/_rt/_verdir/...).
+
+prebuilt_base_url() {
+    if [ -n "${TMON_PREBUILT_BASE_URL:-}" ]; then
+        printf '%s' "${TMON_PREBUILT_BASE_URL%/}"
+    else
+        printf 'https://github.com/fractal-manifold/mcp-marketplace/releases/download/broker-v%s' \
+            "$(bundle_version)"
+    fi
+}
+
+# detect_platform: echo "<os>-<arch>" for the running host, matching the names
+# build-prebuilt.sh produces; empty when unrecognised (-> no fetch).
+detect_platform() {
+    dp_os="" ; dp_arch=""
+    case "$(uname -s 2>/dev/null)" in
+        Linux*)                          dp_os=linux ;;
+        Darwin*)                         dp_os=darwin ;;
+        MINGW*|MSYS*|CYGWIN*|Windows_NT) dp_os=windows ;;
+    esac
+    case "$(uname -m 2>/dev/null)" in
+        x86_64|amd64)  dp_arch=amd64 ;;
+        aarch64|arm64) dp_arch=arm64 ;;
+    esac
+    [ -n "$dp_os" ] && [ -n "$dp_arch" ] && printf '%s-%s' "$dp_os" "$dp_arch"
+}
+
+# verify_prebuilt <file> <basename>: check <file>'s SHA-256 against the entry
+# for <basename> in bin/SHA256SUMS. FAIL-CLOSED (returns 1) on mismatch,
+# missing/unreadable SHA256SUMS, no matching entry, OR no sha256 tool — we
+# never exec downloaded content we couldn't verify. bin/SHA256SUMS ships in
+# git, so the trust root is the checkout, not the downloaded blob.
+verify_prebuilt() {
+    vp_file="$1" ; vp_name="$2"
+    vp_sums="$script_dir/bin/SHA256SUMS"
+    [ -r "$vp_sums" ] || { log "prebuilt: no SHA256SUMS to verify against"; return 1; }
+    # Exact basename match on field 2; its hash is field 1.
+    vp_want=$(awk -v n="$vp_name" '$2==n {print $1; exit}' "$vp_sums" 2>/dev/null)
+    [ -n "$vp_want" ] || { log "prebuilt: $vp_name not listed in SHA256SUMS"; return 1; }
+    if command -v sha256sum >/dev/null 2>&1; then
+        vp_got=$(sha256sum "$vp_file" 2>/dev/null | awk '{print $1; exit}')
+    elif command -v shasum >/dev/null 2>&1; then
+        vp_got=$(shasum -a 256 "$vp_file" 2>/dev/null | awk '{print $1; exit}')
+    else
+        log "prebuilt: no sha256sum/shasum to verify the download; refusing"
+        return 1
+    fi
+    [ "$vp_got" = "$vp_want" ] && return 0
+    log "prebuilt: checksum mismatch for $vp_name (got '${vp_got:-?}')"
+    return 1
+}
+
+# fetch_prebuilt_go <verdir> <rt> <bin>: download the prebuilt Go binary for
+# this host into <bin> (verified), mark it ready, and return 0 so the caller
+# execs it. Returns 1 on: unknown platform / no downloader / download failure /
+# checksum failure / no SHA256SUMS. Serialised with the same cache lock the
+# local build uses, so concurrent sessions don't double-download.
+fetch_prebuilt_go() {
+    fp_verdir="$1" ; fp_rt="$2" ; fp_bin="$3"
+    fp_plat=$(detect_platform)
+    [ -n "$fp_plat" ] || { log "prebuilt: unrecognised platform; cannot fetch"; return 1; }
+    fp_name="tokenmonitor-mcp-go-$fp_plat"
+    case "$fp_plat" in windows-*) fp_name="$fp_name.exe" ;; esac
+
+    if command -v curl >/dev/null 2>&1; then
+        fp_dl='curl -fsSL -o'
+    elif command -v wget >/dev/null 2>&1; then
+        fp_dl='wget -qO'
+    else
+        log "prebuilt: neither curl nor wget on PATH; cannot fetch $fp_name"
+        return 1
+    fi
+
+    mkdir -p "$fp_verdir"
+    acquire_lock "$fp_verdir/.lock-go" || return 1
+    # Another session may have fetched/built it while we waited on the lock.
+    if [ -x "$fp_bin" ]; then
+        release_lock "$fp_verdir/.lock-go"
+        return 0
+    fi
+    mirror_common "$fp_verdir"
+    mkdir -p "$fp_rt"
+    fp_url="$(prebuilt_base_url)/$fp_name"
+    fp_tmp="$fp_rt/.dl.$$"
+    log "fetching prebuilt Go binary $fp_name (v$(bundle_version)) from $fp_url"
+    if ! $fp_dl "$fp_tmp" "$fp_url" 1>&2; then
+        rm -f "$fp_tmp"
+        release_lock "$fp_verdir/.lock-go"
+        log "prebuilt: download failed"
+        return 1
+    fi
+    if ! verify_prebuilt "$fp_tmp" "$fp_name"; then
+        rm -f "$fp_tmp"
+        release_lock "$fp_verdir/.lock-go"
+        return 1
+    fi
+    chmod +x "$fp_tmp" 2>/dev/null || true
+    # Guard the install: a failed mv (e.g. replacing an in-use .exe on Windows)
+    # must NOT leave us reporting success and exec'ing a missing/old target.
+    if ! mv "$fp_tmp" "$fp_bin"; then
+        rm -f "$fp_tmp"
+        release_lock "$fp_verdir/.lock-go"
+        log "prebuilt: could not install downloaded binary to $fp_bin"
+        return 1
+    fi
+    : > "$fp_rt/.tmon-ready"
+    release_lock "$fp_verdir/.lock-go"
+    return 0
 }
 
 bundle_run() {
@@ -326,11 +466,13 @@ bundle_run() {
     printf '%s\n' \
         "tokenmonitor-mcp launcher: no runtime could be prepared (tried:$order)." \
         "" \
-        "The bundled server resolves dependencies on first run; it needs" \
-        "ONE of these toolchains on PATH:" \
+        "The bundled server resolves itself on first run. It needs EITHER a" \
+        "toolchain on PATH to build/install from the bundled source:" \
         "  Node:    node (>=20) + npm" \
         "  Python:  python3 (>=3.11) + uv (or pip/venv)" \
         "  Go:      go (>=1.25)" \
+        "OR — for the toolchain-free Go path — network access plus curl/wget," \
+        "to download a prebuilt Go binary for this platform." \
         "" \
         "To pin a preferred runtime, write 'runtime=js' (or python, go) to" \
         "  $conf_file" >&2
