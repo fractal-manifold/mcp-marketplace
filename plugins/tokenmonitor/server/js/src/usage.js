@@ -291,6 +291,21 @@ export class ClaudeFetcher {
 const CODEX_URL = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_SESSION_FALLBACK = 5 * 3600;
 const CODEX_WEEKLY_FALLBACK = 7 * 86400;
+const CODEX_MONTHLY_FALLBACK = 30 * 86400;
+// Bucket boundaries keyed on a window's DURATION rather than its position in
+// the response (OpenAI reshuffled primary vs secondary once, 2026-07):
+//   ≤ 5h → Session, > 5h and ≤ 2wk → Weekly, above → Monthly.
+const CODEX_SESSION_MAX = 5 * 3600;
+const CODEX_WEEKLY_MAX = 14 * 86400;
+
+// codexClassify returns "session" | "weekly" | "monthly" | null (null when the
+// duration is 0/unknown and the caller must fall back to position).
+function codexClassify(windowSeconds) {
+  if (!(windowSeconds > 0)) return null;
+  if (windowSeconds <= CODEX_SESSION_MAX) return "session";
+  if (windowSeconds <= CODEX_WEEKLY_MAX) return "weekly";
+  return "monthly";
+}
 
 export class CodexFetcher {
   constructor({ authPath, loadCodex }) {
@@ -325,45 +340,66 @@ export class CodexFetcher {
     const snap = emptySnapshot();
     snap.tier = String(doc.plan_type || "unknown");
     const rl = doc.rate_limit || {};
-    const primary = rl.primary_window;
-    const secondary = rl.secondary_window;
 
-    // As of 2026-07 OpenAI collapsed Codex to a SINGLE weekly limit:
-    // primary_window.limit_window_seconds is now 7d and secondary_window is
-    // null. When secondary is absent we render Codex weekly-only (like
-    // Antigravity): hide the session card and surface primary as the Weekly
-    // bucket. The legacy two-window path (primary=Session ~5h, secondary=Weekly
-    // 7d) is kept for any account/plan that still returns both windows.
-    if (!secondary || typeof secondary !== "object") {
-      snap.session_window_seconds = 0;
+    // Windows in wire order. OpenAI currently ships primary + secondary;
+    // tertiary_window is read defensively so a future third (e.g. monthly)
+    // window renders without a code change.
+    const present = [rl.primary_window, rl.secondary_window, rl.tertiary_window]
+      .filter((w) => w && typeof w === "object");
+
+    // Classify each window by its DURATION into Session / Weekly / Monthly.
+    // First window to claim a bucket wins. A window that omits
+    // limit_window_seconds can't be classified, so it falls back to POSITION:
+    // a lone window is the account-level weekly cap; with several, the first is
+    // the short (session) window and the rest are weekly.
+    const buckets = { session: null, weekly: null, monthly: null };
+    const claim = (name, w, dur) => {
+      if (buckets[name]) return;
+      buckets[name] = {
+        pct: Number(w.used_percent || 0),
+        window_seconds: dur,
+        reset_eta_seconds: codexEta(w),
+      };
+    };
+    present.forEach((w, i) => {
+      // Floor to an integer so a fractional limit_window_seconds classifies
+      // identically to the go/py runtimes (which truncate) instead of leaking
+      // a fractional window into the slot.
+      const lim = Math.floor(Number(w.limit_window_seconds));
+      const dur = Number.isFinite(lim) && lim > 0 ? lim : 0;
+      const bucket = codexClassify(dur);
+      if (bucket === "session") claim("session", w, dur);
+      else if (bucket === "weekly") claim("weekly", w, dur);
+      else if (bucket === "monthly") claim("monthly", w, dur);
+      else if (present.length === 1 || i > 0) claim("weekly", w, CODEX_WEEKLY_FALLBACK);
+      else claim("session", w, CODEX_SESSION_FALLBACK);
+    });
+
+    // Legacy scalar fields the pre-slots firmware still reads. An absent
+    // Session/Weekly bucket leaves the window at 0 → the device hides that
+    // card. Monthly has no legacy scalar; a >2wk window surfaces via slots only.
+    if (buckets.session) {
+      snap.session_pct = buckets.session.pct;
+      snap.session_window_seconds = buckets.session.window_seconds;
+      snap.session_reset_eta_seconds = buckets.session.reset_eta_seconds;
+    }
+    if (buckets.weekly) {
+      snap.weekly_pct = buckets.weekly.pct;
+      snap.weekly_window_seconds = buckets.weekly.window_seconds;
+      snap.weekly_reset_eta_seconds = buckets.weekly.reset_eta_seconds;
+    }
+
+    // Slots in fixed card order for whichever buckets are present.
+    const order = [["Session", "session"], ["Weekly", "weekly"], ["Monthly", "monthly"]];
+    snap.slots = order
+      .filter(([, k]) => buckets[k])
+      .map(([label, k]) => ({ label, pct: buckets[k].pct, window_seconds: buckets[k].window_seconds, reset_eta_seconds: buckets[k].reset_eta_seconds }));
+
+    // Nothing usable parsed: keep the historical single empty Weekly card at 0%.
+    if (snap.slots.length === 0) {
       snap.weekly_window_seconds = CODEX_WEEKLY_FALLBACK;
-      if (primary && typeof primary === "object") {
-        snap.weekly_pct = Number(primary.used_percent || 0);
-        const lim = Number(primary.limit_window_seconds);
-        if (Number.isFinite(lim) && lim > 0) snap.weekly_window_seconds = lim;
-        snap.weekly_reset_eta_seconds = codexEta(primary);
-      }
-      snap.slots = [
-        { label: "Weekly", pct: snap.weekly_pct, window_seconds: snap.weekly_window_seconds, reset_eta_seconds: snap.weekly_reset_eta_seconds },
-      ];
-      return snap;
+      snap.slots = [{ label: "Weekly", pct: 0, window_seconds: CODEX_WEEKLY_FALLBACK, reset_eta_seconds: 0 }];
     }
-
-    // Legacy two-window model.
-    snap.session_window_seconds = CODEX_SESSION_FALLBACK;
-    snap.weekly_window_seconds = CODEX_WEEKLY_FALLBACK;
-    if (primary && typeof primary === "object") {
-      snap.session_pct = Number(primary.used_percent || 0);
-      const lim = Number(primary.limit_window_seconds);
-      if (Number.isFinite(lim) && lim > 0) snap.session_window_seconds = lim;
-      snap.session_reset_eta_seconds = codexEta(primary);
-    }
-    snap.weekly_pct = Number(secondary.used_percent || 0);
-    const lim = Number(secondary.limit_window_seconds);
-    if (Number.isFinite(lim) && lim > 0) snap.weekly_window_seconds = lim;
-    snap.weekly_reset_eta_seconds = codexEta(secondary);
-    // Unified slots layout (Session / Weekly); Codex has no third bucket.
-    snap.slots = sessionWeeklySlots(snap);
     return snap;
   }
 }
@@ -371,7 +407,10 @@ export class CodexFetcher {
 function codexEta(win) {
   if (typeof win.reset_after_seconds === "number") return Math.max(0, Math.floor(win.reset_after_seconds));
   if (typeof win.reset_at === "number") {
-    const eta = Math.floor(win.reset_at - Date.now() / 1000);
+    // Truncate now to whole seconds BEFORE subtracting, matching go
+    // (time.Now().Unix()) and py (int(time.time())); flooring the difference
+    // instead would come out 1s low for a fractional now.
+    const eta = Math.floor(win.reset_at) - Math.floor(Date.now() / 1000);
     return Math.max(0, eta);
   }
   return 0;

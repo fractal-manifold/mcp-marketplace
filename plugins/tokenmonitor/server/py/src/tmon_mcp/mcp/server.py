@@ -792,6 +792,24 @@ def _publish_firmware(deps: Deps, args: dict) -> dict:
     update.firmware_url = firmware_url
     update.firmware_sha256 = sha_hex
     update.firmware_version = version
+
+    # Optional signed-manifest envelope — same validation as
+    # set_device_pending. Lets a signed image staged over the local
+    # /firmware/ (plain-HTTP) endpoint install on a production build (which
+    # refuses an unsigned OTA). Host signs; the broker never signs. Paired:
+    # both or neither.
+    mb = (args.get("firmware_manifest_b64") or "").strip()
+    ms = (args.get("firmware_manifest_sig_b64") or "").strip()
+    if mb and len(mb) > 4096:
+        return {"error": "firmware_manifest_b64 exceeds 4 KiB"}
+    if ms and len(ms) > 128:
+        return {"error": "firmware_manifest_sig_b64 looks wrong (Ed25519 sig ~88 base64 chars)"}
+    if bool(mb) != bool(ms):
+        return {"error": "firmware_manifest_b64 and firmware_manifest_sig_b64 must be supplied together"}
+    if mb:
+        update.firmware_manifest_b64 = mb
+        update.firmware_manifest_sig_b64 = ms
+
     try:
         dev2 = deps.registry.set_pending(device_id, update)
     except Exception as e:
@@ -801,6 +819,7 @@ def _publish_firmware(deps: Deps, args: dict) -> dict:
         "firmware_url": firmware_url,
         "firmware_sha256": sha_hex,
         "firmware_version": version,
+        "signed": bool(mb),
         "device": _device_summary(dev2),
     }
 

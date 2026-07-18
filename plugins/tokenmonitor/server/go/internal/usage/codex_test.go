@@ -170,6 +170,129 @@ func TestCodexFetcher_SingleWeeklyWindow(t *testing.T) {
 	}
 }
 
+func TestCodexFetcher_InvertedWindows(t *testing.T) {
+	// Forward-looking: when OpenAI re-introduces the 5h limit it may keep the
+	// weekly window in primary_window and hang the 5h window off
+	// secondary_window (the reverse of the pre-2026-07 layout). Because we
+	// classify by DURATION, not position, the labels must still come out
+	// right: the 604800 window is Weekly, the 18000 window is Session.
+	body := `{
+	  "plan_type": "pro",
+	  "rate_limit": {
+	    "primary_window":   {"used_percent": 6,  "limit_window_seconds": 604800, "reset_after_seconds": 582744},
+	    "secondary_window": {"used_percent": 33, "limit_window_seconds": 18000,  "reset_after_seconds": 14007}
+	  }
+	}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+	f := &CodexFetcher{
+		AuthPath: writeCodexAuth(t, time.Now().Add(time.Hour).Unix()),
+		HTTP:     &http.Client{Transport: rewriteHost(srv.URL)},
+		Now:      time.Now,
+	}
+	snap, err := f.Fetch(context.Background())
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if snap.SessionPct != 33 || snap.SessionWindowSeconds != 18000 || snap.SessionResetETASeconds != 14007 {
+		t.Errorf("session mislabelled: pct=%v win=%d eta=%d", snap.SessionPct, snap.SessionWindowSeconds, snap.SessionResetETASeconds)
+	}
+	if snap.WeeklyPct != 6 || snap.WeeklyWindowSeconds != 604800 || snap.WeeklyResetETASeconds != 582744 {
+		t.Errorf("weekly mislabelled: pct=%v win=%d eta=%d", snap.WeeklyPct, snap.WeeklyWindowSeconds, snap.WeeklyResetETASeconds)
+	}
+	// Slots stay in fixed card order regardless of wire order.
+	wantSlots := []Slot{
+		{Label: "Session", Pct: 33, WindowSeconds: 18000, ResetETASeconds: 14007},
+		{Label: "Weekly", Pct: 6, WindowSeconds: 604800, ResetETASeconds: 582744},
+	}
+	if len(snap.Slots) != len(wantSlots) {
+		t.Fatalf("slots: want %d, got %+v", len(wantSlots), snap.Slots)
+	}
+	for i, w := range wantSlots {
+		if snap.Slots[i] != w {
+			t.Errorf("slots[%d]: want %+v, got %+v", i, w, snap.Slots[i])
+		}
+	}
+}
+
+func TestCodexFetcher_MonthlyWindow(t *testing.T) {
+	// Forward-looking: a window longer than two weeks maps to a Monthly bucket.
+	// Monthly has no legacy scalar, so it surfaces via slots only; the 5h
+	// window still fills Session and the weekly card is hidden.
+	body := `{
+	  "plan_type": "pro",
+	  "rate_limit": {
+	    "primary_window":   {"used_percent": 20, "limit_window_seconds": 18000,   "reset_after_seconds": 3600},
+	    "secondary_window": {"used_percent": 42, "limit_window_seconds": 2592000, "reset_after_seconds": 1000000}
+	  }
+	}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+	f := &CodexFetcher{
+		AuthPath: writeCodexAuth(t, time.Now().Add(time.Hour).Unix()),
+		HTTP:     &http.Client{Transport: rewriteHost(srv.URL)},
+		Now:      time.Now,
+	}
+	snap, err := f.Fetch(context.Background())
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if snap.SessionPct != 20 || snap.SessionWindowSeconds != 18000 {
+		t.Errorf("session: pct=%v win=%d", snap.SessionPct, snap.SessionWindowSeconds)
+	}
+	if snap.WeeklyWindowSeconds != 0 || snap.WeeklyPct != 0 {
+		t.Errorf("weekly card must be hidden: win=%d pct=%v", snap.WeeklyWindowSeconds, snap.WeeklyPct)
+	}
+	wantSlots := []Slot{
+		{Label: "Session", Pct: 20, WindowSeconds: 18000, ResetETASeconds: 3600},
+		{Label: "Monthly", Pct: 42, WindowSeconds: 2592000, ResetETASeconds: 1000000},
+	}
+	if len(snap.Slots) != len(wantSlots) {
+		t.Fatalf("slots: want %d, got %+v", len(wantSlots), snap.Slots)
+	}
+	for i, w := range wantSlots {
+		if snap.Slots[i] != w {
+			t.Errorf("slots[%d]: want %+v, got %+v", i, w, snap.Slots[i])
+		}
+	}
+}
+
+func TestCodexFetcher_FractionalWindowCoerced(t *testing.T) {
+	// A fractional limit_window_seconds must FLOOR to an integer (not reject the
+	// response, and not leak a fractional window), so all three runtimes agree:
+	// 18000.5 → 18000 → Session.
+	body := `{
+	  "plan_type": "plus",
+	  "rate_limit": {
+	    "primary_window":   {"used_percent": 10, "limit_window_seconds": 18000.5, "reset_after_seconds": 100},
+	    "secondary_window": {"used_percent": 20, "limit_window_seconds": 604800,  "reset_after_seconds": 200}
+	  }
+	}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+	f := &CodexFetcher{
+		AuthPath: writeCodexAuth(t, time.Now().Add(time.Hour).Unix()),
+		HTTP:     &http.Client{Transport: rewriteHost(srv.URL)},
+		Now:      time.Now,
+	}
+	snap, err := f.Fetch(context.Background())
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if snap.SessionWindowSeconds != 18000 {
+		t.Errorf("fractional session window must floor to 18000, got %d", snap.SessionWindowSeconds)
+	}
+	if snap.WeeklyWindowSeconds != 604800 {
+		t.Errorf("weekly window: %d", snap.WeeklyWindowSeconds)
+	}
+}
+
 func TestCodexFetcher_MissingRateLimit(t *testing.T) {
 	// Empty rate_limit (no secondary) → single-weekly path with zero usage:
 	// session hidden, weekly at 0% with the 7d fallback window, one slot.

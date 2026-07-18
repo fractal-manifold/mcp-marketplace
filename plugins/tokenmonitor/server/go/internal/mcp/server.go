@@ -224,6 +224,10 @@ func NewServer(d Deps) *server.MCPServer {
 			mcp.WithString("firmware_version", mcp.Required(), mcp.Description("Version string matching TMON_VERSION_STRING / CONFIG_APP_PROJECT_VER in the built image. Used as the destination filename (tokenmonitor-<version>.bin) and as the on-device dedupe key.")),
 			mcp.WithString("external_url", mcp.Description("Optional HTTPS URL to use instead of /firmware/<file>. When set, bin_path is ignored and the SHA must be supplied via sha256_hex.")),
 			mcp.WithString("sha256_hex", mcp.Description("Optional precomputed SHA-256. Required when external_url is set; ignored otherwise (we compute it from bin_path).")),
+			mcp.WithString("firmware_manifest_b64",
+				mcp.Description("Optional base64 of the canonical-JSON Ed25519 manifest for THIS .bin (from `tools/tmtools/lib/manifest.py sign`). Attach it so a signed image staged over the local /firmware/ (plain-HTTP) endpoint still installs on a production build — the device refuses an unsigned OTA unless built with TMON_OTA_UNSIGNED=y. Must be supplied together with firmware_manifest_sig_b64; the broker never signs.")),
+			mcp.WithString("firmware_manifest_sig_b64",
+				mcp.Description("Optional base64 of the 64-byte Ed25519 signature over the manifest bytes (the `signature_b64` field from `manifest.py sign`). Must be supplied together with firmware_manifest_b64.")),
 		),
 		handlePublishFirmware(d),
 	)

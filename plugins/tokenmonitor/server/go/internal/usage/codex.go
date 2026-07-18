@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"time"
 
@@ -19,7 +20,44 @@ const (
 	// so these are only fallbacks when upstream omits them.
 	codexSessionWindowFallback = 5 * 3600
 	codexWeeklyWindowFallback  = 7 * 86400
+	codexMonthlyWindowFallback = 30 * 86400
+
+	// Bucket boundaries, keyed on a window's DURATION rather than its
+	// position in the response. OpenAI has already reshuffled which window
+	// sits in primary_window vs secondary_window once (2026-07); classifying
+	// by limit_window_seconds keeps the Session / Weekly / Monthly labels
+	// correct no matter which slot each window arrives in, and lets a future
+	// monthly window surface without a code change.
+	codexSessionMaxSeconds = 5 * 3600   // ≤ 5h        → Session
+	codexWeeklyMaxSeconds  = 14 * 86400 // > 5h, ≤ 2wk → Weekly; above → Monthly
 )
+
+// codexBucket is the Session / Weekly / Monthly card a Codex window maps to.
+type codexBucket int
+
+const (
+	codexBucketNone codexBucket = iota
+	codexBucketSession
+	codexBucketWeekly
+	codexBucketMonthly
+)
+
+// codexClassify picks a bucket from a window's duration in seconds:
+// ≤ 5h is a session window, up to 2 weeks is weekly, and anything longer is
+// treated as a monthly window. A zero/unknown duration returns codexBucketNone
+// so the caller can fall back to positional heuristics.
+func codexClassify(windowSeconds uint32) codexBucket {
+	switch {
+	case windowSeconds == 0:
+		return codexBucketNone
+	case windowSeconds <= codexSessionMaxSeconds:
+		return codexBucketSession
+	case windowSeconds <= codexWeeklyMaxSeconds:
+		return codexBucketWeekly
+	default:
+		return codexBucketMonthly
+	}
+}
 
 // CodexFetcher reads ~/.codex/auth.json and hits ChatGPT's wham/usage
 // endpoint. Refresh-token handling is intentionally NOT done here: the
@@ -108,14 +146,46 @@ type codexUsageDoc struct {
 	RateLimit struct {
 		PrimaryWindow   *codexWindow `json:"primary_window"`
 		SecondaryWindow *codexWindow `json:"secondary_window"`
+		// TertiaryWindow is not part of any shape OpenAI has shipped yet; it
+		// is parsed defensively so that if they ever return three windows
+		// (e.g. session + weekly + monthly) the third is classified and
+		// rendered without a code change.
+		TertiaryWindow *codexWindow `json:"tertiary_window"`
 	} `json:"rate_limit"`
 }
 
 type codexWindow struct {
-	UsedPercent        *float64 `json:"used_percent"`
-	LimitWindowSeconds *uint32  `json:"limit_window_seconds"`
+	UsedPercent *float64 `json:"used_percent"`
+	// LimitWindowSeconds is a float64 (not uint32) so a fractional value
+	// coerces the way the js/py runtimes do rather than hard-failing the whole
+	// JSON unmarshal. codexWindowSeconds() floors + range-checks it.
+	LimitWindowSeconds *float64 `json:"limit_window_seconds"`
 	ResetAfterSeconds  *uint32  `json:"reset_after_seconds"`
 	ResetAt            *int64   `json:"reset_at"`
+}
+
+// codexWindowSeconds coerces limit_window_seconds to a u32 the same way js
+// (Math.floor) and py (int()) do: floor the value, and treat a missing, ≤0, or
+// out-of-u32-range value as 0 ("unusable"). Parsing the field as float64 keeps
+// a fractional value from rejecting the entire response, so the three runtimes
+// stay byte-for-byte identical on the same input.
+func codexWindowSeconds(w *codexWindow) uint32 {
+	if w.LimitWindowSeconds == nil {
+		return 0
+	}
+	v := math.Floor(*w.LimitWindowSeconds)
+	if v < 1 || v > 4294967295 { // 0/negative → unusable; overflow → drop
+		return 0
+	}
+	return uint32(v)
+}
+
+// codexBucketData accumulates the one window that claimed a bucket.
+type codexBucketData struct {
+	pct    float64
+	window uint32
+	eta    uint32
+	set    bool
 }
 
 func codexMap(d codexUsageDoc) Snapshot {
@@ -123,61 +193,90 @@ func codexMap(d codexUsageDoc) Snapshot {
 	if snap.Tier == "" {
 		snap.Tier = "unknown"
 	}
-	primary := d.RateLimit.PrimaryWindow
-	secondary := d.RateLimit.SecondaryWindow
 
-	// As of 2026-07 OpenAI collapsed Codex to a SINGLE weekly limit:
-	// primary_window.limit_window_seconds is now 7d and secondary_window is
-	// null. When secondary is absent we render Codex weekly-only (like
-	// Antigravity): hide the session card (SessionWindowSeconds=0) and surface
-	// primary as the Weekly bucket. The legacy two-window path (primary=Session
-	// ~5h, secondary=Weekly 7d) is kept for any account/plan that still returns
-	// both windows.
-	if secondary == nil {
-		snap.SessionWindowSeconds = 0
+	// Windows in wire order. OpenAI currently ships primary + secondary;
+	// tertiary is parsed defensively (see codexUsageDoc).
+	windows := []*codexWindow{
+		d.RateLimit.PrimaryWindow,
+		d.RateLimit.SecondaryWindow,
+		d.RateLimit.TertiaryWindow,
+	}
+	present := make([]*codexWindow, 0, len(windows))
+	for _, w := range windows {
+		if w != nil {
+			present = append(present, w)
+		}
+	}
+
+	var session, weekly, monthly codexBucketData
+	claim := func(b *codexBucketData, w *codexWindow, dur uint32) {
+		if b.set { // first window to claim a bucket wins
+			return
+		}
+		b.set = true
+		if w.UsedPercent != nil {
+			b.pct = *w.UsedPercent
+		}
+		b.window = dur
+		b.eta = codexResetETA(w)
+	}
+	// Classify each window by its DURATION into Session / Weekly / Monthly.
+	// A window that omits limit_window_seconds can't be classified, so it
+	// falls back to POSITION: a lone window is the account-level weekly cap;
+	// with several, the first is the short (session) window and the rest are
+	// weekly — matching the pre-2026-07 two-window layout.
+	for i, w := range present {
+		dur := codexWindowSeconds(w)
+		switch codexClassify(dur) {
+		case codexBucketSession:
+			claim(&session, w, dur)
+		case codexBucketWeekly:
+			claim(&weekly, w, dur)
+		case codexBucketMonthly:
+			claim(&monthly, w, dur)
+		default: // no usable duration → positional fallback
+			if len(present) == 1 || i > 0 {
+				claim(&weekly, w, codexWeeklyWindowFallback)
+			} else {
+				claim(&session, w, codexSessionWindowFallback)
+			}
+		}
+	}
+
+	// Populate the legacy scalar fields the pre-slots firmware still reads.
+	// An absent Session/Weekly bucket leaves *WindowSeconds at 0, which the
+	// device treats as "hide this card". Monthly has no legacy scalar, so a
+	// window longer than 2 weeks surfaces via slots only.
+	if session.set {
+		snap.SessionPct = session.pct
+		snap.SessionWindowSeconds = session.window
+		snap.SessionResetETASeconds = session.eta
+	}
+	if weekly.set {
+		snap.WeeklyPct = weekly.pct
+		snap.WeeklyWindowSeconds = weekly.window
+		snap.WeeklyResetETASeconds = weekly.eta
+	}
+
+	// Slots in fixed card order (Session, Weekly, Monthly) for whichever
+	// buckets are present — broker-labelled cards, like Antigravity.
+	if session.set {
+		snap.Slots = append(snap.Slots, Slot{Label: "Session", Pct: session.pct, WindowSeconds: session.window, ResetETASeconds: session.eta})
+	}
+	if weekly.set {
+		snap.Slots = append(snap.Slots, Slot{Label: "Weekly", Pct: weekly.pct, WindowSeconds: weekly.window, ResetETASeconds: weekly.eta})
+	}
+	if monthly.set {
+		snap.Slots = append(snap.Slots, Slot{Label: "Monthly", Pct: monthly.pct, WindowSeconds: monthly.window, ResetETASeconds: monthly.eta})
+	}
+
+	// Nothing usable parsed (empty rate_limit, etc.): keep the historical
+	// "single empty Weekly card at 0%" default so the device shows a Codex
+	// weekly bar rather than a blank provider.
+	if len(snap.Slots) == 0 {
 		snap.WeeklyWindowSeconds = codexWeeklyWindowFallback
-		if w := primary; w != nil {
-			if w.UsedPercent != nil {
-				snap.WeeklyPct = *w.UsedPercent
-			}
-			if w.LimitWindowSeconds != nil && *w.LimitWindowSeconds > 0 {
-				snap.WeeklyWindowSeconds = *w.LimitWindowSeconds
-			}
-			snap.WeeklyResetETASeconds = codexResetETA(w)
-		}
-		snap.Slots = []Slot{{
-			Label:           "Weekly",
-			Pct:             snap.WeeklyPct,
-			WindowSeconds:   snap.WeeklyWindowSeconds,
-			ResetETASeconds: snap.WeeklyResetETASeconds,
-		}}
-		return snap
+		snap.Slots = []Slot{{Label: "Weekly", WindowSeconds: codexWeeklyWindowFallback}}
 	}
-
-	// Legacy two-window model.
-	snap.SessionWindowSeconds = codexSessionWindowFallback
-	snap.WeeklyWindowSeconds = codexWeeklyWindowFallback
-	if w := primary; w != nil {
-		if w.UsedPercent != nil {
-			snap.SessionPct = *w.UsedPercent
-		}
-		if w.LimitWindowSeconds != nil && *w.LimitWindowSeconds > 0 {
-			snap.SessionWindowSeconds = *w.LimitWindowSeconds
-		}
-		snap.SessionResetETASeconds = codexResetETA(w)
-	}
-	if w := secondary; w != nil {
-		if w.UsedPercent != nil {
-			snap.WeeklyPct = *w.UsedPercent
-		}
-		if w.LimitWindowSeconds != nil && *w.LimitWindowSeconds > 0 {
-			snap.WeeklyWindowSeconds = *w.LimitWindowSeconds
-		}
-		snap.WeeklyResetETASeconds = codexResetETA(w)
-	}
-	// Unified slots layout (Session / Weekly) so the device renders
-	// broker-labelled cards; Codex has no third bucket. See sessionWeeklySlots.
-	snap.Slots = sessionWeeklySlots(snap)
 	return snap
 }
 

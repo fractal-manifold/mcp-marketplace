@@ -63,39 +63,14 @@ key and refuses to install the same version twice.
 If `idf.py build` fails, **do not** call `tokenmonitor_publish_firmware`
 with a stale .bin. Surface the build error to the user.
 
-### 3. Publish
+### 3. Sign the OTA manifest (REQUIRED on default / production builds)
 
-```
-tokenmonitor_publish_firmware
-    device_id=<id>
-    bin_path="<repo>/firmware/build/tokenmonitor.bin"
-    firmware_version="<version>"
-```
-
-What this does, in order:
-
-1. Copies the .bin to `~/.config/tokenmonitor/firmware/tmon-<version>.bin`.
-2. Computes the SHA-256 and caches it (also surfaced as the `ETag` and
-   `X-Tmon-Firmware-SHA256` headers on subsequent `/firmware/<file>` requests).
-3. Stages a pending update on the device's TOML record with the URL,
-   SHA-256, and version. Bumps `pending.version` so the device sees a
-   strictly newer config_version on its next poll.
-
-The response includes the computed `firmware_url`, `firmware_sha256`
-and the updated `device` summary (which now shows
-`pending_changes: ["firmware: <version>"]`).
-
-### 4. Sign + attach the OTA manifest (REQUIRED on default builds)
-
-`publish_firmware` stages the URL + SHA-256, but on a **default build**
-(`TMON_OTA_UNSIGNED=n`) the device gates the OTA on an **Ed25519-signed
-manifest** before it will even download the .bin — see
-`gate_manifest()` in `firmware/components/ota/src/tmon_ota.c`. The
-SHA-256 is *not* the trust root; the signed manifest is. Skip this step
-and the device refuses the update at the manifest gate.
-
-Sign the manifest with the offline OTA key, then merge it into the
-already-staged pending blob:
+On any build with `TMON_OTA_UNSIGNED=n` (the default, and all production
+builds) the device gates the OTA on an **Ed25519-signed manifest** before
+it will even download the .bin — see `gate_manifest()` in
+`firmware/components/ota/src/tmon_ota.c`. The SHA-256 is *not* the trust
+root; the signed manifest is. Sign it first so it can be staged together
+with the .bin in one call (next step):
 
 ```
 python tools/tmtools/lib/manifest.py sign \
@@ -114,19 +89,47 @@ still pass their real hardware SKU — `DEV` is a serial FAC value (dev-ness
 keys on the serial's FAC field), never a SKU. The output JSON carries
 `manifest_b64` and `signature_b64`.
 
-Deliver them with a **manifest-only** `set_device_pending` — it merges
-with the firmware pending you just staged (it does NOT replace it):
+### 4. Publish — bin + SHA + version + signed manifest in ONE call
 
 ```
-tokenmonitor_set_device_pending
+tokenmonitor_publish_firmware
     device_id=<id>
-    firmware_manifest_b64="<manifest_b64 from the JSON>"
-    firmware_manifest_sig_b64="<signature_b64 from the JSON>"
+    bin_path="<repo>/firmware/build/tokenmonitor.bin"
+    firmware_version="<version>"
+    firmware_manifest_b64="<manifest_b64 from /tmp/tmon-manifest.json>"
+    firmware_manifest_sig_b64="<signature_b64 from /tmp/tmon-manifest.json>"
 ```
+
+What this does, in order:
+
+1. Copies the .bin to `~/.config/tokenmonitor/firmware/tokenmonitor-<version>.bin`.
+2. Computes the SHA-256 and caches it (also surfaced as the `ETag` and
+   `X-Tmon-Firmware-SHA256` headers on subsequent `/firmware/<file>` requests).
+3. Stages a pending update on the device's TOML record with the URL,
+   SHA-256, version **and the signed manifest pair** — all in one blob.
+   Bumps `pending.version` so the device sees a strictly newer
+   config_version on its next poll. The response shows `"signed": true`.
 
 The device verifies `sig(manifest)` against its trusted OTA pubkey,
 checks the manifest SKU / version / `min_secure_version` (anti-rollback)
 and only then downloads + hashes the .bin.
+
+> **Do this in ONE call.** Passing the manifest to `publish_firmware`
+> directly (rather than a second manifest-only `set_device_pending`)
+> keeps `firmware_url` / `firmware_sha256` / `firmware_version` / manifest
+> all consistent in a single pending blob. The old two-step split could
+> leave `firmware_version` stale relative to the url/sha/manifest, so the
+> device saw "already on this version" and never armed. If you must split
+> (e.g. an `external_url` bin hosted elsewhere), re-send **all four**
+> firmware fields on the second call, not the manifest alone.
+
+Over the LAN the staged `firmware_url` is the broker's own
+`http://<broker>/firmware/tokenmonitor-<version>.bin` — plain HTTP is
+accepted by the device (`CONFIG_TMON_OTA_ALLOW_HTTP=y`, now on in the
+production build too). Transport is decoupled from trust: the signed
+manifest + on-device SHA-256 + anti-rollback + channel gate anchor the
+image regardless of scheme, and the .bin is public so cleartext leaks
+nothing.
 
 #### Shortcut: the public-channel publisher
 
@@ -215,23 +218,25 @@ tokenmonitor_publish_firmware
     firmware_version="<version>"
     external_url="https://github.com/.../releases/download/v<ver>/tokenmonitor.bin"
     sha256_hex="<lowercase 64-hex SHA-256>"
+    firmware_manifest_b64="<manifest_b64 signed over the uploaded .bin>"
+    firmware_manifest_sig_b64="<signature_b64>"
 ```
 
 Requirements:
 
-- The TLS chain to that host must be reachable from the device's CA
-  bundle. The firmware ships with IDF's CA store plus
+- `external_url` must be **HTTPS** (the broker enforces this for
+  off-broker hosts — only the broker's own `/firmware/` LAN endpoint may
+  be plain HTTP). The TLS chain must be reachable from the device's CA
+  bundle: the firmware ships IDF's CA store plus
   `firmware/extra_certs/anthropic_extra_roots.pem`; GitHub and AWS S3
   are covered by the standard set.
 - You compute the SHA-256 ahead of time (`sha256sum
   tokenmonitor.bin`) and pass it verbatim.
-- The **signed manifest is still mandatory** on default builds — the
-  external host only changes where the .bin is fetched from, not the
-  manifest gate. After this `publish_firmware`, run the same `manifest.py
-  sign` + manifest-only `set_device_pending` step from step 4 (sign the
-  exact .bin you uploaded; the manifest's SHA-256 must match the hosted
-  file). For a public GitHub-release host, `tmtools.ota.publish`
-  produces both the signed manifest and the release in one shot.
+- The **signed manifest is still mandatory** — pass `firmware_manifest_b64`
+  + `firmware_manifest_sig_b64` in the same call (sign the exact .bin you
+  uploaded; the manifest's SHA-256 must match the hosted file). For a
+  public GitHub-release host, `tmtools.ota.publish` produces both the
+  signed manifest and the release in one shot.
 
 ## Secure Boot v2
 
@@ -277,11 +282,15 @@ unsecured devices.
 - Wire format: the firmware fields ride inside the AES-CTR-encrypted
   pending blob, so a captured `/sync` response cannot be tampered to
   redirect to a malicious URL without breaking the PSK seal. The .bin
-  file is served over HTTPS, but transport/host integrity is **not**
-  the trust root: on a default build (`TMON_OTA_UNSIGNED=n`) the device
-  installs the image only if the **Ed25519-signed manifest** verifies
-  against its trusted OTA pubkey and the manifest's SHA-256 matches the
-  downloaded bytes. The SHA-256 alone proves nothing about authenticity
-  — it's the signature over the manifest (which carries that SHA-256)
-  that does. Only an `TMON_OTA_UNSIGNED=y` build skips the manifest gate.
+  itself may be served over HTTP (broker LAN endpoint) or HTTPS
+  (external host) — transport/host integrity is **not** the trust root:
+  on a default build (`TMON_OTA_UNSIGNED=n`) the device installs the
+  image only if the **Ed25519-signed manifest** verifies against its
+  trusted OTA pubkey and the manifest's SHA-256 matches the downloaded
+  bytes. The SHA-256 alone proves nothing about authenticity — it's the
+  signature over the manifest (which carries that SHA-256) that does,
+  and the anti-rollback floor (`tmon_min_sv`) blocks downgrades and the
+  channel gate keeps dev-channel builds off production units. That is
+  why plain HTTP is safe even on the production build. Only an
+  `TMON_OTA_UNSIGNED=y` build skips the manifest gate.
 

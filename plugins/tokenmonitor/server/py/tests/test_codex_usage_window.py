@@ -73,6 +73,63 @@ async def test_codex_single_weekly_window(monkeypatch):
     ]
 
 
+async def test_codex_inverted_windows(monkeypatch):
+    # Forward-looking: OpenAI may re-add the 5h limit as secondary_window while
+    # keeping the weekly window in primary_window. Classifying by duration keeps
+    # the labels right — 604800 is Weekly, 18000 is Session.
+    body = {
+        "plan_type": "pro",
+        "rate_limit": {
+            "primary_window": {"used_percent": 6, "limit_window_seconds": 604800, "reset_after_seconds": 582744},
+            "secondary_window": {"used_percent": 33, "limit_window_seconds": 18000, "reset_after_seconds": 14007},
+        },
+    }
+    snap = await _fetcher(monkeypatch).fetch(_FakeSession(body))
+    assert snap.session_pct == 33
+    assert snap.session_window_seconds == 18000
+    assert snap.weekly_pct == 6
+    assert snap.weekly_window_seconds == 604800
+    assert [(s.label, s.pct, s.window_seconds, s.reset_eta_seconds) for s in snap.slots] == [
+        ("Session", 33, 18000, 14007),
+        ("Weekly", 6, 604800, 582744),
+    ]
+
+
+async def test_codex_monthly_window(monkeypatch):
+    # A window longer than two weeks maps to a Monthly bucket, which has no
+    # legacy scalar → it surfaces via slots only; the weekly card is hidden.
+    body = {
+        "plan_type": "pro",
+        "rate_limit": {
+            "primary_window": {"used_percent": 20, "limit_window_seconds": 18000, "reset_after_seconds": 3600},
+            "secondary_window": {"used_percent": 42, "limit_window_seconds": 2592000, "reset_after_seconds": 1000000},
+        },
+    }
+    snap = await _fetcher(monkeypatch).fetch(_FakeSession(body))
+    assert snap.session_pct == 20
+    assert snap.session_window_seconds == 18000
+    assert snap.weekly_window_seconds == 0  # weekly card hidden
+    assert snap.weekly_pct == 0
+    assert [(s.label, s.pct, s.window_seconds, s.reset_eta_seconds) for s in snap.slots] == [
+        ("Session", 20, 18000, 3600),
+        ("Monthly", 42, 2592000, 1000000),
+    ]
+
+
+async def test_codex_fractional_window_floors(monkeypatch):
+    # A fractional limit_window_seconds floors to an integer, matching go/js.
+    body = {
+        "plan_type": "plus",
+        "rate_limit": {
+            "primary_window": {"used_percent": 10, "limit_window_seconds": 18000.5, "reset_after_seconds": 100},
+            "secondary_window": {"used_percent": 20, "limit_window_seconds": 604800, "reset_after_seconds": 200},
+        },
+    }
+    snap = await _fetcher(monkeypatch).fetch(_FakeSession(body))
+    assert snap.session_window_seconds == 18000
+    assert snap.weekly_window_seconds == 604800
+
+
 async def test_codex_legacy_two_window(monkeypatch):
     body = {
         "plan_type": "plus",

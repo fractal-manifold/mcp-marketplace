@@ -759,6 +759,30 @@ func handlePublishFirmware(d Deps) server.ToolHandlerFunc {
 			FirmwareSHA256:  shaHex,
 			FirmwareVersion: version,
 		}
+
+		// Optional signed-manifest envelope. Same validation as
+		// set_device_pending: an SBv2/production build (TMON_OTA_UNSIGNED=n)
+		// refuses to install an OTA whose pending lacks these, so the local
+		// LAN-hosting path must be able to carry them too. Host-side signer
+		// (tools/tmtools/lib/manifest.py) produces the pair; the broker never
+		// signs. We do NOT parse the manifest here — the device-side gate is
+		// authoritative.
+		if mb := strings.TrimSpace(req.GetString("firmware_manifest_b64", "")); mb != "" {
+			if len(mb) > 4096 {
+				return mcp.NewToolResultError("firmware_manifest_b64 exceeds 4 KiB"), nil
+			}
+			update.FirmwareManifestB64 = mb
+		}
+		if sb := strings.TrimSpace(req.GetString("firmware_manifest_sig_b64", "")); sb != "" {
+			if len(sb) > 128 {
+				return mcp.NewToolResultError("firmware_manifest_sig_b64 looks wrong (Ed25519 sig is 64 B → ~88 base64 chars)"), nil
+			}
+			update.FirmwareManifestSigB64 = sb
+		}
+		if (update.FirmwareManifestB64 == "") != (update.FirmwareManifestSigB64 == "") {
+			return mcp.NewToolResultError("firmware_manifest_b64 and firmware_manifest_sig_b64 must be supplied together"), nil
+		}
+
 		dev2, err := d.Registry.SetPending(deviceID, update)
 		if err != nil {
 			return mcp.NewToolResultErrorFromErr("set_pending", err), nil
@@ -768,7 +792,8 @@ func handlePublishFirmware(d Deps) server.ToolHandlerFunc {
 			FirmwareURL    string        `json:"firmware_url"`
 			FirmwareSHA256 string        `json:"firmware_sha256"`
 			Version        string        `json:"firmware_version"`
+			Signed         bool          `json:"signed"`
 			Device         deviceSummary `json:"device"`
-		}{OK: true, FirmwareURL: firmwareURL, FirmwareSHA256: shaHex, Version: version, Device: summarise(dev2)})
+		}{OK: true, FirmwareURL: firmwareURL, FirmwareSHA256: shaHex, Version: version, Signed: update.FirmwareManifestB64 != "", Device: summarise(dev2)})
 	}
 }

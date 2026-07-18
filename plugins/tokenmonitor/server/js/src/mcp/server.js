@@ -557,13 +557,24 @@ function publishFirmwareTool(deps, args) {
     firmwareURL = `${base}/firmware/${fileName}`;
   }
 
+  // Optional signed-manifest envelope — same validation as setDevicePending.
+  // Lets a signed image staged over the local /firmware/ (plain-HTTP) endpoint
+  // install on a production build (which refuses an unsigned OTA). Host signs;
+  // the broker never signs.
+  const mb = String(args.firmware_manifest_b64 || "").trim();
+  const ms = String(args.firmware_manifest_sig_b64 || "").trim();
+  if (mb && mb.length > 4096) return { error: "firmware_manifest_b64 exceeds 4 KiB" };
+  if (ms && ms.length > 128) return { error: "firmware_manifest_sig_b64 looks wrong (Ed25519 sig is 64 B → ~88 base64 chars)" };
+  if (!!mb !== !!ms) return { error: "firmware_manifest_b64 and firmware_manifest_sig_b64 must be supplied together" };
+
   const upd = { version: 0, broker_url: "", psk_hex: "", city: "", br_day: 0, br_night: 0, vol: null,
                 providers: null, provider_modes: null, autorotate_enabled: null, autorotate_interval_s: null,
                 theme_mode: "", gemini_models: null,
-                firmware_url: firmwareURL, firmware_sha256: shaHex, firmware_version: version };
+                firmware_url: firmwareURL, firmware_sha256: shaHex, firmware_version: version,
+                firmware_manifest_b64: mb, firmware_manifest_sig_b64: ms };
   try {
     const dev2 = deps.registry.setPending(deviceID, upd);
-    return { ok: true, firmware_url: firmwareURL, firmware_sha256: shaHex, firmware_version: version, device: deviceSummary(dev2) };
+    return { ok: true, firmware_url: firmwareURL, firmware_sha256: shaHex, firmware_version: version, signed: !!mb, device: deviceSummary(dev2) };
   } catch (e) { return { error: e.message }; }
 }
 

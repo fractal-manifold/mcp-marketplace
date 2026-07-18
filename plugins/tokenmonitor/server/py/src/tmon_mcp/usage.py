@@ -373,6 +373,24 @@ class ClaudeFetcher:
 CODEX_URL = "https://chatgpt.com/backend-api/wham/usage"
 CODEX_SESSION_FALLBACK = 5 * 3600
 CODEX_WEEKLY_FALLBACK = 7 * 86400
+CODEX_MONTHLY_FALLBACK = 30 * 86400
+# Bucket boundaries keyed on a window's DURATION rather than its position in
+# the response (OpenAI reshuffled primary vs secondary once, 2026-07):
+#   ≤ 5h → Session, > 5h and ≤ 2wk → Weekly, above → Monthly.
+CODEX_SESSION_MAX = 5 * 3600
+CODEX_WEEKLY_MAX = 14 * 86400
+
+
+def _codex_classify(window_seconds: int) -> str | None:
+    """Return "session" | "weekly" | "monthly", or None when the duration is
+    0/unknown and the caller must fall back to position."""
+    if window_seconds <= 0:
+        return None
+    if window_seconds <= CODEX_SESSION_MAX:
+        return "session"
+    if window_seconds <= CODEX_WEEKLY_MAX:
+        return "weekly"
+    return "monthly"
 
 
 @dataclass
@@ -410,46 +428,60 @@ class CodexFetcher:
 
         snap = Snapshot(tier=str(doc.get("plan_type") or "unknown"))
         rl = doc.get("rate_limit") or {}
-        primary = rl.get("primary_window")
-        secondary = rl.get("secondary_window")
 
-        # As of 2026-07 OpenAI collapsed Codex to a SINGLE weekly limit:
-        # primary_window.limit_window_seconds is now 7d and secondary_window is
-        # null. When secondary is absent we render Codex weekly-only (like
-        # Antigravity): hide the session card and surface primary as the Weekly
-        # bucket. The legacy two-window path (primary=Session ~5h,
-        # secondary=Weekly 7d) is kept for any account/plan that still returns
-        # both windows.
-        if not isinstance(secondary, dict):
-            snap.session_window_seconds = 0
+        # Windows in wire order. OpenAI currently ships primary + secondary;
+        # tertiary_window is read defensively so a future third (e.g. monthly)
+        # window renders without a code change.
+        present = [
+            w
+            for w in (rl.get("primary_window"), rl.get("secondary_window"), rl.get("tertiary_window"))
+            if isinstance(w, dict)
+        ]
+
+        # Classify each window by its DURATION into Session / Weekly / Monthly.
+        # First window to claim a bucket wins. A window that omits
+        # limit_window_seconds can't be classified, so it falls back to
+        # POSITION: a lone window is the account-level weekly cap; with several,
+        # the first is the short (session) window and the rest are weekly.
+        buckets: dict[str, Slot] = {}
+
+        def _claim(name: str, w: dict, dur: int) -> None:
+            if name in buckets:
+                return
+            buckets[name] = Slot(name.capitalize(), float(w.get("used_percent") or 0), dur, _codex_eta(w))
+
+        for i, w in enumerate(present):
+            lim = w.get("limit_window_seconds")
+            dur = int(lim) if isinstance(lim, (int, float)) and lim > 0 else 0
+            bucket = _codex_classify(dur)
+            if bucket in ("session", "weekly", "monthly"):
+                _claim(bucket, w, dur)
+            elif len(present) == 1 or i > 0:
+                _claim("weekly", w, CODEX_WEEKLY_FALLBACK)
+            else:
+                _claim("session", w, CODEX_SESSION_FALLBACK)
+
+        # Legacy scalar fields the pre-slots firmware still reads. An absent
+        # Session/Weekly bucket leaves the window at 0 → the device hides that
+        # card. Monthly has no legacy scalar; a >2wk window is slots-only.
+        if "session" in buckets:
+            s = buckets["session"]
+            snap.session_pct, snap.session_window_seconds, snap.session_reset_eta_seconds = (
+                s.pct, s.window_seconds, s.reset_eta_seconds
+            )
+        if "weekly" in buckets:
+            s = buckets["weekly"]
+            snap.weekly_pct, snap.weekly_window_seconds, snap.weekly_reset_eta_seconds = (
+                s.pct, s.window_seconds, s.reset_eta_seconds
+            )
+
+        # Slots in fixed card order for whichever buckets are present.
+        snap.slots = [buckets[k] for k in ("session", "weekly", "monthly") if k in buckets]
+
+        # Nothing usable parsed: keep the historical single empty Weekly card.
+        if not snap.slots:
             snap.weekly_window_seconds = CODEX_WEEKLY_FALLBACK
-            if isinstance(primary, dict):
-                snap.weekly_pct = float(primary.get("used_percent") or 0)
-                lim = primary.get("limit_window_seconds")
-                if isinstance(lim, (int, float)) and lim > 0:
-                    snap.weekly_window_seconds = int(lim)
-                snap.weekly_reset_eta_seconds = _codex_eta(primary)
-            snap.slots = [
-                Slot("Weekly", snap.weekly_pct, snap.weekly_window_seconds, snap.weekly_reset_eta_seconds)
-            ]
-            return snap
-
-        # Legacy two-window model.
-        snap.session_window_seconds = CODEX_SESSION_FALLBACK
-        snap.weekly_window_seconds = CODEX_WEEKLY_FALLBACK
-        if isinstance(primary, dict):
-            snap.session_pct = float(primary.get("used_percent") or 0)
-            lim = primary.get("limit_window_seconds")
-            if isinstance(lim, (int, float)) and lim > 0:
-                snap.session_window_seconds = int(lim)
-            snap.session_reset_eta_seconds = _codex_eta(primary)
-        snap.weekly_pct = float(secondary.get("used_percent") or 0)
-        lim = secondary.get("limit_window_seconds")
-        if isinstance(lim, (int, float)) and lim > 0:
-            snap.weekly_window_seconds = int(lim)
-        snap.weekly_reset_eta_seconds = _codex_eta(secondary)
-        # Unified slots layout (Session / Weekly); Codex has no third bucket.
-        snap.slots = _session_weekly_slots(snap)
+            snap.slots = [Slot("Weekly", 0.0, CODEX_WEEKLY_FALLBACK, 0)]
         return snap
 
 
