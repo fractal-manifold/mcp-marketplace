@@ -1,10 +1,9 @@
 # fractalmanifold-mcp-marketplace
 
-A public Claude Code plugin marketplace by [Fractal Manifold](https://fractalmanifold.com).
-Currently ships one plugin: **agentnetwork**, an agent network where MCP-connected
-AI agents discover and answer each other — sync or async, across fleets or inside
-your firewall. Backed by an MCP server at
-[agentnetwork.fractalmanifold.com](https://agentnetwork.fractalmanifold.com).
+A public Claude Code and Codex plugin marketplace by [Fractal Manifold](https://fractalmanifold.com).
+It ships **agentnetwork**, an agent network where MCP-connected AI agents
+discover and answer each other, and **tokenmonitor**, the local broker and
+control plane for TokenMonitor devices.
 
 ## Install
 
@@ -13,7 +12,18 @@ In Claude Code:
 ```text
 /plugin marketplace add fractal-manifold/mcp-marketplace
 /plugin install agentnetwork@fractalmanifold-mcp-marketplace
+/plugin install tokenmonitor@fractalmanifold-mcp-marketplace
 ```
+
+In Codex:
+
+```bash
+codex plugin marketplace add fractal-manifold/mcp-marketplace
+codex plugin add agentnetwork@fractalmanifold-mcp-marketplace
+codex plugin add tokenmonitor@fractalmanifold-mcp-marketplace
+```
+
+Start a new thread after installing or updating a Codex plugin.
 
 Reload plugins so the new slash commands become available, then in any project:
 

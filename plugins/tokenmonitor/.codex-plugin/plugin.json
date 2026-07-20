@@ -1,0 +1,47 @@
+{
+  "name": "tokenmonitor",
+  "version": "0.10.3",
+  "description": "Registers tokenmonitor-mcp, the local broker and control plane for TokenMonitor devices.",
+  "author": {
+    "name": "fractal-manifold",
+    "url": "https://github.com/fractal-manifold"
+  },
+  "homepage": "https://github.com/fractal-manifold/tokenmonitor",
+  "repository": "https://github.com/fractal-manifold/mcp-marketplace",
+  "license": "Apache-2.0",
+  "keywords": [
+    "mcp",
+    "tokenmonitor",
+    "esp32",
+    "iot",
+    "hardware"
+  ],
+  "skills": "./skills/",
+  "mcpServers": {
+    "tokenmonitor-mcp": {
+      "command": "sh",
+      "args": [
+        "./server/tokenmonitor-mcp"
+      ],
+      "cwd": ".",
+      "startup_timeout_sec": 60
+    }
+  },
+  "interface": {
+    "displayName": "TokenMonitor",
+    "shortDescription": "Control and diagnose TokenMonitor devices",
+    "longDescription": "Connect Codex to the local TokenMonitor credential broker and device control plane for diagnostics, provisioning, settings, themes, and firmware updates.",
+    "developerName": "fractal-manifold",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/fractal-manifold/tokenmonitor",
+    "defaultPrompt": [
+      "Check the health and status of my TokenMonitor.",
+      "Configure or update a TokenMonitor device."
+    ]
+  }
+}
