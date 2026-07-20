@@ -9,7 +9,7 @@ Layout:
 
 ```
 server/
-  tokenmonitor-mcp         bundle-mode launcher (POSIX sh); .mcp.json execs this
+  tokenmonitor-mcp         bundle-mode launcher (POSIX sh); the plugin mcpServers entry execs this
   install.sh               optional standalone PATH-mode installer
   VERSION                  canonical broker version axis (NOT vendored; see below)
   compat/tool-schemas.json vendored copy of the monorepo compat/ (see below)

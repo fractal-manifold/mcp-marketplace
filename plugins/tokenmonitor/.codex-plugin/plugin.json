@@ -21,9 +21,8 @@
     "tokenmonitor-mcp": {
       "command": "sh",
       "args": [
-        "./server/tokenmonitor-mcp"
+        "${CLAUDE_PLUGIN_ROOT}/server/tokenmonitor-mcp"
       ],
-      "cwd": ".",
       "startup_timeout_sec": 60
     }
   },

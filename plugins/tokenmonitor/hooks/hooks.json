@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'command -v node >/dev/null 2>&1 || exit 0; exec node \"$CLAUDE_PLUGIN_ROOT/hooks/session-start.js\"'"
+            "command": "sh -c 'root=\"${CLAUDE_PLUGIN_ROOT:-}\"; [ -n \"$root\" ] && command -v node >/dev/null 2>&1 && exec node \"$root/hooks/session-start.js\"; exit 0'"
           }
         ]
       }
