@@ -31,7 +31,8 @@ const (
 	PluginName = "tokenmonitor"
 	// DefaultMarketplaceURL is the raw catalog on the marketplace repo's
 	// default branch — the single source of truth for "latest published".
-	// Overridable via TOKENMONITOR_MARKETPLACE_URL (used by tests).
+	// Overridable via TMON_MARKETPLACE_URL (used by tests); legacy
+	// TOKENMONITOR_MARKETPLACE_URL is still honoured as an alias.
 	DefaultMarketplaceURL = "https://raw.githubusercontent.com/fractal-manifold/mcp-marketplace/main/.claude-plugin/marketplace.json"
 
 	httpTimeout  = 10 * time.Second
@@ -54,7 +55,12 @@ type pluginManifest struct {
 }
 
 // MarketplaceURL returns the catalog URL, honouring the test/CI override.
+// TMON_ is the project's env-var convention; TOKENMONITOR_MARKETPLACE_URL is a
+// backward-compat alias (TMON_ wins when both are set).
 func MarketplaceURL() string {
+	if u := os.Getenv("TMON_MARKETPLACE_URL"); u != "" {
+		return u
+	}
 	if u := os.Getenv("TOKENMONITOR_MARKETPLACE_URL"); u != "" {
 		return u
 	}
@@ -63,10 +69,15 @@ func MarketplaceURL() string {
 
 // InstalledVersion resolves the running release version. It prefers the
 // bundle's plugin.json (the release/marketplace axis, apples-to-apples with the
-// catalog) found via CLAUDE_PLUGIN_ROOT, and falls back to the baked-in broker
-// build version when that file is absent or unreadable.
+// catalog). The launcher exports TMON_PLUGIN_ROOT (set on every client, incl.
+// Antigravity and the cached Go binary); CLAUDE_PLUGIN_ROOT is the host-provided
+// fallback (Claude/Codex only). Falls back to the baked-in broker build version
+// when the manifest is absent or unreadable.
 func InstalledVersion(baked string) string {
-	root := os.Getenv("CLAUDE_PLUGIN_ROOT")
+	root := os.Getenv("TMON_PLUGIN_ROOT")
+	if root == "" {
+		root = os.Getenv("CLAUDE_PLUGIN_ROOT")
+	}
 	if root != "" {
 		p := filepath.Join(root, ".claude-plugin", "plugin.json")
 		if b, err := os.ReadFile(p); err == nil {

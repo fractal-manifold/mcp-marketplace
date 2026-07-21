@@ -36,6 +36,18 @@
 # POSIX sh, no bashisms. Tested with dash + zsh.
 set -u
 
+# --prewarm: resolve/fetch/build the selected runtime to a ready state, then
+# exit 0 WITHOUT starting a server. The SessionStart hook fires this detached so
+# the runtime is already cached before the client's MCP handshake — a
+# NEXT-LAUNCH optimization (it cannot guarantee the current launch, since hook
+# vs. MCP-connect ordering is not contractual across clients). Safe to run
+# concurrently with a real launch: both take the same per-runtime cache lock.
+TMON_PREWARM=0
+if [ "${1:-}" = "--prewarm" ]; then
+    TMON_PREWARM=1
+    shift
+fi
+
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/tokenmonitor"
 conf_file="$config_dir/launcher.conf"
 cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/tokenmonitor"
@@ -80,15 +92,24 @@ bundle_version() { cat "$script_dir/VERSION" 2>/dev/null || echo dev; }
 # lockdir has been abandoned for >10 min, so a setup killed mid-flight
 # can't wedge every future session behind the old rmdir-only cleanup.
 TMON_HELD_LOCK=""
+# Ownership token written into the lock's pid file when we acquire it. Used on
+# release so we only remove a lock we STILL own: if a contender stole our lock
+# after the stale/dead-holder grace window and re-acquired it, our later release
+# must NOT delete their lock. `$$` is unique per launcher process (a stealer is a
+# different process with a different pid), so it doubles as the ownership token.
+TMON_HELD_TOKEN=""
 
-# release_lock <dir>: remove the lock (now a dir containing a pid file)
-# and clear the held-lock marker if it was ours. Guards an empty arg so
-# the global EXIT trap is a no-op once we released explicitly / never
-# acquired.
+# release_lock <dir>: remove the lock (a dir containing a pid file) ONLY if the
+# pid file still names us (or is gone/empty), then clear the held-lock marker if
+# it was ours. Guards an empty arg so the global EXIT trap is a no-op once we
+# released explicitly / never acquired.
 release_lock() {
     [ -n "${1:-}" ] || return 0
-    rm -rf "$1" 2>/dev/null || true
-    [ "$1" = "$TMON_HELD_LOCK" ] && TMON_HELD_LOCK=""
+    _rl_cur=$(cat "$1/pid" 2>/dev/null || true)
+    if [ -z "$_rl_cur" ] || [ "$_rl_cur" = "${TMON_HELD_TOKEN:-}" ]; then
+        rm -rf "$1" 2>/dev/null || true
+    fi
+    [ "$1" = "$TMON_HELD_LOCK" ] && { TMON_HELD_LOCK=""; TMON_HELD_TOKEN=""; }
     return 0
 }
 
@@ -101,19 +122,32 @@ acquire_lock() {
     _lock="$1"
     _tries=0
     while ! mkdir "$_lock" 2>/dev/null; do
-        # Contention. Steal the lock if its holder is gone (dead PID) or
-        # the lockdir is stale (>10 min), then retry immediately.
+        # Contention. Best-effort mkdir lock (POSIX; no flock dependency). We
+        # ONLY steal when the holder cannot be alive — never from a live process
+        # (that was the likely TOCTOU: stealing from an alive holder that is
+        # itself mid-release lets two setups clobber the cache):
+        #   - PID present + dead  -> steal immediately.
+        #   - PID present + alive -> WAIT, no matter how long it holds (a slow
+        #     but progressing build must not be interrupted).
+        #   - PID absent/unreadable (holder crashed before writing it, or is
+        #     racing its own write) -> steal only once the lockdir is old enough
+        #     that a mid-write race is impossible.
+        # Removing the steal-from-live case eliminates the steal-vs-release race
+        # (a dead holder never resumes to delete the stealer's lock). A narrow
+        # residual remains — two contenders that BOTH observe the same dead PID
+        # can both steal-and-recreate, since check-then-remove is not atomic in
+        # sh. That is rare and self-limiting (concurrent first-run setup of the
+        # SAME version); the setup steps below are written to tolerate it rather
+        # than rely on the lock being perfect.
         _steal=0
         _lpid=$(cat "$_lock/pid" 2>/dev/null || true)
         if [ -n "$_lpid" ]; then
             kill -0 "$_lpid" 2>/dev/null || _steal=1
-        fi
-        if [ "$_steal" -eq 0 ] && \
-           [ -n "$(find "$_lock" -maxdepth 0 -mmin +10 -print 2>/dev/null)" ]; then
+        elif [ -n "$(find "$_lock" -maxdepth 0 -mmin +10 -print 2>/dev/null)" ]; then
             _steal=1
         fi
         if [ "$_steal" -eq 1 ]; then
-            log "stealing stale lock $_lock (holder pid='${_lpid:-?}')"
+            log "stealing dead/abandoned lock $_lock (holder pid='${_lpid:-?}')"
             rm -rf "$_lock" 2>/dev/null || true
             continue
         fi
@@ -126,6 +160,7 @@ acquire_lock() {
     done
     printf '%s' "$$" > "$_lock/pid"
     TMON_HELD_LOCK="$_lock"
+    TMON_HELD_TOKEN="$$"
     return 0
 }
 
@@ -175,6 +210,19 @@ needs_setup() {
 # Each ensure_* returns non-zero (without execing) when its toolchain is
 # missing or setup fails, so the caller can fall through to the next
 # candidate. On success it `exec`s and never returns.
+
+# run_or_prewarm <cmd> [args...]: the single success sink for every ensure_*.
+# In a normal launch it `exec`s the runtime (never returns). In --prewarm mode
+# the runtime is now cached/ready, so there is nothing to serve: log it and
+# exit 0, ending the whole launcher (the loop must not fall through to another
+# runtime). TMON_PLUGIN_ROOT was already exported by the bundle dispatch.
+run_or_prewarm() {
+    if [ "$TMON_PREWARM" -eq 1 ]; then
+        log "prewarmed: $1"
+        exit 0
+    fi
+    exec "$@"
+}
 
 ensure_js() {
     command -v node >/dev/null 2>&1 || { log "js: node not found"; return 1; }
@@ -226,7 +274,7 @@ ensure_js() {
         release_lock "$_verdir/.lock-js"
     fi
     log "using js ($_rt)"
-    exec node "$_rt/src/index.js" "$@"
+    run_or_prewarm node "$_rt/src/index.js" "$@"
 }
 
 ensure_py() {
@@ -264,7 +312,46 @@ ensure_py() {
         release_lock "$_verdir/.lock-py"
     fi
     log "using python ($_rt)"
-    exec "$_venv/bin/python" -m tmon_mcp "$@"
+    run_or_prewarm "$_venv/bin/python" -m tmon_mcp "$@"
+}
+
+# build_go_from_source <verdir> <rt> <bin> <ready> <exe>: compile the bundled Go
+# source into <bin> under the shared cache lock, mark it ready + source-
+# provenance. Returns 0 ready-to-run, non-zero on lock/build failure. Assumes a
+# `go` toolchain is present (the caller checks).
+build_go_from_source() {
+    bg_verdir="$1"; bg_rt="$2"; bg_bin="$3"; bg_ready="$4"; bg_exe="$5"
+    mkdir -p "$bg_verdir"
+    acquire_lock "$bg_verdir/.lock-go" || return 1
+    if [ ! -x "$bg_bin" ] || needs_setup "$bg_ready" "$script_dir/go" \
+       || [ "$(cat "$bg_rt/.tmon-prov" 2>/dev/null || true)" != "source" ]; then
+        mirror_common "$bg_verdir"
+        # Build in a PRIVATE temp tree and atomically rename the finished binary
+        # into place (same filesystem). This tolerates the narrow concurrent-
+        # steal residual documented in acquire_lock: two builders never share a
+        # build dir, and $bg_bin only ever appears as a complete binary — a
+        # racing build can't leave a half-written one behind the ready marker.
+        bg_tmp="$bg_verdir/.go-build.$$"
+        rm -rf "$bg_tmp"
+        cp -R "$script_dir/go" "$bg_tmp"
+        mkdir -p "$bg_rt"
+        log "compiling Go impl (first run, ~once per version)"
+        if ( cd "$bg_tmp" && CGO_ENABLED=0 go build -trimpath \
+                 -ldflags="-s -w -X main.Version=$(bundle_version)" \
+                 -o "tokenmonitor-mcp-go$bg_exe" ./cmd/tokenmonitor-mcp ) 1>&2 \
+           && mv "$bg_tmp/tokenmonitor-mcp-go$bg_exe" "$bg_bin"; then
+            printf 'source' > "$bg_rt/.tmon-prov"
+            : > "$bg_ready"
+            rm -rf "$bg_tmp"
+        else
+            rm -rf "$bg_tmp"
+            release_lock "$bg_verdir/.lock-go"
+            log "go: build failed"
+            return 1
+        fi
+    fi
+    release_lock "$bg_verdir/.lock-go"
+    return 0
 }
 
 ensure_go() {
@@ -276,49 +363,59 @@ ensure_go() {
     case "$(detect_platform)" in windows-*) _exe=".exe" ;; esac
     _bin="$_rt/tokenmonitor-mcp-go$_exe"
     _ready="$_rt/.tmon-ready"
-    # Fresh cached binary -> run it.
-    if [ -x "$_bin" ] && ! needs_setup "$_ready" "$script_dir/go"; then
-        log "using go ($_bin)"
-        exec "$_bin" "$@"
+
+    # Preference (launcher.conf `go_prefer=`): default is PREBUILT-first —
+    # downloading the verified prebuilt binary keeps a from-source COMPILE out of
+    # the MCP startup critical path, which is what blows past a client's startup
+    # budget (Claude ~30s, Codex default 10s). `go_prefer=source` restores the
+    # build-from-source path for provenance-conscious or air-gapped toolchain
+    # hosts. Either preference still falls back to the other when its primary is
+    # unavailable, so no host is left without a runtime.
+    _go_prefer="${go_prefer:-prebuilt}"
+    case "$_go_prefer" in prebuilt|source) : ;; *) _go_prefer=prebuilt ;; esac
+
+    _have_go=0
+    command -v go >/dev/null 2>&1 && _have_go=1
+
+    # Fresh cached binary -> run it (no network, no compile). When the caller
+    # explicitly wants source provenance, only take this fast path if the cached
+    # binary was itself source-built.
+    _prov=$(cat "$_rt/.tmon-prov" 2>/dev/null || echo prebuilt)
+    if [ -x "$_bin" ] && ! needs_setup "$_ready" "$script_dir/go" \
+       && { [ "$_go_prefer" != "source" ] || [ "$_prov" = "source" ]; }; then
+        log "using go ($_bin, $_prov)"
+        run_or_prewarm "$_bin" "$@"
     fi
-    if ! command -v go >/dev/null 2>&1; then
-        # No toolchain to build from source. Fetch a prebuilt binary on demand
-        # (verified against the committed bin/SHA256SUMS) into the same cache
-        # slot the local build would use, then run it. This is the toolchain-
-        # free path; a host WITH go never reaches it (it builds above).
+
+    if [ "$_go_prefer" = "source" ]; then
+        # Explicit source-first: build if we can, else fall back to a prebuilt.
+        if [ "$_have_go" -eq 1 ]; then
+            build_go_from_source "$_verdir" "$_rt" "$_bin" "$_ready" "$_exe" \
+                && { log "using go ($_bin, source)"; run_or_prewarm "$_bin" "$@"; }
+        fi
         if fetch_prebuilt_go "$_verdir" "$_rt" "$_bin"; then
             log "using prebuilt go ($_bin)"
-            exec "$_bin" "$@"
+            run_or_prewarm "$_bin" "$@"
         fi
-        # Fetch unavailable/failed. A stale-but-present binary still beats
-        # falling through to no runtime at all.
-        if [ -x "$_bin" ]; then
-            log "go: no toolchain and prebuilt fetch failed; using cached binary (may be stale)"
-            exec "$_bin" "$@"
+    else
+        # Default prebuilt-first: fetch the verified binary, else build.
+        if fetch_prebuilt_go "$_verdir" "$_rt" "$_bin"; then
+            log "using prebuilt go ($_bin)"
+            run_or_prewarm "$_bin" "$@"
         fi
-        log "go: no toolchain, and could not fetch a prebuilt binary"
-        return 1
-    fi
-    mkdir -p "$_verdir"
-    acquire_lock "$_verdir/.lock-go" || return 1
-    if [ ! -x "$_bin" ] || needs_setup "$_ready" "$script_dir/go"; then
-        mirror_common "$_verdir"
-        rm -rf "$_rt"
-        cp -R "$script_dir/go" "$_rt"
-        log "compiling Go impl (first run, ~once per version) in $_rt"
-        if ( cd "$_rt" && CGO_ENABLED=0 go build -trimpath \
-                 -ldflags="-s -w -X main.Version=$(bundle_version)" \
-                 -o "tokenmonitor-mcp-go$_exe" ./cmd/tokenmonitor-mcp ) 1>&2; then
-            : > "$_ready"
-        else
-            release_lock "$_verdir/.lock-go"
-            log "go: build failed"
-            return 1
+        if [ "$_have_go" -eq 1 ]; then
+            build_go_from_source "$_verdir" "$_rt" "$_bin" "$_ready" "$_exe" \
+                && { log "using go ($_bin, source)"; run_or_prewarm "$_bin" "$@"; }
         fi
     fi
-    release_lock "$_verdir/.lock-go"
-    log "using go ($_bin)"
-    exec "$_bin" "$@"
+
+    # Both paths exhausted. A stale-but-present binary still beats no runtime.
+    if [ -x "$_bin" ]; then
+        log "go: setup failed; using cached binary (may be stale)"
+        run_or_prewarm "$_bin" "$@"
+    fi
+    log "go: no toolchain, and could not fetch/build a binary"
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -403,10 +500,31 @@ fetch_prebuilt_go() {
     fp_name="tokenmonitor-mcp-go-$fp_plat"
     case "$fp_plat" in windows-*) fp_name="$fp_name.exe" ;; esac
 
+    # Bound the download: a fast connect cap so an unreachable endpoint fails
+    # quickly (this — not prewarm — is what keeps the cold launch under a
+    # client's MCP startup budget), plus a total cap so a slow trickle can't
+    # hang the handshake indefinitely. On timeout we fall through to a cached
+    # binary or a from-source build.
     if command -v curl >/dev/null 2>&1; then
-        fp_dl='curl -fsSL -o'
+        fp_dl='curl -fsSL --connect-timeout 5 --max-time 45 -o'
     elif command -v wget >/dev/null 2>&1; then
-        fp_dl='wget -qO'
+        # Bounding wget portably is fiddly: only -T/--timeout is common to GNU
+        # and BusyBox (BusyBox has no --connect-timeout), and GNU's -T is
+        # PER-operation with a default --tries=20, so -T alone does NOT cap total
+        # time. So: -T 20 (portable per-op cap); add --tries=1 only when wget
+        # advertises it (GNU; BusyBox doesn't retry and would reject the flag);
+        # and, as a hard total cap, wrap in `timeout` when available (coreutils
+        # or BusyBox applet). curl (preferred, above) already has a true
+        # --max-time, so this only matters on wget-only hosts.
+        fp_wget='wget -q -T 20 -O'
+        if wget --help 2>&1 | grep -q -- '--tries'; then
+            fp_wget='wget -q -T 20 --tries=1 -O'
+        fi
+        if command -v timeout >/dev/null 2>&1; then
+            fp_dl="timeout 45 $fp_wget"
+        else
+            fp_dl="$fp_wget"
+        fi
     else
         log "prebuilt: neither curl nor wget on PATH; cannot fetch $fp_name"
         return 1
@@ -414,8 +532,10 @@ fetch_prebuilt_go() {
 
     mkdir -p "$fp_verdir"
     acquire_lock "$fp_verdir/.lock-go" || return 1
-    # Another session may have fetched/built it while we waited on the lock.
-    if [ -x "$fp_bin" ]; then
+    # Another session may have fetched/built a FRESH binary while we waited on
+    # the lock — reuse it. A stale-but-present binary must NOT short-circuit the
+    # download (that was the old "any executable is fresh" bug): fall through.
+    if [ -x "$fp_bin" ] && ! needs_setup "$fp_rt/.tmon-ready" "$script_dir/go"; then
         release_lock "$fp_verdir/.lock-go"
         return 0
     fi
@@ -444,6 +564,7 @@ fetch_prebuilt_go() {
         log "prebuilt: could not install downloaded binary to $fp_bin"
         return 1
     fi
+    printf 'prebuilt' > "$fp_rt/.tmon-prov"
     : > "$fp_rt/.tmon-ready"
     release_lock "$fp_verdir/.lock-go"
     return 0
@@ -565,6 +686,16 @@ path_run() {
 # ---------------------------------------------------------------------------
 
 if [ "$is_bundle" -eq 1 ]; then
+    # Export the plugin root (this launcher lives at <root>/server/) so every
+    # runtime — incl. the cached Go binary under ~/.cache and any client that
+    # does NOT set CLAUDE_PLUGIN_ROOT (Antigravity) — can locate
+    # .claude-plugin/plugin.json for its version/update check. The launcher self-
+    # resolved script_dir with no host-variable dependency, so this works
+    # identically across Claude, Codex and Antigravity. Scoped to bundle mode:
+    # a standalone PATH-mode binary may live anywhere and should not inherit a
+    # bogus root.
+    TMON_PLUGIN_ROOT=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
+    export TMON_PLUGIN_ROOT
     bundle_run "$@"
 else
     path_run "$@"

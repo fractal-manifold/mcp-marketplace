@@ -7,7 +7,7 @@ known, and the tokenmonitor_status snapshot carries update_available /
 latest_version. Omit-when-unknown must match the Go broker's omitempty fields.
 
 The remote fetch is mocked two ways: (1) monkeypatching updatecheck.fetch_latest
-for the pure verdict tests, and (2) pointing TOKENMONITOR_MARKETPLACE_URL at a
+for the pure verdict tests, and (2) pointing TMON_MARKETPLACE_URL at a
 throwaway local HTTP server to exercise the real fetch + URL override path.
 """
 
@@ -104,8 +104,38 @@ def _serve_catalog(doc: dict, monkeypatch):
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     host, port = srv.server_address
-    monkeypatch.setenv("TOKENMONITOR_MARKETPLACE_URL", f"http://{host}:{port}/marketplace.json")
+    monkeypatch.setenv("TMON_MARKETPLACE_URL", f"http://{host}:{port}/marketplace.json")
     return srv
+
+
+def test_marketplace_url_precedence(monkeypatch):
+    # TMON_ is canonical and wins over the legacy alias; the alias alone works.
+    monkeypatch.setenv("TMON_MARKETPLACE_URL", "https://canonical.example/c.json")
+    monkeypatch.setenv("TOKENMONITOR_MARKETPLACE_URL", "https://legacy.example/c.json")
+    assert updatecheck.marketplace_url() == "https://canonical.example/c.json"
+    monkeypatch.delenv("TMON_MARKETPLACE_URL")
+    assert updatecheck.marketplace_url() == "https://legacy.example/c.json"
+
+
+def test_installed_version_root_precedence(monkeypatch, tmp_path):
+    # TMON_PLUGIN_ROOT (launcher-exported) wins over host CLAUDE_PLUGIN_ROOT.
+    def mk(root, version):
+        d = tmp_path / root / ".claude-plugin"
+        d.mkdir(parents=True)
+        (d / "plugin.json").write_text(
+            json.dumps({"name": "tokenmonitor", "version": version})
+        )
+        return str(tmp_path / root)
+
+    tmon_root = mk("tmon", "1.2.3")
+    claude_root = mk("claude", "4.5.6")
+    monkeypatch.setenv("TMON_PLUGIN_ROOT", tmon_root)
+    monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", claude_root)
+    assert updatecheck.installed_version("0.0.0") == "1.2.3"
+    monkeypatch.delenv("TMON_PLUGIN_ROOT")
+    assert updatecheck.installed_version("0.0.0") == "4.5.6"
+    monkeypatch.delenv("CLAUDE_PLUGIN_ROOT")
+    assert updatecheck.installed_version("0.0.0") == "0.0.0"
 
 
 def test_fetch_latest_reads_tokenmonitor_entry(monkeypatch):

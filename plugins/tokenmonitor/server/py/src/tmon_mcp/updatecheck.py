@@ -30,7 +30,8 @@ from .state import State, UpdateInfo
 PLUGIN_NAME = "tokenmonitor"
 # DEFAULT_MARKETPLACE_URL is the raw catalog on the marketplace repo's default
 # branch — the single source of truth for "latest published". Overridable via
-# TOKENMONITOR_MARKETPLACE_URL (used by tests).
+# TMON_MARKETPLACE_URL (used by tests); legacy TOKENMONITOR_MARKETPLACE_URL is
+# still honoured as an alias.
 DEFAULT_MARKETPLACE_URL = (
     "https://raw.githubusercontent.com/fractal-manifold/mcp-marketplace/"
     "main/.claude-plugin/marketplace.json"
@@ -43,17 +44,26 @@ _MAX_BODY = 1 * 1024 * 1024  # 1 MiB
 
 
 def marketplace_url() -> str:
-    """Return the catalog URL, honouring the test/CI override."""
-    return os.environ.get("TOKENMONITOR_MARKETPLACE_URL") or DEFAULT_MARKETPLACE_URL
+    """Return the catalog URL, honouring the test/CI override.
+
+    TMON_ is the project's env-var convention; TOKENMONITOR_MARKETPLACE_URL is a
+    backward-compat alias (TMON_ wins when both are set)."""
+    return (
+        os.environ.get("TMON_MARKETPLACE_URL")
+        or os.environ.get("TOKENMONITOR_MARKETPLACE_URL")
+        or DEFAULT_MARKETPLACE_URL
+    )
 
 
 def installed_version(baked: str | None = None) -> str:
     """Resolve the running release version. Prefer the bundle's plugin.json (the
-    release/marketplace axis, apples-to-apples with the catalog) found via
-    CLAUDE_PLUGIN_ROOT; fall back to the packaged broker version when that file
-    is absent or unreadable."""
+    release/marketplace axis, apples-to-apples with the catalog). The launcher
+    exports TMON_PLUGIN_ROOT (set on every client, incl. Antigravity and the
+    cached Go binary); CLAUDE_PLUGIN_ROOT is the host-provided fallback
+    (Claude/Codex only). Fall back to the packaged broker version when the
+    manifest is absent or unreadable."""
     baked = baked if baked is not None else __version__
-    root = os.environ.get("CLAUDE_PLUGIN_ROOT", "")
+    root = os.environ.get("TMON_PLUGIN_ROOT") or os.environ.get("CLAUDE_PLUGIN_ROOT", "")
     if root:
         p = Path(root) / ".claude-plugin" / "plugin.json"
         try:

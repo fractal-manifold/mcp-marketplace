@@ -23,7 +23,8 @@ export const PLUGIN_NAME = "tokenmonitor";
 
 // DEFAULT_MARKETPLACE_URL is the raw catalog on the marketplace repo's default
 // branch — the single source of truth for "latest published". Overridable via
-// TOKENMONITOR_MARKETPLACE_URL (used by tests).
+// TMON_MARKETPLACE_URL (used by tests); legacy TOKENMONITOR_MARKETPLACE_URL is
+// still honoured as an alias.
 export const DEFAULT_MARKETPLACE_URL =
   "https://raw.githubusercontent.com/fractal-manifold/mcp-marketplace/main/.claude-plugin/marketplace.json";
 
@@ -33,17 +34,24 @@ const INITIAL_DELAY_MS = 30_000; // 30s
 const MAX_BODY = 1 * 1024 * 1024;
 
 // marketplaceURL returns the catalog URL, honouring the test/CI override.
+// TMON_ is the project's env-var convention; TOKENMONITOR_MARKETPLACE_URL is a
+// backward-compat alias (TMON_ wins when both are set).
 export function marketplaceURL() {
-  return process.env.TOKENMONITOR_MARKETPLACE_URL || DEFAULT_MARKETPLACE_URL;
+  return (
+    process.env.TMON_MARKETPLACE_URL ||
+    process.env.TOKENMONITOR_MARKETPLACE_URL ||
+    DEFAULT_MARKETPLACE_URL
+  );
 }
 
 // installedVersion resolves the running release version. It prefers the
 // bundle's plugin.json (the release/marketplace axis, apples-to-apples with the
-// catalog) found via CLAUDE_PLUGIN_ROOT, and falls back to the baked-in broker
-// build VERSION when that file is absent or unreadable. Mirrors Go
-// InstalledVersion.
+// catalog). The launcher exports TMON_PLUGIN_ROOT (set on every client, incl.
+// Antigravity and the cached Go binary); CLAUDE_PLUGIN_ROOT is the host-provided
+// fallback (Claude/Codex only). Falls back to the baked-in broker build VERSION
+// when the manifest is absent or unreadable. Mirrors Go InstalledVersion.
 export function installedVersion(baked = VERSION) {
-  const root = process.env.CLAUDE_PLUGIN_ROOT;
+  const root = process.env.TMON_PLUGIN_ROOT || process.env.CLAUDE_PLUGIN_ROOT;
   if (root) {
     try {
       const raw = readFileSync(join(root, ".claude-plugin", "plugin.json"), "utf8");

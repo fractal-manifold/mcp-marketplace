@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -15,8 +17,57 @@ func mockCatalog(t *testing.T, body string, status int) *httptest.Server {
 		_, _ = w.Write([]byte(body))
 	}))
 	t.Cleanup(ts.Close)
-	t.Setenv("TOKENMONITOR_MARKETPLACE_URL", ts.URL)
+	t.Setenv("TMON_MARKETPLACE_URL", ts.URL)
 	return ts
+}
+
+func TestMarketplaceURL_Precedence(t *testing.T) {
+	// TMON_ is canonical and must win over the legacy alias; the alias alone
+	// still works.
+	t.Setenv("TMON_MARKETPLACE_URL", "https://canonical.example/catalog.json")
+	t.Setenv("TOKENMONITOR_MARKETPLACE_URL", "https://legacy.example/catalog.json")
+	if got := MarketplaceURL(); got != "https://canonical.example/catalog.json" {
+		t.Fatalf("TMON_ should win, got %q", got)
+	}
+	t.Setenv("TMON_MARKETPLACE_URL", "")
+	if got := MarketplaceURL(); got != "https://legacy.example/catalog.json" {
+		t.Fatalf("legacy alias should apply when TMON_ unset, got %q", got)
+	}
+}
+
+func TestInstalledVersion_RootPrecedence(t *testing.T) {
+	// TMON_PLUGIN_ROOT (launcher-exported, all clients) wins over the
+	// host-provided CLAUDE_PLUGIN_ROOT; both resolve a manifest version.
+	dirTmon := t.TempDir()
+	writeManifest(t, dirTmon, "1.2.3")
+	dirClaude := t.TempDir()
+	writeManifest(t, dirClaude, "4.5.6")
+
+	t.Setenv("TMON_PLUGIN_ROOT", dirTmon)
+	t.Setenv("CLAUDE_PLUGIN_ROOT", dirClaude)
+	if got := InstalledVersion("0.0.0"); got != "1.2.3" {
+		t.Fatalf("TMON_PLUGIN_ROOT should win, got %q", got)
+	}
+	t.Setenv("TMON_PLUGIN_ROOT", "")
+	if got := InstalledVersion("0.0.0"); got != "4.5.6" {
+		t.Fatalf("CLAUDE_PLUGIN_ROOT fallback should apply, got %q", got)
+	}
+	t.Setenv("CLAUDE_PLUGIN_ROOT", "")
+	if got := InstalledVersion("0.0.0"); got != "0.0.0" {
+		t.Fatalf("baked fallback should apply, got %q", got)
+	}
+}
+
+func writeManifest(t *testing.T, root, version string) {
+	t.Helper()
+	dir := filepath.Join(root, ".claude-plugin")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"name":"tokenmonitor","version":"` + version + `"}`
+	if err := os.WriteFile(filepath.Join(dir, "plugin.json"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func tmonCatalog(version string) string {

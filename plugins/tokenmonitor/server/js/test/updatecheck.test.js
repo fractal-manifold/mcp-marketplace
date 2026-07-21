@@ -1,14 +1,17 @@
 // Tests for the broker self-version check (src/updatecheck.js): the verdict is
 // `outdated` when the remote catalog is newer than installed, `up to date` when
 // equal, and `unknown` on any fetch/parse failure. The marketplace URL is
-// pointed at a local http server via TOKENMONITOR_MARKETPLACE_URL, exactly the
+// pointed at a local http server via TMON_MARKETPLACE_URL, exactly the
 // override the module honours in production.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { check, fetchLatest } from "../src/updatecheck.js";
+import { check, fetchLatest, marketplaceURL, installedVersion } from "../src/updatecheck.js";
 
 // Spin up a throwaway HTTP server returning `body` (a string) with `status`.
 // Returns { url, close }.
@@ -42,6 +45,42 @@ test("fetchLatest extracts the tokenmonitor entry version", async () => {
   try {
     assert.equal(await fetchLatest(s.url), "0.9.4");
   } finally { await s.close(); }
+});
+
+test("marketplaceURL: TMON_ wins over the legacy alias", () => {
+  const saved = { a: process.env.TMON_MARKETPLACE_URL, b: process.env.TOKENMONITOR_MARKETPLACE_URL };
+  try {
+    process.env.TMON_MARKETPLACE_URL = "https://canonical.example/c.json";
+    process.env.TOKENMONITOR_MARKETPLACE_URL = "https://legacy.example/c.json";
+    assert.equal(marketplaceURL(), "https://canonical.example/c.json");
+    delete process.env.TMON_MARKETPLACE_URL;
+    assert.equal(marketplaceURL(), "https://legacy.example/c.json");
+  } finally {
+    if (saved.a === undefined) delete process.env.TMON_MARKETPLACE_URL; else process.env.TMON_MARKETPLACE_URL = saved.a;
+    if (saved.b === undefined) delete process.env.TOKENMONITOR_MARKETPLACE_URL; else process.env.TOKENMONITOR_MARKETPLACE_URL = saved.b;
+  }
+});
+
+test("installedVersion: TMON_PLUGIN_ROOT wins over CLAUDE_PLUGIN_ROOT, then baked", () => {
+  const saved = { t: process.env.TMON_PLUGIN_ROOT, c: process.env.CLAUDE_PLUGIN_ROOT };
+  const mk = (v) => {
+    const root = mkdtempSync(join(tmpdir(), "tmon-root-"));
+    mkdirSync(join(root, ".claude-plugin"));
+    writeFileSync(join(root, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "tokenmonitor", version: v }));
+    return root;
+  };
+  try {
+    process.env.TMON_PLUGIN_ROOT = mk("1.2.3");
+    process.env.CLAUDE_PLUGIN_ROOT = mk("4.5.6");
+    assert.equal(installedVersion("0.0.0"), "1.2.3");
+    delete process.env.TMON_PLUGIN_ROOT;
+    assert.equal(installedVersion("0.0.0"), "4.5.6");
+    delete process.env.CLAUDE_PLUGIN_ROOT;
+    assert.equal(installedVersion("0.0.0"), "0.0.0");
+  } finally {
+    if (saved.t === undefined) delete process.env.TMON_PLUGIN_ROOT; else process.env.TMON_PLUGIN_ROOT = saved.t;
+    if (saved.c === undefined) delete process.env.CLAUDE_PLUGIN_ROOT; else process.env.CLAUDE_PLUGIN_ROOT = saved.c;
+  }
 });
 
 test("check marks outdated when remote > installed", async () => {

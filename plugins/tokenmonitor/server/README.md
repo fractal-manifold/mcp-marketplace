@@ -27,15 +27,28 @@ with `runtime=` in `~/.config/tokenmonitor/launcher.conf`). Dependencies
 — including native ones (serialport, fs-ext, cryptography) — are resolved on
 first run into `~/.cache/tokenmonitor/<version>/`, not committed here.
 
-**Toolchain-free Go path.** When the Go runtime is selected but there is **no**
-`go` toolchain to compile the bundled source, the launcher downloads a
-prebuilt, statically-linked Go binary for the host (`linux|darwin|windows` ×
-`amd64|arm64`) from the broker GitHub release (`broker-v<VERSION>`), verifies
-it against `bin/SHA256SUMS` (fail-closed), caches it, and runs it. So a host
-needs *either* a toolchain *or* network + curl/wget — never both, and never a
-native-module compile. `TMON_PREBUILT_BASE_URL` overrides the base URL. Only
+**Prebuilt-first Go path.** When the Go runtime is selected the launcher, by
+default, **prefers** a prebuilt, statically-linked Go binary for the host
+(`linux|darwin|windows` × `amd64|arm64`) from the broker GitHub release
+(`broker-v<VERSION>`), verified against `bin/SHA256SUMS` (fail-closed) — this
+keeps a from-source *compile* out of the MCP startup critical path (which is
+what trips client startup timeouts). The download is bounded (fast connect cap +
+total cap) so an unreachable endpoint fails quickly and falls back to a
+from-source build when a `go` toolchain is present. Set `go_prefer=source` in
+`~/.config/tokenmonitor/launcher.conf` to build from source first (fetch only as
+fallback) — for provenance-conscious or air-gapped toolchain hosts, which then
+never touch the network. `TMON_PREBUILT_BASE_URL` overrides the base URL. Only
 `bin/SHA256SUMS` is committed; the binaries live in the release (see
 `docs/releasing.md` Procedure C) and are listed in `go/THIRD_PARTY_NOTICES.md`.
+
+**Prewarm.** `tokenmonitor-mcp --prewarm` resolves/fetches/builds the selected
+runtime to a ready state and exits 0 without starting a server. The SessionStart
+hook fires it detached so the cache is warm before the client's MCP handshake (a
+next-launch optimization). `TMON_NO_PREWARM=1` opts out.
+
+**Native Windows.** The plugin launches the server via `command: "sh"`, absent on
+native Windows. Windows works only under **Git-Bash/MSYS** on `PATH` or a client
+running **inside WSL**; native `cmd`/PowerShell-only hosts are unsupported.
 
 ## Vendored vs. canonical files (`compat/tool-schemas.json`, `VERSION`)
 

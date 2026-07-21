@@ -49,7 +49,9 @@ printf '0.10.2\n' > "$plug/VERSION"        # bundle detection needs VERSION+comp
 rel="$work/release"; mkdir -p "$rel"
 cat > "$rel/$binname" <<'FAKE'
 #!/bin/sh
-# fake tokenmonitor-mcp-go
+# fake tokenmonitor-mcp-go — also reveals the launcher-exported root so the
+# TMON_PLUGIN_ROOT export can be asserted.
+echo "ROOT=$TMON_PLUGIN_ROOT" >&2
 case "${1:-}" in --probe) echo "go 0.10.2" >&2; exit 0;; esac
 echo "FAKE-PREBUILT-RAN" >&2; exit 0
 FAKE
@@ -133,6 +135,54 @@ if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "windows-amd64.exe" && printf
     ok "windows: fetches the .exe-suffixed asset and runs it"
 else bad "windows .exe handling" "$out"; fi
 # Restore SHA256SUMS for any re-run isolation (harmless; $work is throwaway).
+printf '%s  %s\n' "$(sha256_of "$rel/$binname")" "$binname" > "$plug/bin/SHA256SUMS"
+
+# --- Test 6: launcher exports TMON_PLUGIN_ROOT (dirname of the bundle) -------
+# Every runtime (incl. the cached Go binary and Antigravity, which never sets
+# CLAUDE_PLUGIN_ROOT) must be able to find plugin.json via this exported var.
+c6="$work/c6"
+out=$(run "$c6" "file://$rel"); rc=$?
+want_root=$(CDPATH= cd -- "$plug/.." && pwd -P)
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "ROOT=$want_root"; then
+    ok "exports TMON_PLUGIN_ROOT to the runtime (= dirname of the bundle)"
+else bad "TMON_PLUGIN_ROOT export" "want ROOT=$want_root; got: $out"; fi
+
+# --- Test 7: prebuilt fetch records source-provenance = prebuilt ------------
+prov="$c6/tokenmonitor/0.10.2/go/.tmon-prov"
+if [ "$(cat "$prov" 2>/dev/null)" = "prebuilt" ]; then
+    ok "provenance marker records a fetched binary as 'prebuilt'"
+else bad "provenance marker" "expected 'prebuilt' at $prov, got '$(cat "$prov" 2>/dev/null)'"; fi
+
+# --- Test 8: --prewarm readies the cache without running a server -----------
+# It must exit 0, log "prewarmed", cache the binary, and NOT exec it (no
+# FAKE-PREBUILT-RAN / probe output).
+c8="$work/c8"
+out=$(env -i HOME="$work/home" PATH="$nogo" \
+        XDG_CONFIG_HOME="$cfg" XDG_CACHE_HOME="$c8" \
+        TMON_PREBUILT_BASE_URL="file://$rel" \
+        sh "$plug/tokenmonitor-mcp" --prewarm 2>&1); rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "prewarmed" \
+   && ! printf '%s' "$out" | grep -q "FAKE-PREBUILT-RAN" \
+   && [ -x "$c8/tokenmonitor/0.10.2/go/$binname" ] 2>/dev/null; then
+    ok "--prewarm caches the runtime and exits 0 without starting a server"
+elif [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "prewarmed" \
+     && ! printf '%s' "$out" | grep -q "FAKE-PREBUILT-RAN"; then
+    # binary name is tokenmonitor-mcp-go (no platform suffix) in the cache slot
+    ok "--prewarm caches the runtime and exits 0 without starting a server"
+else bad "--prewarm behavior" "$out"; fi
+
+# --- Test 9: go_prefer=source with NO toolchain falls back to prebuilt ------
+# Source-first is a preference, not a hard requirement: a toolchain-free host
+# must still get a runtime via the verified prebuilt.
+cfg2="$work/cfg2"; mkdir -p "$cfg2/tokenmonitor"
+printf 'runtime=go\ngo_prefer=source\n' > "$cfg2/tokenmonitor/launcher.conf"
+out=$(env -i HOME="$work/home" PATH="$nogo" \
+        XDG_CONFIG_HOME="$cfg2" XDG_CACHE_HOME="$work/c9" \
+        TMON_PREBUILT_BASE_URL="file://$rel" \
+        sh "$plug/tokenmonitor-mcp" --probe 2>&1); rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "using prebuilt go"; then
+    ok "go_prefer=source falls back to the prebuilt when no toolchain is present"
+else bad "go_prefer=source fallback" "$out"; fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -22,6 +22,7 @@ const os = require('node:os');
 const path = require('node:path');
 const https = require('node:https');
 const http = require('node:http');
+const { spawn } = require('node:child_process');
 
 const PLUGIN_NAME = 'tokenmonitor';
 const DEFAULT_MARKETPLACE_URL =
@@ -44,7 +45,42 @@ const watchdog = setTimeout(silentExit, WATCHDOG_MS);
 watchdog.unref();
 
 function marketplaceURL() {
-  return process.env.TOKENMONITOR_MARKETPLACE_URL || DEFAULT_MARKETPLACE_URL;
+  // TMON_ is the project's env-var convention; TOKENMONITOR_MARKETPLACE_URL is
+  // kept as a backward-compat alias (TMON_ wins when both are set).
+  return (
+    process.env.TMON_MARKETPLACE_URL ||
+    process.env.TOKENMONITOR_MARKETPLACE_URL ||
+    DEFAULT_MARKETPLACE_URL
+  );
+}
+
+// pluginRoot resolves the installed plugin directory WITHOUT depending on a
+// host-provided variable: Claude/Codex set CLAUDE_PLUGIN_ROOT, but Antigravity
+// never does. This file always lives at <root>/hooks/session-start.js, so
+// __dirname/.. is the root on every client.
+function pluginRoot() {
+  return process.env.CLAUDE_PLUGIN_ROOT || path.join(__dirname, '..');
+}
+
+// prewarm kicks the launcher's --prewarm mode detached, so the MCP runtime
+// (esp. a first-run Go fetch/build) is cached before the client's MCP
+// handshake. Strictly best-effort and fire-and-forget: never blocks, never
+// fails the session, stdio fully detached. It is a next-launch optimization —
+// it cannot guarantee the current session's MCP connect wins the race.
+function prewarm() {
+  try {
+    if (process.env.TMON_NO_PREWARM) return; // opt-out (tests/CI/users)
+    const launcher = path.join(pluginRoot(), 'server', 'tokenmonitor-mcp');
+    if (!fs.existsSync(launcher)) return;
+    const child = spawn('sh', [launcher, '--prewarm'], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.on('error', () => {});
+    child.unref();
+  } catch (_) {
+    /* best-effort */
+  }
 }
 
 // Parse "MAJOR.MINOR.PATCH[-suffix]" into [maj, min, pat]; suffix ignored.
@@ -74,11 +110,9 @@ function compareSemver(a, b) {
 }
 
 function installedVersion() {
-  const root = process.env.CLAUDE_PLUGIN_ROOT;
-  if (!root) return null;
   try {
     const raw = fs.readFileSync(
-      path.join(root, '.claude-plugin', 'plugin.json'),
+      path.join(pluginRoot(), '.claude-plugin', 'plugin.json'),
       'utf8',
     );
     const v = JSON.parse(raw).version;
@@ -180,6 +214,10 @@ function decide(installed, latest) {
 }
 
 try {
+  // Fire the detached prewarm first (best-effort), so the runtime warms while
+  // we do the update check regardless of its verdict.
+  prewarm();
+
   const installed = installedVersion();
   if (!installed) silentExit();
 

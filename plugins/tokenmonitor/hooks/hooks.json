@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'root=\"${CLAUDE_PLUGIN_ROOT:-}\"; [ -n \"$root\" ] && command -v node >/dev/null 2>&1 && exec node \"$root/hooks/session-start.js\"; exit 0'"
+            "command": "sh -c 'for f in \"${CLAUDE_PLUGIN_ROOT:+$CLAUDE_PLUGIN_ROOT/}hooks/session-start.js\" hooks/session-start.js session-start.js; do [ -f \"$f\" ] || continue; command -v node >/dev/null 2>&1 && exec node \"$f\"; break; done; exit 0'"
           }
         ]
       }
