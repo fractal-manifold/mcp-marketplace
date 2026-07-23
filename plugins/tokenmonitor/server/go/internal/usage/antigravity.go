@@ -3,12 +3,14 @@ package usage
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -256,27 +258,78 @@ type keyringToken struct {
 	Expiry       string `json:"expiry"`
 }
 
-// readKeyringToken pulls agy's consumer OAuth token from the OS keyring
-// (libsecret) via `secret-tool lookup service <name>`. The quota RPC requires
-// THIS token — the gemini-cli token in oauth_creds.json authenticates
-// loadCodeAssist but is rejected (403) by the quota endpoint. Returns the
-// inner token object, or nil on any failure (no secret-tool, locked/empty
+// antigravityKeychainAccount is the macOS Keychain account agy stores its
+// token under (svce=<service>, acct="antigravity"). Linux libsecret keys by
+// service only.
+const antigravityKeychainAccount = "antigravity"
+
+// readKeyringToken pulls agy's consumer OAuth token from the OS keyring. The
+// quota RPC requires THIS token — the gemini-cli token in oauth_creds.json
+// authenticates loadCodeAssist but is rejected (403) by the quota endpoint.
+// Platform-aware: macOS reads the login Keychain via `security
+// find-generic-password`, Linux reads libsecret via `secret-tool`. Returns the
+// inner token object, or nil on any failure (missing tool, locked/empty
 // keyring, bad JSON) so the fetcher degrades to ErrCredsMissing rather than
 // crashing. Mirror of the JS broker's readKeyringToken().
 func readKeyringToken(service string) *keyringToken {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "secret-tool", "lookup", "service", service).Output()
+	var cmd *exec.Cmd
+	if runtime.GOOS == "darwin" {
+		cmd = exec.CommandContext(ctx, "/usr/bin/security",
+			"find-generic-password", "-s", service, "-a", antigravityKeychainAccount, "-w")
+	} else {
+		cmd = exec.CommandContext(ctx, "secret-tool", "lookup", "service", service)
+	}
+	out, err := cmd.Output()
 	if err != nil {
 		return nil
 	}
-	var d struct {
-		Token *keyringToken `json:"token"`
-	}
-	if err := json.Unmarshal(out, &d); err != nil {
+	return normalizeKeyringToken(out)
+}
+
+// normalizeKeyringToken extracts agy's token object from the keyring secret.
+// Linux libsecret holds the JSON {token:{access_token,expiry,…}} directly; the
+// macOS Keychain holds `<id>:<base64url(JSON)>` (a short id/label segment, then
+// the same token JSON base64url-encoded). Handles both, plus a top-level
+// {access_token,…} object. Mirror of the JS broker's normalizeKeyringToken().
+func normalizeKeyringToken(raw []byte) *keyringToken {
+	parse := func(b []byte) *keyringToken {
+		var w struct {
+			Token *keyringToken `json:"token"`
+		}
+		if json.Unmarshal(b, &w) == nil && w.Token != nil && w.Token.AccessToken != "" {
+			return w.Token
+		}
+		var t keyringToken
+		if json.Unmarshal(b, &t) == nil && t.AccessToken != "" {
+			return &t
+		}
 		return nil
 	}
-	return d.Token
+	b64u := func(x string) ([]byte, bool) {
+		x = strings.NewReplacer("-", "+", "_", "/").Replace(x)
+		if m := len(x) % 4; m != 0 {
+			x += strings.Repeat("=", 4-m)
+		}
+		b, err := base64.StdEncoding.DecodeString(x)
+		return b, err == nil
+	}
+	s := strings.TrimSpace(string(raw))
+	if t := parse([]byte(s)); t != nil {
+		return t
+	}
+	for _, seg := range strings.Split(s, ":") {
+		if len(seg) < 16 {
+			continue
+		}
+		if dec, ok := b64u(seg); ok {
+			if t := parse(dec); t != nil {
+				return t
+			}
+		}
+	}
+	return nil
 }
 
 // geminiLoadCodeAssistDoc captures the fields we care about from the

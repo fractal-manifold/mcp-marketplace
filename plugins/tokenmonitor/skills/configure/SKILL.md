@@ -129,31 +129,32 @@ Resolve only the broker URL before asking the user anything else:
       default is `false` (opt-in). Pass `true` only if the user set up a
       panel data source.
 - **providers** — REQUIRED. The device tracks usage from one or more of
-  Claude, Codex and Antigravity; only the ones enabled here are polled and
-  shown on the dashboard. Default selection rules:
-    - **Claude is always pre-selected.** If this skill is running at
-      all, it is running inside Claude Code (this plugin only exists as
-      a Claude Code plugin), so Claude is definitely an active provider
-      — no detection needed.
-    - **Codex** → pre-select if `~/.codex/auth.json` exists, or
-      `~/.config/codex/` exists, or `OPENAI_API_KEY` is set in the
-      environment.
-    - **Antigravity** → pre-select if the `agy` binary is on `PATH`, or
-      `~/.gemini/antigravity-cli/` exists, or
-      `~/.gemini/oauth_creds.json` exists (the OAuth file is shared with
-      the old Gemini CLI and still used), or `GEMINI_API_KEY` /
-      `GOOGLE_API_KEY` are set. (Antigravity is Google's successor to the
-      Gemini CLI; it still runs the Gemini-family models.)
+  Claude, Codex and Antigravity. **The default configuration enables all
+  three** — pre-select Claude, Codex *and* Antigravity so a new device tracks
+  every provider out of the box. Credential detection is only a *hint* about
+  what already has local logins, never a gate on the default:
+    - **Claude** — always available (this skill runs inside Claude Code, so
+      Claude is definitely an active provider).
+    - **Codex** — local creds present if `~/.codex/auth.json` or
+      `~/.config/codex/` exists, or `OPENAI_API_KEY` is set.
+    - **Antigravity** — local creds present if the `agy` binary is on `PATH`,
+      or `~/.gemini/antigravity/` / `~/.gemini/oauth_creds.json` exists
+      (the OAuth file is shared with the old Gemini CLI and still used), or
+      `GEMINI_API_KEY` / `GOOGLE_API_KEY` are set. (Antigravity is Google's
+      successor to the Gemini CLI; it still runs the Gemini-family models.)
 
-  Then call `AskUserQuestion` with `multiSelect: true`, pre-marking
-  Claude plus whichever of Codex/Antigravity were detected, with options:
+  Then call `AskUserQuestion` with `multiSelect: true`, **pre-marking all
+  three**, with options:
     - "Claude (Claude Code)"
     - "Codex (OpenAI)"
     - "Antigravity (Google)"
 
-  The user can still uncheck Claude if they really want to (e.g. they
-  use Claude Code for other work but don't want it tracked on the
-  device). Require at least one provider selected.
+  All three are checked by default; the user can uncheck any they don't want
+  tracked (require at least one to remain selected). **Enabling a provider
+  that has no local credentials is fine** — the dashboard shows "--" for it
+  until that CLI is logged in, which is the expected "set it up later" state.
+  If a selected provider wasn't detected, mention which login it needs (e.g.
+  "Antigravity will show -- until you run `agy` to log in").
 
   Send `provider_claude`, `provider_codex`, `provider_antigravity` flags
   (`true` for selected, omit for not-selected — the broker treats the

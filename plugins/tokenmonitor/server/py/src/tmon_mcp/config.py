@@ -44,7 +44,9 @@ class Credentials:
 
 @dataclass
 class Codex:
-    enabled: bool = False
+    # Default config tracks all three providers; one with no local creds
+    # just serves "creds missing" until its CLI logs in.
+    enabled: bool = True
     auth_path: str = "~/.codex/auth.json"
 
 
@@ -69,7 +71,7 @@ class Antigravity:
     the CLI's oauth_creds.json (still under ~/.gemini/, shared with the
     legacy layout); projects_path at its projects.json. Both optional."""
 
-    enabled: bool = False
+    enabled: bool = True
     creds_path: str = "~/.gemini/oauth_creds.json"
     projects_path: str = "~/.gemini/projects.json"
     # OS keyring service holding agy's consumer OAuth token (the quota RPC
@@ -104,7 +106,7 @@ class Spend:
     # antigravity_conversations_path is the Antigravity CLI's per-conversation
     # SQLite trajectory store. gemini_tmp_path is the DEPRECATED pre-rename key,
     # merged into it in load() so a legacy tokenmonitor.toml keeps working.
-    antigravity_conversations_path: str = "~/.gemini/antigravity-cli/conversations"
+    antigravity_conversations_path: str = "~/.gemini/antigravity/conversations"
     gemini_tmp_path: str = ""
 
 
@@ -329,7 +331,13 @@ def _merge_legacy_gemini(cfg: Config, raw: dict) -> None:
     uses key presence in the raw TOML so "not provided" is not confused with
     "set to a zero value"."""
     if "antigravity" not in raw and "gemini" in raw:
-        cfg.antigravity.enabled = cfg.gemini.enabled
+        # Read `enabled` from the raw [gemini] section (default False when the
+        # key is absent) rather than cfg.gemini.enabled, whose dataclass default
+        # is now True — matching Go (`cfg.Gemini.Enabled`, zero-value false) and
+        # JS (`!!g.enabled`) so a legacy [gemini] with no `enabled` behaves
+        # identically across all three impls.
+        gem = raw.get("gemini") or {}
+        cfg.antigravity.enabled = bool(gem.get("enabled", False))
         if cfg.gemini.creds_path:
             cfg.antigravity.creds_path = cfg.gemini.creds_path
         if cfg.gemini.projects_path:

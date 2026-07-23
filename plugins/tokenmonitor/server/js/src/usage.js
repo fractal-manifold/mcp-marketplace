@@ -438,29 +438,74 @@ const ANTIGRAVITY_WEEKLY = 604800;
 // is a JSON value {token:{access_token,refresh_token,expiry},…}; only the
 // access_token is read here (agy keeps it fresh while it runs).
 const ANTIGRAVITY_KEYRING_SERVICE = "gemini";
+// macOS Keychain account agy stores that token under (svce=<service>,
+// acct="antigravity"). Linux libsecret keys by service only.
+const ANTIGRAVITY_KEYCHAIN_ACCOUNT = "antigravity";
 
-// readKeyringToken pulls agy's consumer OAuth token from the OS keyring
-// (libsecret) via `secret-tool`. The quota RPC requires THIS token — the
-// gemini-cli token in oauth_creds.json authenticates loadCodeAssist but is
-// rejected (403) by the quota endpoint. Returns the inner token object, or
-// null on any failure (no secret-tool, locked/empty keyring, bad JSON) so the
+// readKeyringSecret returns the raw keyring secret agy wrote. Platform-aware:
+// macOS reads the login Keychain via `security find-generic-password`, Linux
+// reads libsecret via `secret-tool`. On macOS the first read may raise a
+// one-time "Always Allow" prompt.
+function readKeyringSecret(service) {
+  if (process.platform === "darwin") {
+    return execFileSync("/usr/bin/security",
+      ["find-generic-password", "-s", service, "-a", ANTIGRAVITY_KEYCHAIN_ACCOUNT, "-w"],
+      { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] });
+  }
+  return execFileSync("secret-tool", ["lookup", "service", service], {
+    encoding: "utf8",
+    timeout: 5000,
+  });
+}
+
+// Exported for tests. normalizeKeyringToken extracts agy's token object as
+// {access_token, expiry}. The secret's shape differs by platform: Linux
+// libsecret holds the JSON {token:{access_token,expiry,…}} directly, while the
+// macOS Keychain holds `<id>:<base64url(JSON)>` (a short id/label segment, then
+// the same token JSON base64url-encoded). Also accepts a top-level
+// {access_token,…} object. Kept byte-for-byte in step with the Go and Python
+// normalizers (readKeyringToken / _normalize_keyring_token) for wire parity.
+export function normalizeKeyringToken(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim();
+  const b64u = (x) => {
+    try { return Buffer.from(x.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"); }
+    catch { return ""; }
+  };
+  const parse = (text) => {
+    let d;
+    try { d = JSON.parse(text); } catch { return null; }
+    if (!d || typeof d !== "object") return null;
+    const tok = d.token && typeof d.token === "object" ? d.token : d;
+    return tok.access_token ? { access_token: tok.access_token, expiry: tok.expiry || "" } : null;
+  };
+  let t = parse(s);
+  if (t) return t;
+  // macOS layout: colon-delimited <id>:<base64url(JSON)> — decode each segment.
+  if (s.includes(":")) {
+    for (const seg of s.split(":")) {
+      if (seg.length < 16) continue;
+      t = parse(b64u(seg));
+      if (t) return t;
+    }
+  }
+  return null;
+}
+
+// readKeyringToken pulls agy's consumer OAuth token from the OS keyring. The
+// quota RPC requires THIS token — the gemini-cli token in oauth_creds.json
+// authenticates loadCodeAssist but is rejected (403) by the quota endpoint.
+// Returns a normalized {access_token, expiry}, or null on any failure (no
+// secret-tool / security, locked/empty keyring, unrecognised shape) so the
 // fetcher degrades to "--" rather than crashing.
 function readKeyringToken(service) {
   let raw;
   try {
-    raw = execFileSync("secret-tool", ["lookup", "service", service], {
-      encoding: "utf8",
-      timeout: 5000,
-    });
+    raw = readKeyringSecret(service);
   } catch {
     return null;
   }
-  try {
-    const d = JSON.parse(raw);
-    return d && typeof d.token === "object" ? d.token : null;
-  } catch {
-    return null;
-  }
+  return normalizeKeyringToken(raw);
 }
 
 export class AntigravityFetcher {

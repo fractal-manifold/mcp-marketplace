@@ -326,7 +326,7 @@ func (c *Config) ClaudeStatsCachePath() string { return expandUser(c.Spend.Claud
 func (c *Config) CodexSessionsPath() string    { return expandUser(c.Spend.CodexSessionsPath) }
 
 // AntigravityConvPath is the per-conversation SQLite trajectory store the
-// Antigravity CLI writes (~/.gemini/antigravity-cli/conversations). It
+// Antigravity CLI writes (~/.gemini/antigravity/conversations). It
 // replaces the dead Gemini-CLI chat-log path; the legacy gemini_tmp_path is
 // merged into it in Load() for back-compat.
 func (c *Config) AntigravityConvPath() string { return expandUser(c.Spend.AntigravityConvPath) }
@@ -482,11 +482,13 @@ func defaults() *Config {
 			OAuthPath: "~/.claude/.credentials.json",
 		},
 		Codex: Codex{
-			Enabled:  false,
+			// Default configuration tracks all three providers; a provider with
+			// no local creds just serves "creds missing" until its CLI logs in.
+			Enabled:  true,
 			AuthPath: "~/.codex/auth.json",
 		},
 		Antigravity: Antigravity{
-			Enabled: false,
+			Enabled: true,
 			// OS keyring service holding agy's consumer OAuth token (the quota
 			// RPC requires it; the oauth_creds.json token is rejected there).
 			// Read via `secret-tool lookup service <name>`.
@@ -507,7 +509,7 @@ func defaults() *Config {
 			ClaudeProjectsPath:   "~/.claude/projects",
 			ClaudeStatsCachePath: "~/.claude/stats-cache.json",
 			CodexSessionsPath:    "~/.codex/sessions",
-			AntigravityConvPath:  "~/.gemini/antigravity-cli/conversations",
+			AntigravityConvPath:  "~/.gemini/antigravity/conversations",
 		},
 		Pricing: Pricing{
 			URL:       "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
@@ -548,9 +550,10 @@ psk_passphrase = "change-me-please"
 oauth_path = "~/.claude/.credentials.json"
 
 [codex]
-# Enable if you also use the Codex CLI. auth.json contains the ChatGPT
-# bearer token plus account_id required by /backend-api/wham/usage.
-enabled = false
+# On by default (the default config tracks all three providers). Set to
+# false to hide it. auth.json contains the ChatGPT bearer token plus
+# account_id required by /backend-api/wham/usage.
+enabled = true
 auth_path = "~/.codex/auth.json"
 
 [antigravity]
@@ -559,7 +562,9 @@ auth_path = "~/.codex/auth.json"
 # OS keyring (READ-ONLY — agy keeps it fresh while it runs) and asks the
 # canary cloudcode-pa host for the grouped weekly quota (Gemini Models /
 # Claude+GPT). (A legacy [gemini] section is still accepted and merged here.)
-enabled = false
+# On by default; shows "creds missing" until you log in with agy. Set to
+# false to hide it.
+enabled = true
 # libsecret service name agy stores its token under
 # (secret-tool lookup service <name>). Default "gemini".
 keyring_service = "gemini"
