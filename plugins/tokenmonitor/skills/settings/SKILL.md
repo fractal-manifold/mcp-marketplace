@@ -5,8 +5,8 @@ description: tokenmonitor plugin — remotely change any on-device setting that 
 
 # /tokenmonitor:settings
 
-Push a runtime configuration change to an already-provisioned C Wall
-Monitor device. The change is queued through the control plane and
+Push a runtime configuration change to an already-provisioned
+TokenMonitor device. The change is queued through the control plane and
 applied on the device's next 60 s poll (with the candidate / promote
 safety net — a bad config rolls back automatically).
 

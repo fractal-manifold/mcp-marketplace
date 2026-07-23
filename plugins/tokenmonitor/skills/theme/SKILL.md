@@ -5,8 +5,8 @@ description: tokenmonitor plugin — switch a TokenMonitor device between Day, N
 
 # /tokenmonitor:theme
 
-Set the on-device theme mode (Day, Night or Auto) on a C Wall
-Monitor device. The change is queued through the control plane and
+Set the on-device theme mode (Day, Night or Auto) on a TokenMonitor
+device. The change is queued through the control plane and
 applied on the device's next poll + reboot cycle.
 
 ## When to invoke
