@@ -1,8 +1,16 @@
-"""Reader for ~/.claude/.credentials.json."""
+"""Reader for the Claude CLI OAuth credentials.
+
+On Linux the CLI writes a plaintext file (``~/.claude/.credentials.json`` by
+default); on macOS it stores the same ``{"claudeAiOauth": {...}}`` JSON blob in
+the login Keychain instead. ``read_raw`` hides that difference — file first,
+then the Keychain on darwin.
+"""
 
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +22,72 @@ class CredsFileMissing(Exception):
 
 class CredsParse(Exception):
     pass
+
+
+# macOS login-Keychain generic-password service name the Claude CLI uses.
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+
+def _default_keychain_reader(service: str) -> str:
+    """Shell out to /usr/bin/security and print the secret to stdout.
+
+    The first read may raise a GUI authorization prompt; once the user picks
+    "Always Allow" it succeeds silently. The short timeout keeps a
+    never-answered prompt from wedging the poll loop.
+    """
+    return subprocess.run(
+        ["/usr/bin/security", "find-generic-password", "-s", service, "-w"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=True,
+    ).stdout
+
+
+# Overridable for tests.
+_keychain_reader = _default_keychain_reader
+
+
+def _default_oauth_path() -> str:
+    """Platform-default Claude credentials file — the only path the Keychain
+    fallback applies to. Overridable in tests."""
+    return str(Path.home() / ".claude" / ".credentials.json")
+
+
+def set_keychain_reader(fn):
+    """Test hook — swap the Keychain reader; returns the previous one."""
+    global _keychain_reader
+    prev = _keychain_reader
+    _keychain_reader = fn
+    return prev
+
+
+def read_raw(path: str, service: str = KEYCHAIN_SERVICE) -> str:
+    """Return the raw Claude credentials JSON blob, Keychain-aware on macOS.
+
+    The file wins when present. Only a missing DEFAULT file falls back to the
+    Keychain (and only on darwin) — a missing explicit oauth_path override
+    errors instead of silently serving the login account's token. A non-ENOENT
+    read error surfaces as CredsParse (parity with the Go/JS impls).
+    """
+    p = Path(path)
+    try:
+        return p.read_text()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        raise CredsParse(f"credentials read error: {e}") from e
+    if sys.platform == "darwin" and str(p) == _default_oauth_path():
+        try:
+            raw = _keychain_reader(service)
+        except Exception:
+            raw = ""
+        if raw and raw.strip():
+            return raw
+        raise CredsFileMissing(
+            f'credentials file missing: {path} (macOS Keychain "{service}" also unavailable)'
+        )
+    raise CredsFileMissing(f"credentials file missing: {path}")
 
 
 @dataclass
@@ -31,11 +105,9 @@ class Stored:
 
 
 def load(path: str) -> Stored:
-    p = Path(path)
-    if not p.is_file():
-        raise CredsFileMissing(f"credentials file missing: {path}")
+    raw = read_raw(path)
     try:
-        doc = json.loads(p.read_text())
+        doc = json.loads(raw)
     except Exception as e:
         raise CredsParse(f"credentials parse error: {e}") from e
     oauth = doc.get("claudeAiOauth") or {}

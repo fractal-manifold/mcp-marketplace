@@ -5,9 +5,91 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
+
+// TestReadRaw_FileWinsOverKeychain: a present file is authoritative and the
+// Keychain must not be consulted (honours explicit oauth_path / Linux).
+func TestReadRaw_FileWinsOverKeychain(t *testing.T) {
+	orig := keychainReader
+	t.Cleanup(func() { keychainReader = orig })
+	keychainReader = func(string) ([]byte, error) {
+		t.Fatal("keychain must not be consulted when the file exists")
+		return nil, nil
+	}
+	dir := t.TempDir()
+	p := filepath.Join(dir, "creds.json")
+	if err := os.WriteFile(p,
+		[]byte(`{"claudeAiOauth":{"accessToken":"f","expiresAt":1700000000000}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(p)
+	if err != nil || c.AccessToken != "f" {
+		t.Fatalf("c=%+v err=%v", c, err)
+	}
+}
+
+// TestReadRaw_KeychainFallbackDarwin: on macOS a missing DEFAULT file falls
+// back to the login Keychain, which serves the same JSON blob.
+func TestReadRaw_KeychainFallbackDarwin(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("keychain fallback is darwin-only")
+	}
+	missing := filepath.Join(t.TempDir(), "does-not-exist.json")
+	origKC, origDef := keychainReader, defaultOAuthPath
+	t.Cleanup(func() { keychainReader, defaultOAuthPath = origKC, origDef })
+	defaultOAuthPath = func() string { return missing } // treat the temp path as the default
+	keychainReader = func(service string) ([]byte, error) {
+		if service != KeychainService {
+			t.Fatalf("service = %q, want %q", service, KeychainService)
+		}
+		return []byte(`{"claudeAiOauth":{"accessToken":"kc","expiresAt":1700000000000}}`), nil
+	}
+	c, err := Load(missing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AccessToken != "kc" {
+		t.Errorf("token = %q, want kc", c.AccessToken)
+	}
+}
+
+// TestReadRaw_ExplicitOverrideNoKeychain: a missing NON-default oauth_path
+// must NOT fall back to the Keychain — it errors so we never serve the login
+// account's token in place of the configured one.
+func TestReadRaw_ExplicitOverrideNoKeychain(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("keychain fallback is darwin-only")
+	}
+	origKC, origDef := keychainReader, defaultOAuthPath
+	t.Cleanup(func() { keychainReader, defaultOAuthPath = origKC, origDef })
+	defaultOAuthPath = func() string { return "/the/default/.credentials.json" }
+	keychainReader = func(string) ([]byte, error) {
+		t.Fatal("keychain must not be consulted for an explicit override path")
+		return nil, nil
+	}
+	if _, err := Load(filepath.Join(t.TempDir(), "custom-missing.json")); !errors.Is(err, ErrFileMissing) {
+		t.Fatalf("expected ErrFileMissing, got %v", err)
+	}
+}
+
+// TestReadRaw_KeychainMissDarwin: a Keychain miss still surfaces
+// ErrFileMissing so callers degrade exactly as on Linux.
+func TestReadRaw_KeychainMissDarwin(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("keychain fallback is darwin-only")
+	}
+	missing := filepath.Join(t.TempDir(), "does-not-exist.json")
+	origKC, origDef := keychainReader, defaultOAuthPath
+	t.Cleanup(func() { keychainReader, defaultOAuthPath = origKC, origDef })
+	defaultOAuthPath = func() string { return missing }
+	keychainReader = func(string) ([]byte, error) { return nil, errors.New("not found") }
+	if _, err := Load(missing); !errors.Is(err, ErrFileMissing) {
+		t.Fatalf("expected ErrFileMissing, got %v", err)
+	}
+}
 
 func TestLoad_Happy(t *testing.T) {
 	dir := t.TempDir()

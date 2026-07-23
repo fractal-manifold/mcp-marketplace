@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fractal-manifold/tokenmonitor-mcp/internal/creds"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/textutil"
 )
 
@@ -501,7 +502,10 @@ func geminiRecords(path string) []record {
 // -----------------------------------------------------------------------
 
 func claudeHasSubscription(credsPath string) bool {
-	raw, err := os.ReadFile(credsPath)
+	// Keychain-aware on macOS (same source as the OAuth token); a plain
+	// os.ReadFile would silently see no file there and mis-report the
+	// account as pay-as-you-go.
+	raw, err := creds.ReadRaw(credsPath)
 	if err != nil {
 		return false
 	}
