@@ -157,7 +157,7 @@ plugin the marketplace ships):
 agy extensions install tokenmonitor
 ```
 
-This drops the extension under `~/.gemini/antigravity-cli/extensions/`
+This drops the extension under `~/.gemini/antigravity/extensions/`
 (OAuth still lives at the unchanged `~/.gemini/oauth_creds.json`). Restart
 `agy` afterwards so it picks up the new extension. See `website/plugin.html`
 for the end-user install flow.

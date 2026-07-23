@@ -87,23 +87,25 @@ broker isn't reachable there is no point collecting preferences.
   `tokenmonitor_set_device_pending`. Note `panel_enabled` also needs a panel
   data source configured broker-side to show anything.
 
-- **providers** — REQUIRED; only enabled ones are polled and shown. Pre-select
-  by detection, then confirm with `AskUserQuestion` (`multiSelect: true`,
-  options "Claude (Claude Code)" / "Codex (OpenAI)" / "Antigravity (Google)"):
-    - **Claude** is always pre-selected — if this skill is running it is
-      running inside Claude Code, so Claude is definitely active.
-    - **Codex** → pre-select if `~/.codex/auth.json` or `~/.config/codex/`
+- **providers** — REQUIRED; only enabled ones are polled and shown. **The
+  default enables all three** — pre-mark Claude, Codex *and* Antigravity in
+  `AskUserQuestion` (`multiSelect: true`, options "Claude (Claude Code)" /
+  "Codex (OpenAI)" / "Antigravity (Google)"). Credential detection is only a
+  *hint* about existing local logins, never a gate on the default:
+    - **Claude** — always active (this skill runs inside Claude Code).
+    - **Codex** — local creds if `~/.codex/auth.json` or `~/.config/codex/`
       exists, or `OPENAI_API_KEY` is set.
-    - **Antigravity** → pre-select if `agy` is on `PATH`, or
-      `~/.gemini/antigravity-cli/` or `~/.gemini/oauth_creds.json` exists (that
+    - **Antigravity** — local creds if `agy` is on `PATH`, or
+      `~/.gemini/antigravity/` or `~/.gemini/oauth_creds.json` exists (that
       OAuth file is shared with the old Gemini CLI and still used), or
       `GEMINI_API_KEY` / `GOOGLE_API_KEY` are set. (Antigravity is Google's
       successor to the Gemini CLI; it still runs Gemini-family models.)
 
-  The user may uncheck Claude if they don't want it tracked. Require at least
-  one. Send `provider_claude` / `provider_codex` / `provider_antigravity` as
-  `true` for selected and **omit** the others (on a fresh provision, absent
-  means disabled).
+  All three are checked by default; the user may uncheck any (require at least
+  one). Enabling a provider with no local creds is fine — the dashboard shows
+  "--" until that CLI logs in. Send `provider_claude` / `provider_codex` /
+  `provider_antigravity` as `true` for selected and **omit** the others (on a
+  fresh provision, absent means disabled).
 
 - **rotation** — `tokenmonitor_provision` does **not** accept rotation fields
   (`additionalProperties: false`; passing them fails the call). With 2+

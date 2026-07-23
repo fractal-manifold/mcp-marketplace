@@ -39,12 +39,14 @@ function defaults() {
     server: { bind: "127.0.0.1", port: 8765 },
     auth: { psk_passphrase: "", psk_hex: "" },
     credentials: { oauth_path: "~/.claude/.credentials.json" },
-    codex: { enabled: false, auth_path: "~/.codex/auth.json" },
+    // Default config tracks all three providers; one with no local creds
+    // just serves "creds missing" until its CLI logs in.
+    codex: { enabled: true, auth_path: "~/.codex/auth.json" },
     // Antigravity CLI (agy, successor to the retired Gemini CLI). The OAuth
     // creds the CLI writes still live under ~/.gemini/ (shared layout). A
     // legacy [gemini] section is still accepted and merged in below.
     antigravity: {
-      enabled: false,
+      enabled: true,
       creds_path: "~/.gemini/oauth_creds.json",
       projects_path: "~/.gemini/projects.json",
       // OS keyring service holding agy's consumer OAuth token (the quota RPC
@@ -65,7 +67,7 @@ function defaults() {
       codex_sessions_path: "~/.codex/sessions",
       // Antigravity CLI conversation trajectory store. The legacy
       // gemini_tmp_path key is merged into this in load() for back-compat.
-      antigravity_conversations_path: "~/.gemini/antigravity-cli/conversations",
+      antigravity_conversations_path: "~/.gemini/antigravity/conversations",
     },
     // Model price table used to turn tokens into USD. Source of truth is
     // LiteLLM's machine-readable table (same data ccusage uses); cached on

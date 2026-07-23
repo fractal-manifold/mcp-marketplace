@@ -14,6 +14,7 @@ import logging
 import math
 import re
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -519,32 +520,71 @@ ANTIGRAVITY_WEEKLY = 604800
 # is a JSON value {token:{access_token,refresh_token,expiry},…}; only the
 # access_token is read here (agy keeps it fresh while it runs).
 ANTIGRAVITY_KEYRING_SERVICE = "gemini"
+# macOS Keychain account agy stores the token under (svce=<service>,
+# acct="antigravity"). Linux libsecret keys by service only.
+ANTIGRAVITY_KEYCHAIN_ACCOUNT = "antigravity"
 
 
 def _read_keyring_token(service: str) -> dict | None:
-    """Pull agy's consumer OAuth token from the OS keyring (libsecret) via
-    `secret-tool`. The quota RPC requires THIS token — the gemini-cli token in
-    oauth_creds.json authenticates loadCodeAssist but is rejected (403) by the
-    quota endpoint. Returns the inner token object, or None on any failure (no
-    secret-tool, locked/empty keyring, bad JSON) so the fetcher degrades to "--"
-    rather than crashing. Verified via live capture 2026-06-30."""
+    """Pull agy's consumer OAuth token from the OS keyring. The quota RPC
+    requires THIS token — the gemini-cli token in oauth_creds.json authenticates
+    loadCodeAssist but is rejected (403) by the quota endpoint. Platform-aware:
+    macOS reads the login Keychain via `security find-generic-password`, Linux
+    reads libsecret via `secret-tool`. Returns the inner token object, or None
+    on any failure (missing tool, locked/empty keyring, bad JSON) so the fetcher
+    degrades to "--" rather than crashing."""
+    if sys.platform == "darwin":
+        cmd = [
+            "/usr/bin/security", "find-generic-password",
+            "-s", service, "-a", ANTIGRAVITY_KEYCHAIN_ACCOUNT, "-w",
+        ]
+    else:
+        cmd = ["secret-tool", "lookup", "service", service]
     try:
-        proc = subprocess.run(
-            ["secret-tool", "lookup", "service", service],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
     except Exception:
         return None
     if proc.returncode != 0 or not proc.stdout:
         return None
-    try:
-        d = json.loads(proc.stdout)
-    except Exception:
-        return None
-    tok = d.get("token") if isinstance(d, dict) else None
-    return tok if isinstance(tok, dict) else None
+    return _normalize_keyring_token(proc.stdout)
+
+
+def _normalize_keyring_token(raw: str) -> dict | None:
+    """Extract agy's token object from the keyring secret. Linux libsecret holds
+    the JSON {token:{access_token,expiry,…}} directly; the macOS Keychain holds
+    `<id>:<base64url(JSON)>` (a short id/label segment, then the same token JSON
+    base64url-encoded). Handles both, plus a top-level {access_token,…} object.
+    Mirror of the JS broker's normalizeKeyringToken()."""
+
+    def parse(text: str) -> dict | None:
+        try:
+            d = json.loads(text)
+        except Exception:
+            return None
+        if not isinstance(d, dict):
+            return None
+        tok = d["token"] if isinstance(d.get("token"), dict) else d
+        return tok if isinstance(tok, dict) and tok.get("access_token") else None
+
+    s = (raw or "").strip()
+    t = parse(s)
+    if t is not None:
+        return t
+    # macOS layout: colon-delimited <id>:<base64url(JSON)>.
+    if ":" in s:
+        import base64
+
+        for seg in s.split(":"):
+            if len(seg) < 16:
+                continue
+            try:
+                dec = base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)).decode("utf-8", "replace")
+            except Exception:
+                continue
+            t = parse(dec)
+            if t is not None:
+                return t
+    return None
 
 
 def _parse_iso_ms(iso: str) -> int:
