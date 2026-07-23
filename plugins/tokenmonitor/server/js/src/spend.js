@@ -9,6 +9,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { Pricing } from "./pricing.js";
 import { clipCodePoints } from "./textutil.js";
+import { readRaw } from "./creds.js";
 
 export const PROVIDER_CLAUDE = "claude";
 export const PROVIDER_CODEX = "codex";
@@ -291,7 +292,10 @@ function readJSONFile(path) {
 }
 
 function claudeHasSubscription(credsPath) {
-  const doc = readJSONFile(credsPath);
+  // Keychain-aware on macOS (same source as the OAuth token); a plain file
+  // read would see nothing there and mis-report the account as pay-as-you-go.
+  let doc = null;
+  try { doc = JSON.parse(readRaw(credsPath)); } catch { doc = null; }
   const o = doc?.claudeAiOauth;
   if (!o) return false;
   const sub = String(o.subscriptionType || "").toLowerCase();

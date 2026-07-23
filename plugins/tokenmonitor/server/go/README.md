@@ -367,8 +367,15 @@ curl -sS http://127.0.0.1:8765/credentials \
   `lsof -i :8765` to find it. If it's the old `service-go` daemon you
   meant to keep, you're done — `tokenmonitor-mcp` will just be a quiet follower.
 - **`credentials file missing` returned to the device**: you're not logged
-  in with the Claude CLI on this host. `~/.claude/.credentials.json` must
-  exist and contain a `claudeAiOauth` object.
+  in with the Claude CLI on this host. On Linux `~/.claude/.credentials.json`
+  must exist and contain a `claudeAiOauth` object. On **macOS** the CLI keeps
+  that same blob in the login Keychain (generic-password service
+  `Claude Code-credentials`) instead of the file — the broker reads it from
+  there automatically. The first read may raise a one-time Keychain prompt
+  ("*security* wants to use…"); click **Always Allow** so subsequent polls
+  succeed silently. If the message mentions the Keychain is "also
+  unavailable", either re-login with `claude` or export the blob to
+  `~/.claude/.credentials.json` and point `oauth_path` at it.
 - **Device shows `Token: PSK rejected (401/403)`**: the `psk_passphrase`
   in `tokenmonitor.toml` doesn't match what was typed in the device's captive
   portal. Either fix the TOML or re-provision the device.

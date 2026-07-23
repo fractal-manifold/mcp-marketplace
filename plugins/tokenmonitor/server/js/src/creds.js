@@ -1,15 +1,76 @@
-// Read ~/.claude/.credentials.json.
+// Read the Claude CLI OAuth credentials. On Linux the CLI writes a plaintext
+// file (~/.claude/.credentials.json by default); on macOS it stores the same
+// {"claudeAiOauth":{...}} JSON blob in the login Keychain instead. readRaw
+// hides that difference — file first, then the Keychain on darwin.
 
 import { readFileSync, existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 export class CredsFileMissing extends Error {}
 export class CredsParse extends Error {}
 
+// macOS login-Keychain generic-password service name the Claude CLI uses.
+export const KEYCHAIN_SERVICE = "Claude Code-credentials";
+
+// Overridable for tests. Shells out to /usr/bin/security to print the secret
+// to stdout. The first read may pop a GUI authorization prompt; once the user
+// picks "Always Allow" it succeeds silently. The short timeout keeps a
+// never-answered prompt from wedging the poll loop.
+let keychainReader = (service) =>
+  execFileSync("/usr/bin/security", ["find-generic-password", "-s", service, "-w"], {
+    encoding: "utf8",
+    timeout: 5_000,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+
+// The platform-default Claude credentials file. The Keychain fallback only
+// applies to this path. Overridable for tests.
+let defaultOAuthPath = () => join(homedir(), ".claude", ".credentials.json");
+
+// Test hook — swap the Keychain reader; returns the previous one.
+export function _setKeychainReader(fn) {
+  const prev = keychainReader;
+  keychainReader = fn;
+  return prev;
+}
+
+// Test hook — swap the default-path resolver; returns the previous one.
+export function _setDefaultOAuthPath(fn) {
+  const prev = defaultOAuthPath;
+  defaultOAuthPath = fn;
+  return prev;
+}
+
+// Return the raw Claude credentials JSON blob, Keychain-aware on macOS. The
+// file wins when present. Only a missing DEFAULT file falls back to the
+// Keychain (and only on darwin) — a missing explicit oauth_path override
+// errors instead of silently serving the login account's token.
+export function readRaw(path, service = KEYCHAIN_SERVICE) {
+  try {
+    return readFileSync(path, "utf8");
+  } catch (e) {
+    if (e.code !== "ENOENT") throw new CredsParse(`credentials read error: ${e.message}`);
+  }
+  if (process.platform === "darwin" && path === defaultOAuthPath()) {
+    try {
+      const raw = keychainReader(service);
+      if (raw && raw.trim()) return raw;
+    } catch {
+      // fall through to the file-missing error below
+    }
+    throw new CredsFileMissing(
+      `credentials file missing: ${path} (macOS Keychain "${service}" also unavailable)`);
+  }
+  throw new CredsFileMissing(`credentials file missing: ${path}`);
+}
+
 export function load(path) {
-  if (!existsSync(path)) throw new CredsFileMissing(`credentials file missing: ${path}`);
+  const rawText = readRaw(path);
   let doc;
   try {
-    doc = JSON.parse(readFileSync(path, "utf8"));
+    doc = JSON.parse(rawText);
   } catch (e) {
     throw new CredsParse(`credentials parse error: ${e.message}`);
   }

@@ -17,6 +17,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from . import creds
 from .pricing import Pricing, PriceTable
 
 PROVIDER_CLAUDE = "claude"
@@ -407,7 +408,12 @@ def _read_json(path: str) -> dict | None:
 
 
 def claude_has_subscription(creds_path: str) -> bool:
-    doc = _read_json(creds_path)
+    # Keychain-aware on macOS (same source as the OAuth token); a plain file
+    # read would see nothing there and mis-report as pay-as-you-go.
+    try:
+        doc = json.loads(creds.read_raw(creds_path))
+    except Exception:
+        doc = None
     o = (doc or {}).get("claudeAiOauth")
     if not isinstance(o, dict):
         return False
