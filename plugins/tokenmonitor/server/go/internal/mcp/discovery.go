@@ -296,18 +296,23 @@ func handleProvision(d Deps) server.ToolHandlerFunc {
 		_, hasAnti := args["provider_antigravity"]
 		_, hasGemini := args["provider_gemini"]
 		if hasClaude || hasCodex || hasAnti || hasGemini {
-			p := map[string]bool{}
-			if hasClaude {
-				p["claude"] = req.GetBool("provider_claude", false)
-			}
-			if hasCodex {
-				p["codex"] = req.GetBool("provider_codex", false)
+			// A provision that names ANY provider is authoritative over the
+			// WHOLE set: fill the ones the caller left out as disabled. The
+			// device's provision handler only overwrites a provider whose key
+			// is present in the payload, so if we forwarded only the named
+			// providers a re-configure that drops one (3→2) would leave the
+			// dropped provider enabled on the device. Sending all three also
+			// matches the registry lift below, which already reads an absent
+			// provider as disabled — keeping device and registry in sync.
+			p := map[string]bool{
+				"claude": req.GetBool("provider_claude", false),
+				"codex":  req.GetBool("provider_codex", false),
 			}
 			// Antigravity: prefer the new arg, fall back to the deprecated
 			// provider_gemini. The internal registry key stays "gemini".
 			if hasAnti {
 				p["gemini"] = req.GetBool("provider_antigravity", false)
-			} else if hasGemini {
+			} else {
 				p["gemini"] = req.GetBool("provider_gemini", false)
 			}
 			payload.Providers = p

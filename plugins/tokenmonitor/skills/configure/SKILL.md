@@ -87,25 +87,25 @@ broker isn't reachable there is no point collecting preferences.
   `tokenmonitor_set_device_pending`. Note `panel_enabled` also needs a panel
   data source configured broker-side to show anything.
 
-- **providers** — REQUIRED; only enabled ones are polled and shown. **The
-  default enables all three** — pre-mark Claude, Codex *and* Antigravity in
+- **providers** — REQUIRED; only enabled ones are polled and shown. **Enable
+  all three by default** — pre-mark Claude, Codex *and* Antigravity in
   `AskUserQuestion` (`multiSelect: true`, options "Claude (Claude Code)" /
-  "Codex (OpenAI)" / "Antigravity (Google)"). Credential detection is only a
-  *hint* about existing local logins, never a gate on the default:
-    - **Claude** — always active (this skill runs inside Claude Code).
-    - **Codex** — local creds if `~/.codex/auth.json` or `~/.config/codex/`
-      exists, or `OPENAI_API_KEY` is set.
-    - **Antigravity** — local creds if `agy` is on `PATH`, or
-      `~/.gemini/antigravity/` or `~/.gemini/oauth_creds.json` exists (that
-      OAuth file is shared with the old Gemini CLI and still used), or
-      `GEMINI_API_KEY` / `GOOGLE_API_KEY` are set. (Antigravity is Google's
-      successor to the Gemini CLI; it still runs Gemini-family models.)
-
-  All three are checked by default; the user may uncheck any (require at least
-  one). Enabling a provider with no local creds is fine — the dashboard shows
-  "--" until that CLI logs in. Send `provider_claude` / `provider_codex` /
-  `provider_antigravity` as `true` for selected and **omit** the others (on a
-  fresh provision, absent means disabled).
+  "Codex (OpenAI)" / "Antigravity (Google)"). **Do NOT inspect local credential
+  files or disable a provider because you can't find a login.** Credential
+  storage is platform-specific — plain files, environment variables, or the
+  macOS Keychain — and the broker resolves it; a filesystem probe from here is
+  both incomplete (it misses the Keychain) and irrelevant to the default. A
+  provider with no usable login stays enabled and simply shows "--" on the
+  dashboard until its CLI logs in. The user may uncheck any (require at least
+  one). (Antigravity is Google's successor to the Gemini CLI; it still runs
+  Gemini-family models.) Send **all three** of `provider_claude` /
+  `provider_codex` / `provider_antigravity` **explicitly** — `true` for the
+  selected ones, `false` for the unchecked ones. **Do not omit the unchecked
+  ones:** the device's provision handler only overwrites a provider's stored
+  state when its key is present in the payload, so on a *re-configure* an
+  omitted provider keeps whatever it already was — dropping a device from three
+  providers to two by omission would silently leave the third enabled. An
+  explicit `false` is what actually disables it.
 
 - **rotation** — `tokenmonitor_provision` does **not** accept rotation fields
   (`additionalProperties: false`; passing them fails the call). With 2+

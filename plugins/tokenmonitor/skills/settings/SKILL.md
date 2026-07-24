@@ -52,7 +52,10 @@ reference "the Display section" or "the Audio settings":
   `provider_mode_codex=disabled`; "show Claude as API spend" →
   `provider_mode_claude=api_key`. Also `antigravity_models` (dashboard model
   hints). The third provider was renamed **Gemini → Antigravity**; the
-  `*_gemini` names still work as aliases but prefer `*_antigravity`.
+  `*_gemini` names still work as aliases but prefer `*_antigravity`. Note
+  `auto` keeps the provider **enabled** and lets the broker pick the data
+  source/mode; a provider with no login shows "--", it is *not* disabled.
+  `disabled` is the only mode that hides a provider.
 - **Display** — `autorotate_enabled`, `autorotate_interval_s`, `theme_mode`,
   `br_day`, `br_night`, `panel_enabled`. For `theme_mode`, normalise first
   (`dark`→`night`, `light`→`day`, `automatic`/`sunset`/`sunrise`→`auto`); ask
@@ -123,10 +126,12 @@ control plane today**, so pushing a string that geocodes is the only fix.
 
 If the user asks to **disable all providers**, refuse — the dashboard would
 have nothing to show. Require at least one to remain enabled; read
-`active_providers` from `tokenmonitor_list_devices` for the current set.
-Disabling auto-rotate while only one provider is enabled is fine (that is the
-natural state); conversely, if the user enables a second provider, suggest
-turning autorotation on if it is currently off.
+`active_providers` from `tokenmonitor_list_devices` for the current set. **Never
+disable a provider merely because the broker reports no credentials or usage
+for it** — that is a "--" display, not a reason to turn it off; disable only on
+explicit user request. Disabling auto-rotate while only one provider is enabled
+is fine (that is the natural state); conversely, if the user enables a second
+provider, suggest turning autorotation on if it is currently off.
 
 ### 3. Special case — passphrase rotation
 

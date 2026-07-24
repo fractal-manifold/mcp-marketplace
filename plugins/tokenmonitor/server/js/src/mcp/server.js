@@ -668,7 +668,7 @@ async function discoverDevicesTool(args) {
   });
 }
 
-async function provisionTool(deps, args) {
+export async function provisionTool(deps, args) {
   const deviceID = String(args.device_id || "").trim().toLowerCase();
   const provisionURL = String(args.provision_url || "").trim();
   const code = String(args.pairing_code || "").trim();
@@ -721,14 +721,24 @@ async function provisionTool(deps, args) {
   if ("pet_enabled" in args) payload.pet_enabled = !!args.pet_enabled;
   if ("panel_enabled" in args) payload.panel_enabled = !!args.panel_enabled;
   const providers = {};
-  for (const name of ["claude", "codex", "gemini"]) {
-    let key = `provider_${name}`;
-    // Antigravity (formerly Gemini): prefer the new arg name, fall back to
-    // the deprecated provider_gemini. Internal key stays "gemini".
-    if (name === "gemini" && "provider_antigravity" in args) key = "provider_antigravity";
-    if (key in args) providers[name] = !!args[key];
+  const provArgs = ["provider_claude", "provider_codex", "provider_antigravity", "provider_gemini"];
+  if (provArgs.some((k) => k in args)) {
+    // A provision that names ANY provider is authoritative over the WHOLE
+    // set: fill the ones the caller left out as disabled. The device's
+    // provision handler only overwrites a provider whose key is present in
+    // the payload, so forwarding only the named providers would leave a
+    // dropped provider enabled on a re-configure (3→2). Sending all three
+    // also matches the registry lift below, which reads an absent provider
+    // as disabled — keeping device and registry in sync.
+    for (const name of ["claude", "codex", "gemini"]) {
+      let key = `provider_${name}`;
+      // Antigravity (formerly Gemini): prefer the new arg name, fall back to
+      // the deprecated provider_gemini. Internal key stays "gemini".
+      if (name === "gemini" && "provider_antigravity" in args) key = "provider_antigravity";
+      providers[name] = !!args[key];
+    }
+    payload.providers = providers;
   }
-  if (Object.keys(providers).length) payload.providers = providers;
 
   const body = JSON.stringify(payload);
   const url = new URL(provisionURL);

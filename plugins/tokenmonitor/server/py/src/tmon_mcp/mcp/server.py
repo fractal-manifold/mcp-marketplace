@@ -949,15 +949,22 @@ async def _provision(deps: Deps, args: dict) -> dict:
     if "panel_enabled" in args:
         payload["panel_enabled"] = bool(args["panel_enabled"])
     providers: dict[str, bool] = {}
-    for name in ("claude", "codex", "gemini"):
-        key = f"provider_{name}"
-        # Antigravity (formerly Gemini): prefer the new arg name, fall back
-        # to the deprecated provider_gemini. Internal key stays "gemini".
-        if name == "gemini" and "provider_antigravity" in args:
-            key = "provider_antigravity"
-        if key in args:
-            providers[name] = bool(args[key])
-    if providers:
+    _provider_args = ("provider_claude", "provider_codex", "provider_antigravity", "provider_gemini")
+    if any(k in args for k in _provider_args):
+        # A provision that names ANY provider is authoritative over the WHOLE
+        # set: fill the ones the caller left out as disabled. The device's
+        # provision handler only overwrites a provider whose key is present in
+        # the payload, so forwarding only the named providers would leave a
+        # dropped provider enabled on a re-configure (3→2). Sending all three
+        # also matches the registry lift below, which reads an absent provider
+        # as disabled — keeping device and registry in sync.
+        for name in ("claude", "codex", "gemini"):
+            key = f"provider_{name}"
+            # Antigravity (formerly Gemini): prefer the new arg name, fall back
+            # to the deprecated provider_gemini. Internal key stays "gemini".
+            if name == "gemini" and "provider_antigravity" in args:
+                key = "provider_antigravity"
+            providers[name] = bool(args.get(key, False))
         payload["providers"] = providers
 
     try:

@@ -1,6 +1,6 @@
 {
   "name": "tokenmonitor",
-  "version": "0.10.7",
+  "version": "0.10.8",
   "description": "Registers tokenmonitor-mcp, the local broker and control plane for TokenMonitor devices.",
   "author": {
     "name": "fractal-manifold",
