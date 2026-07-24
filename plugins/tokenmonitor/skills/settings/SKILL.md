@@ -1,437 +1,193 @@
 ---
 name: settings
-description: tokenmonitor plugin — remotely change any on-device setting that the Settings panel exposes (city, day / night brightness, alert volume, enabled providers, auto-rotation, virtual pet, broker URL, passphrase) on a TokenMonitor device. Equivalent to long-pressing the mascot on the dashboard and editing a row, but driven from Claude Code via the control plane. Use this when the user says "set the wall monitor city to Madrid", "lower the night brightness", "mute the alerts", "disable Codex on device X", "rotate providers every 60 s", "change the pet to a dragon", "rename the pet", "hide the pet", "rotate the broker passphrase", "change the broker URL", "enable/disable the custom panel", "configure the swipe-up panel", "change what the panel shows", or any similar reconfiguration of an already-provisioned device.
+description: tokenmonitor plugin — remotely change any on-device setting the Settings panel exposes (city, day / night brightness, alert volume, providers and their modes, auto-rotation, theme, virtual pet, custom panel, broker URL, passphrase) on a TokenMonitor device. Equivalent to long-pressing the mascot on the dashboard and editing a row, but driven from Claude Code via the control plane. Use this when the user says "set the wall monitor city to Madrid", "lower the night brightness", "mute the alerts", "disable Codex on device X", "rotate providers every 60 s", "change/rename/hide the pet", "rotate the broker passphrase", "change the broker URL", "enable/disable the custom (swipe-up) panel", "change what the panel shows", or any similar reconfiguration of an already-provisioned device.
 ---
 
 # /tokenmonitor:settings
 
-Push a runtime configuration change to an already-provisioned
-TokenMonitor device. The change is queued through the control plane and
-applied on the device's next 60 s poll (with the candidate / promote
-safety net — a bad config rolls back automatically).
+Push a runtime configuration change to an already-provisioned TokenMonitor
+device. The change is queued through the control plane and applied on the
+device's next 60 s poll, under the candidate/promote safety net — a bad config
+rolls back automatically.
 
-This is the remote equivalent of the on-device Settings panel
-(long-press the mascot on the dashboard). For *first-time* provisioning
-of a brand-new device, use [[configure]] instead. For the dedicated
-theme shortcut, [[theme]] is a thin wrapper around the `theme_mode`
-field here.
-
-## When to invoke
-
-- "Set the wall monitor city to Madrid."
-- "Lower the night brightness to 15."
-- "Mute the alerts." / "Set alert volume to 0."
-- "Enable / disable Codex on the wall monitor."
-- "Rotate providers every 60 s."
-- "Stop rotating providers." / "Pin the dashboard to Claude."
-- "Change the pet to a dragon." / "Rename the pet to Sparky." / "Hide the pet."
-- "Change the broker URL on device `<id>`."
-- "Rotate the broker passphrase on the wall monitor."
-- "Enable / disable the custom (swipe-up) panel." / "Change what the panel shows."
-- "Update the wall monitor settings."
+This is the remote equivalent of the on-device Settings panel (long-press the
+mascot). For *first-time* provisioning use [[configure]]; [[theme]] is a thin
+wrapper around the `theme_mode` field here.
 
 ## Out of scope
 
-- **WiFi SSID and password are NOT remotely changeable.** The control
-  plane intentionally never advertises them: a wrong WiFi push would
-  brick the device because it loses connectivity *before* it can
-  rollback. Tell the user they have to either open the on-device
-  Settings panel (long-press the mascot) or factory-reset the device
+- **WiFi SSID and password are NOT remotely changeable**, by design: a wrong
+  WiFi push would brick the device, since it loses connectivity *before* it can
+  roll back. The user must use the on-device Settings panel or factory-reset
   and re-run `/tokenmonitor:configure`.
-- **First-time provisioning** (the device is showing "Waiting for
-  setup"): use [[configure]] — this skill needs a device that is
-  already registered in the broker's registry.
+- **First-time provisioning** (device shows "Waiting for setup") → [[configure]].
+  This skill needs a device already in the broker's registry.
 
 ## Procedure
 
 ### 1. Resolve the device
 
-Call `tokenmonitor_list_devices`.
+Call `tokenmonitor_list_devices`. 0 devices → tell the user nothing is
+registered and stop (suggest `/tokenmonitor:configure`). 1 → use it without
+asking. >1 → if the user did not name one, present the list with
+`AskUserQuestion` (`device_id`, `active_broker_url`, `last_seen`).
 
-- 0 devices → tell the user nothing is registered and stop (suggest
-  `/tokenmonitor:configure`).
-- 1 device → use it without asking.
-- >1 devices → if the user did not name one, present the list with
-  `AskUserQuestion` (show `device_id`, `active_broker_url`,
-  `last_seen`).
+### 2. Map the request to `tokenmonitor_set_device_pending` arguments
 
-### 2. Resolve the fields to change
+**Only send arguments the user actually asked to change** — omitted fields keep
+their current value on the device. The tool schema carries the ranges, enums
+and precedence rules; consult it rather than guessing, and clamp numeric values
+to its ranges, warning the user when you had to clamp. Two constraints the
+schema does **not** state: every numeric field is an **integer** on the wire
+(the broker stores them as `uint8`, so `br_day: 42.5` silently truncates), and
+`city` is capped at **64 bytes** (the firmware clips it UTF-8-aware rather than
+rejecting, so an over-long name is silently shortened).
 
-For each setting the user mentioned, map to the `tokenmonitor_set_device_pending`
-argument from the table below. **Only send arguments the user actually
-asked to change** — every other field is left as-is on the device
-(omitted arguments mean "keep current").
+The device's Settings screen groups these into five sections, so the user may
+reference "the Display section" or "the Audio settings":
 
-On the device the Settings screen is grouped into five visible
-sections; the same grouping is reflected here so it's easy to find
-the matching MCP argument when the user references "the Display
-section" or "the Audio settings".
+- **Providers** — `provider_mode_{claude,codex,antigravity}` (fine-grained:
+  auto / disabled / subscription / api_key) or the legacy coarse booleans
+  `provider_{claude,codex,antigravity}`. "Disable Codex" →
+  `provider_mode_codex=disabled`; "show Claude as API spend" →
+  `provider_mode_claude=api_key`. Also `antigravity_models` (dashboard model
+  hints). The third provider was renamed **Gemini → Antigravity**; the
+  `*_gemini` names still work as aliases but prefer `*_antigravity`.
+- **Display** — `autorotate_enabled`, `autorotate_interval_s`, `theme_mode`,
+  `br_day`, `br_night`, `panel_enabled`. For `theme_mode`, normalise first
+  (`dark`→`night`, `light`→`day`, `automatic`/`sunset`/`sunrise`→`auto`); ask
+  if still ambiguous.
+- **Virtual pet** — `pet_enabled`, `pet_species` (int enum in the schema; map
+  the named animal to its number, or pick the closest / ask when the user names
+  a species that isn't in the list), `pet_name`.
+- **Network** — `city` (**run the geocoding pre-check below first**),
+  `broker_url`, `psk_hex`.
+- **Audio** — `vol`.
 
-#### Providers
+Pet and panel settings are **device-owned**: the user can also change them on
+the device, which reports its choice back via `POST /device/<id>/settings`, so
+a control-plane push and an on-device edit converge. A device that has not
+picked a species yet simply omits `pet_species` from its report — normal, and
+it leaves the stored value untouched.
 
-| User intent                       | MCP argument               | Valid range / format               |
-| --------------------------------- | -------------------------- | ---------------------------------- |
-| Set Claude provider mode          | `provider_mode_claude`     | `auto` \| `disabled` \| `subscription` \| `api_key` |
-| Set Codex provider mode           | `provider_mode_codex`      | `auto` \| `disabled` \| `subscription` \| `api_key` |
-| Set Antigravity provider mode     | `provider_mode_antigravity`| `auto` \| `disabled` \| `subscription` \| `api_key` |
-| Enable/disable Claude (coarse)    | `provider_claude`          | bool (legacy: true→auto, false→disabled) |
-| Enable/disable Codex (coarse)     | `provider_codex`           | bool (legacy: true→auto, false→disabled) |
-| Enable/disable Antigravity (coarse)| `provider_antigravity`    | bool (legacy: true→auto, false→disabled) |
+**About** (Device ID, firmware version, IP, active broker URL) is read-only
+diagnostics. If the user asks for any of it, read the fields from
+`tokenmonitor_list_devices` — do NOT queue a pending change.
 
-Mode meanings: `disabled` hides the provider; `auto` trusts the broker's
-credential detection (subscription vs pay-as-you-go); `subscription` forces
-the dashboard's quota-% view; `api_key` forces the $-spend view. The
-`provider_mode_*` arg wins over `provider_*` when both are given. "Disable
-Codex" → `provider_mode_codex=disabled`; "show Claude as API spend" →
-`provider_mode_claude=api_key`.
-
-The third provider was renamed **Gemini → Antigravity** (the tracked tool is
-now Google's `agy` CLI; it still runs the Gemini-family models). Prefer the
-`*_antigravity` arg names (`provider_mode_antigravity`, `provider_antigravity`,
-and the model-hint `antigravity_models`); the legacy `*_gemini` names
-(`provider_mode_gemini`, `provider_gemini`, `gemini_models`) are still accepted
-as aliases.
-
-#### Display
-
-| User intent                       | MCP argument               | Valid range / format               |
-| --------------------------------- | -------------------------- | ---------------------------------- |
-| Auto-rotate enabled               | `autorotate_enabled`       | bool                               |
-| Auto-rotate interval (seconds)    | `autorotate_interval_s`    | int, 1..300                        |
-| Theme (day / night / auto)        | `theme_mode`               | one of `day`, `night`, `auto`      |
-| Day brightness                    | `br_day`                   | int, 10..100 (% of backlight)      |
-| Night brightness                  | `br_night`                 | int, 5..100 (% of backlight)       |
-| Custom-panel screen               | `panel_enabled`            | bool (default false, opt-in)       |
-
-`panel_enabled` only turns on the swipe-up screen; it shows data only if the
-broker is also pointed at a panel file via its `[panel]` config section (see
-the monorepo's `docs/custom-panel.md`). Enabling it on a broker with no
-`[panel]` set just shows an empty-state message on the device.
-
-##### Enabling / disabling / configuring the custom panel
-
-The custom panel has **two independent switches** — get both right:
-
-1. **The device flag** `panel_enabled` (this skill / on-device Settings →
-   Display → Custom panel). Controls whether the device *polls for* and
-   *renders* the swipe-up screen at all.
-2. **The broker content** — a JSON file the broker serves at
-   `GET /device/<id>/panel`. Without a file the endpoint returns **404** and
-   the page drops out of the rotation even if `panel_enabled=true`.
-
-**Enable:** send `panel_enabled: true` **and** make sure the broker has a
-panel file (see "Configuring" below). One without the other shows only the
-empty-state message.
-
-**Disable:** the clean way is `panel_enabled: false` (the device stops polling
-and rendering — this is what frees the RAM the panel's render buffers hold).
-**But** `panel_enabled` only exists on brokers new enough to advertise it in
-`tokenmonitor_set_device_pending`. If the arg is **absent from the tool schema**
-(older broker — e.g. 0.9.6), you cannot toggle the device flag remotely; fall
-back to disabling the **content** broker-side so the endpoint 404s and the page
-drops from the rotation:
-
-- Per-device file: move/rename `<panel-dir>/<device-id>.json` aside, **and**
-  `<panel-dir>/default.json` if present (otherwise the device falls back to
-  the default file and the page stays).
-- Or comment out the whole `[panel]` section in the broker config and restart
-  the broker.
-
-The broker re-reads panel files on every request (mtime+size cache), so
-removing a file 404s on the **next device poll (~20 s) without a broker
-restart** — only editing the `[panel]` *section* of the config needs a restart.
-Tell the user the panel flag itself is still on and suggest bumping the broker
-so `panel_enabled` becomes pushable.
-
-**Configuring the content** is a broker-side filesystem operation, not a device
-pending. Resolve the broker's panel location from its `[panel]` section
-(`~/.config/tokenmonitor/tokenmonitor.toml`):
-
-- `dir` set → per-device `dir/<device-id>.json`, else `dir/default.json`;
-- else `file` → one shared panel for every device.
-
-Write valid PANEL_WIRE JSON there (`version:1`, 1–4 `tiles` of type
-`line`/`bar`/`pie`/`table`/`text`; caps: 4 tiles, 4 series, 64 points, 8 KB
-file; solid `#rrggbb` colors only). **Write atomically** (temp file + rename)
-so the broker never serves a half-written file — it picks up the change on the
-next request, no restart. Full field list and examples live in the monorepo's
-`docs/custom-panel.md` and `compat/PANEL_WIRE.md`. If the user asks to *change
-what the panel shows* rather than toggle it, edit that file; do **not** queue a
-device pending.
-
-#### Virtual pet
-
-These are **device-owned** display settings: the user can also pick them on
-the device, and the device reports its choice back via
-`POST /device/<id>/settings` (so a control-plane push and an on-device edit
-converge — the report contract lives in the monorepo's shared compat suite at
-`compat/SETTINGS_REPORT.md`; a standalone plugin install only bundles
-`server/compat/tool-schemas.json`, not this file). They apply on the device's
-next poll like any other Display field.
-
-| User intent                       | MCP argument               | Valid range / format               |
-| --------------------------------- | -------------------------- | ---------------------------------- |
-| Show / hide the pet               | `pet_enabled`              | bool (default true)                |
-| Pet species                       | `pet_species`              | int 0..9 (enum below; clamped)     |
-| Pet name                          | `pet_name`                 | string ≤ 15 chars (truncated; `""` = species default) |
-
-Species enum: `0=cat, 1=dog, 2=dragon, 3=robot, 4=blob, 5=slime, 6=duck,
-7=penguin, 8=owl, 9=ghost`. Map a named animal to its number (e.g. "make it a
-dragon" → `pet_species: 2`); if the user names a species not in the list, pick
-the closest or ask. Note the device may not have picked a species yet, in
-which case `pet_species` is simply absent from its report — that is normal and
-leaves the stored value untouched.
-
-#### Network
-
-| User intent                       | MCP argument               | Valid range / format               |
-| --------------------------------- | -------------------------- | ---------------------------------- |
-| City (weather / sunrise)          | `city`                     | string, 1..64 chars — **must geocode**, see pre-check below |
-| Broker URL                        | `broker_url`               | full URL (e.g. `http://10.0.0.5:8787`) |
-| Pairing passphrase / PSK rotation | `psk_hex`                  | exactly 64 lowercase hex chars     |
-
-#### Audio
-
-| User intent                       | MCP argument               | Valid range / format               |
-| --------------------------------- | -------------------------- | ---------------------------------- |
-| Alert volume                      | `vol`                      | int, 0..100 (% of audio level)     |
-
-#### About (read-only on the device)
-
-The device's Settings screen also exposes an **About** section with
-Device ID, running firmware version, IP address and active broker
-URL. These are diagnostic readouts — there is no MCP argument to
-change them (Device ID is assigned at first boot, firmware comes
-from the running image, IP from DHCP, and Broker URL mirrors the
-editable `broker_url` above). If the user asks "what's the IP /
-firmware / device ID of my wall monitor", call
-`tokenmonitor_list_devices` and read the active fields from the
-registry — do NOT queue a pending change.
-
-Clamp numeric values to the listed ranges and warn the user if you had
-to clamp. For `theme_mode`, normalise (`dark`→`night`, `light`→`day`,
-`automatic`/`sunset`/`sunrise`→`auto`); if still ambiguous, ask.
+**Custom panel**: it has two independent switches — the device flag
+`panel_enabled` *and* a panel JSON file the broker serves at
+`GET /device/<id>/panel`. Both must be on for the screen to show data.
+Changing *what the panel shows* is a broker-side file edit, **not** a pending.
+If the broker is too old to expose `panel_enabled` in the tool schema, the only
+way to disable the panel is to remove the content broker-side so the endpoint
+404s. Before doing anything panel-related, read `custom-panel.md` next to this
+file (in this skill's directory) for the full procedure.
 
 #### City — geocoding pre-check (REQUIRED before sending `city`)
 
-The device **re-geocodes the string you push**: on the next ambient
-cycle the firmware calls Open-Meteo with that exact string. Open-Meteo's
-`name=` parameter expects a **single place name**, not a
-comma-separated descriptor — so `"Pinto, Madrid, Spain"` returns **zero
-results** and the device silently falls back to its build-time default
-coordinates (you see `geocoding: no results for '<city>'` in
-`tokenmonitor_device_logs`). There is **no lat/lon field in the control
-plane today**, so the only way to fix the location is to push a string
-that geocodes. Validate and normalise it here, before queueing:
+The device re-geocodes the string you push: on the next ambient cycle the
+firmware calls Open-Meteo with that exact string. Open-Meteo's `name=`
+parameter expects a **single place name**, not a comma-separated descriptor —
+`"Pinto, Madrid, Spain"` returns zero results and the device silently falls
+back to its build-time default coordinates (`geocoding: no results for
+'<city>'` in `tokenmonitor_device_logs`). There is **no lat/lon field in the
+control plane today**, so pushing a string that geocodes is the only fix.
 
-1. Run the **firmware's exact query** so you see what the device will
-   see (`count=1`, `language=es`):
+1. Run the firmware's exact query so you see what the device will see:
 
    ```
    curl -s "https://geocoding-api.open-meteo.com/v1/search?name=<URL-encoded>&count=1&language=es&format=json"
    ```
 
-   A non-empty `results[]` means the string geocodes as-is → push it
-   verbatim.
+   Non-empty `results[]` → push the string verbatim.
 
-2. If `results` is empty, build simpler candidates **in order** and test
-   each with the same query, taking the first that resolves:
-   - the first comma-segment (`"Pinto, Madrid, Spain"` → `"Pinto"`);
-   - the bare town with no region/country words.
+2. If empty, test simpler candidates in order, taking the first that resolves:
+   the first comma-segment (`"Pinto, Madrid, Spain"` → `"Pinto"`), then the
+   bare town with no region/country words. Push the form that resolved (the
+   device must resolve the identical string) and tell the user you normalised
+   `"<original>"` → `"<resolved>"`, showing the matched `name` / `admin1` /
+   `country_code` / `latitude,longitude`.
 
-   When a simplified form resolves, **push that form** (the device must
-   resolve the identical string), and tell the user you normalised
-   `"<original>"` → `"<resolved>"`, showing the matched
-   `name` / `admin1` / `country_code` / `latitude,longitude` for
-   confirmation.
+3. If nothing resolves, widen the search (`count=5`, drop `language=es`) and
+   use `AskUserQuestion` to let the user pick — offer the closest indexed town
+   **or the nearest larger city** (e.g. Pinto → Getafe, ~5 km, pop 187k).
+   **Never queue a `city` you could not geocode.**
 
-3. If **nothing** resolves (typo, or a hamlet Open-Meteo doesn't index),
-   widen the search (`count=5`, drop `language=es`) to list candidates,
-   and use `AskUserQuestion` to let the user pick — offer the closest
-   indexed town **or the nearest larger city** (e.g. Pinto → Getafe,
-   ~5 km, pop 187k). Push the chosen city's bare name. **Never queue a
-   `city` you could not geocode** — it would just re-trigger the silent
-   fallback.
+4. "Use coordinates instead" is **not possible remotely**: the firmware stores
+   `tmon_lat`/`tmon_lon` but the pending payload has no lat/lon field, and
+   writing `tmon_city` erases them so the device re-geocodes. Exact coordinates
+   for an unindexed spot need the on-device captive portal / Settings panel; a
+   nearby indexed city is the remote-friendly answer.
 
-4. "Use coordinates instead" is **not yet possible remotely**: the
-   firmware stores `tmon_lat`/`tmon_lon` but the control-plane pending has
-   no lat/lon field, and writing `tmon_city` erases them so the device
-   re-geocodes. If the user insists on exact coordinates for an
-   unindexed spot, the only path today is the on-device captive
-   portal / Settings panel; pushing a nearby indexed city is the
-   remote-friendly answer. (A signed lat/lon pending field is a possible
-   follow-up.)
+#### Provider sanity rules
 
-If the user asks to **disable all providers**, refuse: the dashboard
-has nothing to show and the device will fall back to "no provider".
-Require at least one provider remain enabled. To get the current set
-of enabled providers, read `active_providers` from
-`tokenmonitor_list_devices`.
+If the user asks to **disable all providers**, refuse — the dashboard would
+have nothing to show. Require at least one to remain enabled; read
+`active_providers` from `tokenmonitor_list_devices` for the current set.
+Disabling auto-rotate while only one provider is enabled is fine (that is the
+natural state); conversely, if the user enables a second provider, suggest
+turning autorotation on if it is currently off.
 
-If the user asks to **disable auto-rotate while only one provider is
-enabled**, just queue `autorotate_enabled: false` — that is the natural
-state. Conversely, if the user enables a second provider, suggest also
-enabling autorotation if it is currently off.
+### 3. Special case — passphrase rotation
 
-### 3. Special-case: passphrase rotation
-
-If the user wants to rotate the passphrase / PSK:
-
-1. Ask whether they want a freshly-generated PSK (recommended) or to
-   supply their own. If freshly generated, derive
-   `psk_hex = secrets.token_hex(32)` locally — the broker's
+1. Ask whether they want a freshly-generated PSK (recommended) or their own.
+   If generated, derive `psk_hex = secrets.token_hex(32)` **locally** —
    `set_device_pending` does not auto-generate one (unlike `provision`).
-2. Send `psk_hex` only. The broker keeps accepting the OLD PSK until
-   the device promotes the new one (via `auth.VerifyMulti`), so a
-   rotation does not lock you out mid-flight.
-3. Warn the user: if the device fails to promote (three OKs within
-   five minutes), it rolls back to the old PSK automatically — they
-   should run `tokenmonitor_list_devices` after ~5 min to confirm the
-   `pending_changes` list no longer mentions `psk_hex (key rotation)`.
+2. Send `psk_hex` only. The broker keeps accepting the OLD PSK until the device
+   promotes the new one (`auth.VerifyMulti`), so rotation cannot lock you out
+   mid-flight.
+3. Warn the user: if the device fails to promote (three OKs within five
+   minutes) it rolls back to the old PSK automatically — they should run
+   `tokenmonitor_list_devices` after ~5 min to confirm `pending_changes` no
+   longer mentions `psk_hex (key rotation)`.
 
-### 4. Special-case: broker_url change
+### 4. Special case — broker_url change
 
-A `broker_url` change is a *move-to-another-broker* operation. Before
-queueing it, ask the user to confirm the new broker is reachable from
-the device's network — if not, the candidate will fail to probe and
-the device rolls back. If the new broker URL belongs to a *different*
-machine, the registry on the new machine also needs a matching device
-entry; suggest the user run `tokenmonitor_register_device` over there
-with the same `device_id` and `psk_hex` first.
+This is a *move-to-another-broker* operation. Confirm with the user that the
+new broker is reachable from the device's network, or the candidate fails to
+probe and the device rolls back. If the new URL belongs to a *different*
+machine, that machine's registry also needs a matching entry — suggest running
+`tokenmonitor_register_device` there first with the same `device_id` and
+`psk_hex`.
 
 ### 5. Queue the change
 
-Call:
-
-```
-tokenmonitor_set_device_pending
-  device_id: <id>
-  <only the fields the user asked to change>
-```
-
-The broker stores the diff as a pending config blob and bumps
-`cfg_ver`. The response includes the updated `device` summary; verify
-that `pending_changes` lists the fields you sent. If `pending_changes`
-is empty, the values already matched the active config — tell the user
-"already set to <value>" and stop.
+Call `tokenmonitor_set_device_pending` with `device_id` plus only the fields
+the user asked to change. Verify the response's `pending_changes` lists what
+you sent; if it is empty the values already matched the active config — tell
+the user "already set to <value>" and stop.
 
 ### 6. Tell the user what happens next
 
-```
-Queued <fields> on device <device_id>.
-The device polls every ~60 s; it will pick up the change, probe it
-against its own broker, and either promote (~90 s end to end) or
-roll back automatically if it can't confirm three healthy fetches
-within 5 minutes.
-```
+> Queued <fields> on device <device_id>. The device polls every ~60 s; it will
+> pick the change up, probe it against its own broker, and either promote
+> (~90 s end to end) or roll back automatically if it can't confirm three
+> healthy fetches within 5 minutes.
 
-If the change requires a reboot (anything that touches `broker_url`,
-`psk_hex`, `theme_mode`, providers, or autorotate settings), mention
-that the screen will go through a brief reboot before settling. Pure
-"live" fields (`br_day`, `br_night`, `vol`, `city`) apply without a
-reboot — the next ambient / backlight tick picks them up.
+Changes touching `broker_url`, `psk_hex`, `theme_mode`, providers or autorotate
+settings need a **reboot** — mention the screen will blank briefly. The "live"
+fields `br_day`, `br_night`, `vol` and `city` apply **without** a reboot, on
+the next ambient / backlight tick.
 
-For verification, the user can run `tokenmonitor_list_devices` to
-watch `pending_changes` drain, or `tokenmonitor_recent_logs` to see
+To verify, the user can watch `pending_changes` drain via
+`tokenmonitor_list_devices`, or `tokenmonitor_recent_logs` for
 `rebooting to apply promoted config`.
-
-## Examples
-
-### Bump night brightness
-
-```
-tokenmonitor_set_device_pending
-  device_id: ab12cd34
-  br_night: 15
-```
-
-### Mute the alerts
-
-```
-tokenmonitor_set_device_pending
-  device_id: ab12cd34
-  vol: 0
-```
-
-### Disable Codex, keep Claude and Antigravity, rotate every 45 s
-
-```
-tokenmonitor_set_device_pending
-  device_id: ab12cd34
-  provider_codex: false
-  autorotate_enabled: true
-  autorotate_interval_s: 45
-```
-
-### Change the pet to a named dragon
-
-```
-tokenmonitor_set_device_pending
-  device_id: ab12cd34
-  pet_species: 2
-  pet_name: Sparky
-```
-
-### Rotate the passphrase
-
-```
-tokenmonitor_set_device_pending
-  device_id: ab12cd34
-  psk_hex: <64 hex chars>
-```
-
-### Enable the custom panel
-
-```
-tokenmonitor_set_device_pending
-  device_id: ab12cd34
-  panel_enabled: true
-# …then make sure the broker has a panel file (see "Configuring the content").
-```
-
-### Disable the custom panel
-
-```
-# Preferred — if the tool schema exposes panel_enabled:
-tokenmonitor_set_device_pending
-  device_id: ab12cd34
-  panel_enabled: false
-
-# Fallback — older broker (no panel_enabled arg): 404 the content instead.
-mv <panel-dir>/ab12cd34.json <panel-dir>/.disabled/   # and default.json if present
-# Device 404s on its next ~20 s poll and drops the panel page; no broker restart.
-```
-
-## Tools used (in order)
-
-1. `tokenmonitor_list_devices`       — resolve the device + read
-   current active providers (for the "don't disable everything" check).
-2. `tokenmonitor_set_device_pending` — queue the diff.
-3. `tokenmonitor_list_devices`       — (optional, suggested to user)
-   confirm `pending_changes` drained.
 
 ## Common errors
 
-- **`device <id> not registered`** — the device was never registered
-  on this broker. The user has to either run
-  `/tokenmonitor:configure` (if it's a fresh device on the LAN) or
-  `tokenmonitor_register_device` (if the device is alive but its
+- **`device <id> not registered`** — run `/tokenmonitor:configure` (fresh
+  device on the LAN) or `tokenmonitor_register_device` (device alive but its
   registry entry was lost).
-- **`psk_hex must be exactly 64 hex chars`** — the user's passphrase
-  string was passed raw. Either generate `secrets.token_hex(32)` or
-  hash a passphrase with SHA-256 first; never pass arbitrary text.
-- **`theme_mode must be one of: day, night, auto`** — see
-  normalisation rules in step 2.
-- **`registry disabled`** — the broker is running without a registry
-  path; the user has to configure
-  `~/.config/tokenmonitor/devices/` and restart `tokenmonitor-mcp`.
-- **`pending_changes` never drains** — most often the new candidate
-  fails to probe (wrong `broker_url`, wrong `psk_hex`). Check
-  `tokenmonitor_recent_logs` for `candidate probe failed`; the device
-  will roll back automatically after 5 minutes.
+- **`psk_hex must be exactly 64 hex chars`** — a raw passphrase was passed.
+  Generate `secrets.token_hex(32)` or SHA-256 the passphrase first; never pass
+  arbitrary text.
+- **`registry disabled`** — the broker runs without a registry path; the user
+  must configure `~/.config/tokenmonitor/devices/` and restart
+  `tokenmonitor-mcp`.
+- **`pending_changes` never drains** — usually the candidate fails to probe
+  (wrong `broker_url` or `psk_hex`). Check `tokenmonitor_recent_logs` for
+  `candidate probe failed`; the device rolls back after 5 minutes.
 - **City accepted but weather/location is wrong** — the device log shows
   `geocoding: no results for '<city>'` and `ambient: location: ~40,-4
-  (build-time default)`. The stored `city` is not a bare Open-Meteo
-  place name (usually a comma-separated descriptor like
-  `"Pinto, Madrid, Spain"`). Re-run with the **city geocoding pre-check**
-  (step 2) and push the normalised bare name.
+  (build-time default)`. Re-run the geocoding pre-check and push the
+  normalised bare name.
