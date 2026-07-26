@@ -197,6 +197,19 @@ class ConfigPayload:
     panel_enabled: bool | None = None
     pet_species: int | None = None
     pet_name: str = ""
+    # WiFi. wifi_ssid alone means "switch to a network the device already
+    # remembers" — it holds the password, so asking the operator to retype it
+    # is the friction tokenmonitor_set_wifi exists to remove. A password is
+    # only needed for a network the device has never seen.
+    #
+    # wifi_pass is deliberately NOT carried into active on promote. Unlike
+    # psk_hex, which the broker must keep to sign every later request, a WiFi
+    # password has exactly one job — get onto the network once — after which
+    # the device holds it in its own remembered-networks store. Keeping it
+    # would mean the registry accumulated every network credential the fleet
+    # was ever given, on disk, to no purpose.
+    wifi_ssid: str = ""
+    wifi_pass: str = ""
     # Per-device override of the Gemini model list surfaced as
     # /usage/gemini slots. None = "no opinion" (use global default);
     # empty list = "clear the override". Max 3 entries.
@@ -253,6 +266,10 @@ class ConfigPayload:
             d["pet_species"] = int(self.pet_species)
         if self.pet_name:
             d["pet_name"] = str(self.pet_name)
+        if self.wifi_ssid:
+            d["wifi_ssid"] = str(self.wifi_ssid)
+        if self.wifi_pass:
+            d["wifi_pass"] = str(self.wifi_pass)
         if self.gemini_models is not None and len(self.gemini_models) > 0:
             d["gemini_models"] = [str(m) for m in self.gemini_models]
         if self.log_enabled is not None:
@@ -297,6 +314,8 @@ class ConfigPayload:
             panel_enabled=bool(d["panel_enabled"]) if "panel_enabled" in d else None,
             pet_species=int(d["pet_species"]) if "pet_species" in d else None,
             pet_name=str(d.get("pet_name", "")),
+            wifi_ssid=str(d.get("wifi_ssid", "")),
+            wifi_pass=str(d.get("wifi_pass", "")),
             gemini_models=[str(m) for m in d["gemini_models"]] if "gemini_models" in d else None,
             log_enabled=bool(d["log_enabled"]) if "log_enabled" in d else None,
             firmware_url=str(d.get("firmware_url", "")),
@@ -316,6 +335,13 @@ def _iso_now() -> datetime:
 class Active:
     payload: ConfigPayload = field(default_factory=ConfigPayload)
     last_seen: datetime | None = None
+    # Device-OBSERVED state, not configuration: the networks the device
+    # remembers, by NAME only. It lives here beside last_seen rather than in
+    # ConfigPayload because nothing may ever push it TO a device — it is only
+    # reported back FROM one, and putting it in the payload would make it look
+    # settable. Each entry: {"ssid": str, "verified": bool, "open": bool}.
+    # None means the device never reported (firmware predating the field).
+    wifi_known: list[dict] | None = None
 
 
 @dataclass
@@ -368,6 +394,17 @@ class Device:
         doc["active"] = self.active.payload.to_toml_dict()
         if self.active.last_seen:
             doc["active"]["last_seen"] = self.active.last_seen
+        # "is not None", not truthiness: an empty list means the device
+        # reported remembering NO networks, which is a different answer from
+        # never having reported at all — and every load() re-reads this file,
+        # so collapsing them here would make the empty case unreachable.
+        if self.active.wifi_known is not None:
+            doc["active"]["wifi_known"] = [
+                {"ssid": str(n.get("ssid", "")),
+                 "verified": bool(n.get("verified")),
+                 "open": bool(n.get("open"))}
+                for n in self.active.wifi_known
+            ]
         if self.pending is not None:
             p = self.pending.payload.to_toml_dict()
             p["created_at"] = self.pending.created_at
@@ -389,6 +426,13 @@ def _device_from_toml(text: str) -> Device:
     if "last_seen" in active_d:
         ls = active_d["last_seen"]
         active.last_seen = ls if isinstance(ls, datetime) else _parse_iso(str(ls))
+    if "wifi_known" in active_d:
+        active.wifi_known = [
+            {"ssid": str(n.get("ssid", "")),
+             "verified": bool(n.get("verified")),
+             "open": bool(n.get("open"))}
+            for n in (active_d.get("wifi_known") or [])
+        ]
     pending = None
     if "pending" in d:
         p_d = d["pending"]
@@ -532,7 +576,8 @@ class Registry:
             prev = dev.active
             active.firmware_version = prev.payload.firmware_version
             active.min_secure_version = prev.payload.min_secure_version
-            dev.active = Active(payload=active, last_seen=prev.last_seen)
+            dev.active = Active(payload=active, last_seen=prev.last_seen,
+                                wifi_known=prev.wifi_known)
             dev.pending = None
             if channel is not None:
                 dev.channel = normalize_channel(channel)
@@ -575,6 +620,7 @@ class Registry:
         panel_enabled: bool | None = None,
         pet_species: int | None = None,
         pet_name: str | None = None,
+        wifi_known: list[dict] | None = None,
     ) -> Device:
         """Apply device-reported display settings to the stored config WITHOUT
         bumping the version. The device owns these fields (the user sets them on
@@ -590,11 +636,20 @@ class Registry:
                 autorotate_enabled, autorotate_interval_s,
                 pet_enabled, panel_enabled, pet_species, pet_name,
             )
+            # Observed state, replaced wholesale rather than merged: the
+            # device is the only authority on what it remembers, and a network
+            # it has forgotten must disappear here too, or set_wifi would keep
+            # offering a password-free switch to something no longer stored. A
+            # None report (firmware too old to send the list) leaves the last
+            # known one alone instead of erasing it.
+            if wifi_known is not None and dev.active.wifi_known != wifi_known:
+                dev.active.wifi_known = wifi_known
+                changed = True
             if dev.pending is not None:
                 changed = _apply_reported(
                     dev.pending.payload, theme_mode, br_day, br_night, vol,
                     autorotate_enabled, autorotate_interval_s,
-                    pet_enabled, pet_species, pet_name,
+                    pet_enabled, panel_enabled, pet_species, pet_name,
                 ) or changed
             if changed:
                 self._save_locked(dev)
@@ -616,7 +671,24 @@ class Registry:
             # would never clear from the registry.
             if not used_pending_psk and dev.pending.payload.psk_hex != dev.active.payload.psk_hex:
                 return False
-            dev.active = Active(payload=dev.pending.payload, last_seen=_iso_now())
+            promoted_payload = dev.pending.payload
+            # The device has applied this payload, so the WiFi password has
+            # done its one job and now lives in the device's own store.
+            # Dropping it here is what keeps the registry from accumulating
+            # every network credential the fleet was ever handed. The SSID
+            # stays: it is not a secret, and it is genuinely useful to see
+            # which network a device is meant to be on.
+            promoted_payload.wifi_pass = ""
+            dev.active = Active(
+                payload=promoted_payload,
+                last_seen=_iso_now(),
+                # Observed state survives a config promote untouched — the
+                # device reports it on its own cadence and a promote knows
+                # nothing about it. Without this the list would be wiped on
+                # every promote and set_wifi would fall back to asking for a
+                # password it already has.
+                wifi_known=dev.active.wifi_known,
+            )
             dev.pending = None
             self._save_locked(dev)
             return True
@@ -671,7 +743,7 @@ class Registry:
             return
         if not fw_version:
             return
-        from ..ota import pack_semver  # lazy: avoid import cycle (ota → registry)
+        from ..ota import compare_semver  # lazy: avoid import cycle (ota → registry)
 
         with self._with_lock(device_id):
             try:
@@ -680,14 +752,17 @@ class Registry:
                 return
             # Clear a stale revert tombstone once the device has moved on to a
             # version STRICTLY NEWER than the blocked one (a fixed release
-            # landed). Guarded by pack_semver so unparseable reports never
-            # touch it. Computed independently of the only-on-change guard so
-            # a clear still persists even if the running version is unchanged.
+            # landed). Guarded by compare_semver so unparseable reports never
+            # touch it — and, unlike pack_semver, so that two builds sharing a
+            # base still order: pack_semver drops the "-dev.<ts>" prerelease, so
+            # 0.10.0-dev.<later> would pack EQUAL to a blocked
+            # 0.10.0-dev.<earlier> and never clear it. Computed independently of
+            # the only-on-change guard so a clear still persists even if the
+            # running version is unchanged.
             clear_blocked = False
             if dev.blocked_firmware_version:
-                got = pack_semver(fw_version)
-                blk = pack_semver(dev.blocked_firmware_version)
-                if got is not None and blk is not None and got > blk:
+                cmp = compare_semver(fw_version, dev.blocked_firmware_version)
+                if cmp is not None and cmp > 0:
                     clear_blocked = True
             if dev.active.payload.firmware_version == fw_version and not clear_blocked:
                 return
@@ -893,6 +968,13 @@ def _merge_payload(base: ConfigPayload, upd: ConfigPayload) -> ConfigPayload:
         panel_enabled=upd.panel_enabled if upd.panel_enabled is not None else base.panel_enabled,
         pet_species=upd.pet_species if upd.pet_species is not None else base.pet_species,
         pet_name=upd.pet_name or base.pet_name,
+        # WiFi moves as a PAIR, always. A password belongs to one SSID, so a
+        # new SSID takes the update's password even when that is empty
+        # ("switch to a network you already remember") — carrying the previous
+        # SSID's password forward would ship the wrong credential for the new
+        # network. Keyed on the SSID: a bare password has nothing to apply to.
+        wifi_ssid=upd.wifi_ssid or base.wifi_ssid,
+        wifi_pass=upd.wifi_pass if upd.wifi_ssid else base.wifi_pass,
         gemini_models=list(upd.gemini_models) if upd.gemini_models is not None else base.gemini_models,
         log_enabled=upd.log_enabled if upd.log_enabled is not None else base.log_enabled,
         firmware_url=upd.firmware_url or base.firmware_url,
@@ -907,9 +989,16 @@ def _merge_payload(base: ConfigPayload, upd: ConfigPayload) -> ConfigPayload:
 
 
 def _payload_equivalent(a: ConfigPayload, b: ConfigPayload) -> bool:
+    # wifi_pass is compared even though a promoted active always has it
+    # empty. That asymmetry is the point: re-staging the SSID the device is
+    # already on, WITH a password, is how an operator fixes a network whose
+    # password changed. Comparing the SSID alone would call that a no-op and
+    # silently drop the fix.
     if (
         a.broker_url != b.broker_url
         or a.psk_hex != b.psk_hex
+        or a.wifi_ssid != b.wifi_ssid
+        or a.wifi_pass != b.wifi_pass
         or a.city != b.city
         or a.br_day != b.br_day
         or a.br_night != b.br_night

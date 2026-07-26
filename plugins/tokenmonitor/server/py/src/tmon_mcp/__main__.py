@@ -107,9 +107,15 @@ async def _run_daemon(cfg, logs: Buffer, logger: logging.Logger) -> int:
     def fw_logs(limit: int) -> dict:
         return {"connected": tailer.connected() if tailer else False, "total_available": len(fw_buf), "lines": fw_buf.tail(limit)}
 
+    # Serial-lease table: followers ask this leader (the sole tailer owner) to
+    # yield the USB port. The controller is the live tailer when a serial device
+    # is configured, else a NopController (every port is already free).
+    from .usbprov import LeaseManager, NopController
+    lease = LeaseManager(tailer if tailer is not None else NopController(), 0)
+
     usage_cache = usage.build_cache(cfg)
     spend_cache = spend.build_cache(cfg, logger)
-    app = make_app(cfg, cache, state, fw_logs, registry, usage_cache, spend_cache)
+    app = make_app(cfg, cache, state, fw_logs, registry, usage_cache, spend_cache, lease)
     sock = try_bind(cfg.server.bind, cfg.server.port)
     if sock is None:
         logger.error("listen %s:%d: address in use", cfg.server.bind, cfg.server.port)
@@ -177,9 +183,13 @@ async def _run_mcp(cfg, logs: Buffer, logger: logging.Logger) -> int:
         if cfg.serial.device:
             tailer = Tailer(cfg.serial.device, fw_buf, baud=cfg.serial.baud)
             tailer.start()
+        # Serial-lease table: followers ask this leader (the sole tailer owner)
+        # to yield the USB port for a provisioning session.
+        from .usbprov import LeaseManager, NopController
+        lease = LeaseManager(tailer if tailer is not None else NopController(), 0)
         usage_cache = usage.build_cache(cfg)
         spend_cache = spend.build_cache(cfg, logger)
-        app = make_app(cfg, cache, state, fw_logs, registry, usage_cache, spend_cache)
+        app = make_app(cfg, cache, state, fw_logs, registry, usage_cache, spend_cache, lease)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.SockSite(runner, sock)

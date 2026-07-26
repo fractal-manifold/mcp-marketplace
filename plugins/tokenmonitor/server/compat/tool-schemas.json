@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema",
-  "$comment": "Authoritative MCP tool definitions for tokenmonitor-mcp. Every impl (Go, Python, JS) must register tools with these exact name/description/inputSchema triples. The Python and JS servers load this file at runtime; the Go server hardcodes equivalent mcp.NewTool registrations in internal/mcp/{server,devices,discovery,ota}.go and must be kept in sync by hand.",
-  "version": 9,
+  "$comment": "Authoritative MCP tool definitions for tokenmonitor-mcp. Every impl (Go, Python, JS) must register tools with these exact name/description/inputSchema triples. The Python and JS servers load this file at runtime; the Go server hardcodes equivalent mcp.NewTool registrations in internal/mcp/{server,devices,discovery,ota,wifi,usb}.go and must be kept in sync by hand.",
+  "version": 12,
   "tools": [
     {
       "name": "tokenmonitor_status",
@@ -290,6 +290,32 @@
       }
     },
     {
+      "name": "tokenmonitor_set_wifi",
+      "description": "Move a registered device onto a different WiFi network, over the network — no USB cable and nothing to tap on the device. Stages a pending config the device applies on its next sync (within ~10 s) and then reboots onto the new network.\n\nPASSWORDS: send `ssid` alone first. If the device already remembers that network it still holds the password, and none is needed. If it does not, this returns needs_password=true with the list of networks it does know — ask the user for the password and call again with `pass`.\n\nSAFETY: if the new network does not come up, the device works back through its remembered networks on boot, preferring ones that have actually connected before, so a wrong answer is recoverable without a cable. The exception is a device carried somewhere NONE of its remembered networks exist — there, recovery is the USB cable (tokenmonitor_usb_provision). Note also that a remembered OPEN network can never be switched to this way: the device refuses to auto-join open networks because an SSID alone is trivially impersonated.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "device_id": {
+            "type": "string",
+            "description": "8 lowercase hex chars. From tokenmonitor_list_devices."
+          },
+          "ssid": {
+            "type": "string",
+            "description": "SSID to switch to, 1-32 bytes. Case-sensitive and exact — this is matched against the device's remembered networks, so 'MyWiFi' and 'mywifi' are different networks."
+          },
+          "pass": {
+            "type": "string",
+            "description": "WiFi passphrase, up to 63 bytes. Omit on the first attempt: it is only needed for a network the device has never seen, and this tool will tell you when that is the case. Supplying it for an already-remembered network REPLACES the stored password, which is how you fix one that has changed."
+          }
+        },
+        "required": [
+          "device_id",
+          "ssid"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
       "name": "tokenmonitor_publish_firmware",
       "description": "Stage a firmware OTA for a registered device. Copies the .bin from bin_path into the broker's firmware directory (~/.config/tokenmonitor/firmware), computes the SHA-256, then queues a pending update with firmware_url pointing back at this broker's /firmware/<file> endpoint. The device picks up the change on its next /sync, downloads + verifies via the encrypted pending blob, switches the boot slot and reboots. If the new image's first broker poll fails, the bootloader auto-rolls back. Use external_url to point at an off-broker host (S3, GitHub Releases) instead of copying locally.",
       "inputSchema": {
@@ -489,6 +515,126 @@
             "type": "string",
             "description": "Optional 8-lowercase-hex device id to restrict staging to a single device. Omit to consider every matching device."
           }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "tokenmonitor_usb_scan",
+      "description": "Enumerate TokenMonitor devices reachable over a USB cable and classify each by identity tier. Returns one entry per serial port with its vid/pid, iSerial, tier (registry-match | probe | shared) and - for enrolled or probed units - device_id/sku/fw/state. A `probe`-tier Espressif port (shared by every ESP32-S3/C3/C6) receives ONE bounded HELLO only during this user-initiated scan; `shared` generic-bridge ports are listed but never written to. Never auto-selects a `probe` or `shared` port. USB is the developer / rescue / reconfiguration path; the consumer path stays SoftAP + LAN (WSL2 without usbipd-win cannot see the device).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "timeout_seconds": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 10,
+            "default": 3,
+            "description": "Per-port HELLO probe window in seconds (1..10, default 3). Kept well under the MCP tool budget (30s in Claude, 10s in Codex)."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "tokenmonitor_usb_provision",
+      "description": "Configure or reconfigure a device over a USB cable, independent of the network. No pairing code is needed: the cable is the physical-presence proof, so pairing_code is optional and the device ignores it on this transport. Runs the SLIP+CRC32 serial session (HELLO -> SESSION_BEGIN -> PROVISION -> BYE) behind a leader-mediated port lease so it never collides with the broker's serial log tailer. Carries the config fields the provisioning core applies (broker_url, psk_hex, city, brightness, volume, theme, pet, providers) plus the optional WiFi pair wifi_ssid + wifi_pass, so partial payloads are allowed: sending only city preserves the broker URL and PSK, and the headline flow sends only wifi_ssid + wifi_pass to point the device at the same WiFi the computer is on (prefill wifi_ssid from the host's current network; ask the user for the password). WiFi credentials go into the device's multi-network remembered-networks store, so a USB-configured device roams like any other. On success the device persists to NVS and reboots. If broker_url + psk_hex are supplied, also registers/updates the device in the local registry. See compat/PROVISION_WIRE.md.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "port": {
+            "type": "string",
+            "description": "Serial port path from tokenmonitor_usb_scan (e.g. /dev/ttyACM0, /dev/cu.usbmodemXXXX, COM3). Optional ONLY when exactly one registry-match device is present; otherwise required, because a probe/shared port is never auto-selected."
+          },
+          "device_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}$",
+            "description": "8 lowercase hex chars, to disambiguate when several devices are attached. Verified against the device's HELLO_RESP before any configuration write."
+          },
+          "pairing_code": {
+            "type": "string",
+            "pattern": "^[0-9]{6}$",
+            "description": "6-digit code shown on the device's screen. OPTIONAL over USB: plugging the cable in is itself the physical-presence proof, so the device does not require a code on the serial transport and ignores one sent anyway. Supply it only if you have it. The LAN transport (tokenmonitor_provision) still requires it. Never logged."
+          },
+          "broker_url": {
+            "type": "string",
+            "description": "HTTP(S) URL of the tokenmonitor-mcp broker the device should poll. Run tokenmonitor_provision_hint to learn the laptop's reachable URL on this LAN; do not assume a specific IP. If omitted, only the optional fields below are pushed."
+          },
+          "psk_hex": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "64-hex PSK the device should sign requests with."
+          },
+          "city": {
+            "type": "string",
+            "description": "Optional city for ambient weather."
+          },
+          "br_day": {
+            "type": "number",
+            "minimum": 10,
+            "maximum": 100,
+            "description": "Daytime brightness 10..100."
+          },
+          "br_night": {
+            "type": "number",
+            "minimum": 5,
+            "maximum": 100,
+            "description": "Nighttime brightness 5..100."
+          },
+          "vol": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Alert volume 0..100."
+          },
+          "theme_mode": {
+            "type": "string",
+            "enum": [
+              "day",
+              "night",
+              "auto"
+            ],
+            "description": "Display theme applied on the device: 'day' (light palette), 'night' (dark palette) or 'auto' (follows sunrise/sunset). Default on the device is auto. Same setting and wire convention as tokenmonitor_set_device_pending's theme_mode."
+          },
+          "pet_enabled": {
+            "type": "boolean",
+            "description": "Show the on-device virtual pet (default true). Device-owned like the display settings; pass false to hide it. Same setting as tokenmonitor_set_device_pending's pet_enabled."
+          },
+          "provider_claude": {
+            "type": "boolean",
+            "description": "Enable Claude provider."
+          },
+          "provider_codex": {
+            "type": "boolean",
+            "description": "Enable Codex provider."
+          },
+          "provider_antigravity": {
+            "type": "boolean",
+            "description": "Enable Antigravity provider (tracks the `agy` CLI, successor to Gemini)."
+          },
+          "provider_gemini": {
+            "type": "boolean",
+            "description": "Deprecated alias of provider_antigravity, accepted for backward compatibility."
+          },
+          "wifi_ssid": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32,
+            "description": "WiFi SSID to store on the device (1-32 bytes). Prefill from the computer's current network for the point-at-my-WiFi flow. MUST be sent together with wifi_pass; a bare wifi_ssid is rejected. Stored in the device's multi-network remembered store (enters unverified), so the device roams."
+          },
+          "wifi_pass": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "WiFi passphrase for wifi_ssid (0-64 bytes). MUST be sent together with wifi_ssid. An explicit empty string means a deliberately open network (the cable is the authority); omitting the key entirely while sending wifi_ssid is an error, not an open network."
+          }
+        },
+        "dependencies": {
+          "wifi_ssid": [
+            "wifi_pass"
+          ],
+          "wifi_pass": [
+            "wifi_ssid"
+          ]
         },
         "additionalProperties": false
       }

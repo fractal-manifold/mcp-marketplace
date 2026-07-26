@@ -900,3 +900,180 @@ func TestDevReleaseSelectVectors(t *testing.T) {
 		}
 	}
 }
+
+// simulateRollback replays what a device does with a staged pending it cannot
+// boot: it applies the config (pending → active, which optimistically sets
+// Active.FirmwareVersion to the staged version), downloads and installs the
+// image, panics before self-confirming, and the bootloader rolls it back — so
+// on the next sync it reports the OLD version again and the broker writes that
+// back over Active.FirmwareVersion. That reversion is what re-opens decide()'s
+// newer-than-running guard and drives the loop.
+func simulateRollback(t *testing.T, reg *registry.Registry, deviceID, runningVersion string) {
+	t.Helper()
+	dev, err := reg.Load(deviceID)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if dev.Pending == nil {
+		t.Fatal("simulateRollback: no pending to consume")
+	}
+	promoted, err := reg.MaybePromote(deviceID, dev.Pending.Version, false)
+	if err != nil || !promoted {
+		t.Fatalf("MaybePromote: promoted=%v err=%v", promoted, err)
+	}
+	if err := reg.SetActiveFirmwareVersion(deviceID, runningVersion, nil); err != nil {
+		t.Fatalf("SetActiveFirmwareVersion: %v", err)
+	}
+}
+
+// A device that downloads a release, fails to boot it and rolls back gets
+// exactly maxAutoStages attempts before the broker gives up and tombstones the
+// version. Without the streak counter this loops forever, one full firmware
+// download per cycle.
+func TestCheckBlocksInstallLoop(t *testing.T) {
+	v := loadVectors(t)
+	canonical, sigB64 := s1Vector(t, v)
+	idx := Index{
+		Version:      "0.5.1",
+		ManifestB64:  base64.StdEncoding.EncodeToString([]byte(canonical)),
+		SignatureB64: sigB64,
+		BinURL:       "https://downloads.example/tmon-S1-0.5.1.bin",
+	}
+	srv := mockReleases(t, map[string]Index{"S1": idx})
+	defer srv.Close()
+
+	cfg := otaConfigForVectors(t, v, srv.URL)
+	reg := newRegistryWithDevice(t, testDevice, "S1", 0)
+	if err := reg.SetActiveFirmwareVersion(testDevice, "0.5.0", nil); err != nil {
+		t.Fatalf("seed running version: %v", err)
+	}
+	checker := NewChecker(cfg, reg, nil)
+
+	for i := 1; i <= maxAutoStages; i++ {
+		rep, err := checker.Check(context.Background(), false, "", "")
+		if err != nil {
+			t.Fatalf("check %d: %v", i, err)
+		}
+		if rep.Devices[0].Action != "staged" {
+			t.Fatalf("check %d: got %q, want staged", i, rep.Devices[0].Action)
+		}
+		simulateRollback(t, reg, testDevice, "0.5.0")
+	}
+
+	// The (maxAutoStages+1)-th visit is where the breaker fires: the device
+	// consumed every pending and came back still running the old version.
+	rep, err := checker.Check(context.Background(), false, "", "")
+	if err != nil {
+		t.Fatalf("breaker check: %v", err)
+	}
+	if rep.Devices[0].Action != "skipped:install-loop" {
+		t.Fatalf("got %q, want skipped:install-loop", rep.Devices[0].Action)
+	}
+	if rep.Staged != 0 {
+		t.Fatalf("breaker staged %d, want 0", rep.Staged)
+	}
+	dev, err := reg.Load(testDevice)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if dev.BlockedFirmwareVersion != "0.5.1" {
+		t.Fatalf("tombstone = %q, want 0.5.1", dev.BlockedFirmwareVersion)
+	}
+	if dev.Pending != nil {
+		t.Fatalf("breaker must not leave a pending, got %+v", dev.Pending)
+	}
+
+	// And it stays blocked on subsequent polls, now via the persisted
+	// tombstone rather than the in-memory streak — so a broker restart does
+	// not resume the loop.
+	rep, err = checker.Check(context.Background(), false, "", "")
+	if err != nil {
+		t.Fatalf("post-block check: %v", err)
+	}
+	if rep.Devices[0].Action != "skipped:blocked-version" {
+		t.Fatalf("got %q, want skipped:blocked-version", rep.Devices[0].Action)
+	}
+}
+
+// The breaker must not fire on a device that simply takes its time: as long as
+// each stage is a different version, or the device actually lands on one, the
+// streak resets and staging continues normally.
+func TestCheckStreakResetsOnSuccessfulInstall(t *testing.T) {
+	v := loadVectors(t)
+	canonical, sigB64 := s1Vector(t, v)
+	idx := Index{
+		Version:      "0.5.1",
+		ManifestB64:  base64.StdEncoding.EncodeToString([]byte(canonical)),
+		SignatureB64: sigB64,
+		BinURL:       "https://downloads.example/tmon-S1-0.5.1.bin",
+	}
+	srv := mockReleases(t, map[string]Index{"S1": idx})
+	defer srv.Close()
+
+	cfg := otaConfigForVectors(t, v, srv.URL)
+	reg := newRegistryWithDevice(t, testDevice, "S1", 0)
+	if err := reg.SetActiveFirmwareVersion(testDevice, "0.5.0", nil); err != nil {
+		t.Fatalf("seed running version: %v", err)
+	}
+	checker := NewChecker(cfg, reg, nil)
+
+	// Two failed installs, then it boots: report the new version as running.
+	for i := 0; i < 2; i++ {
+		if _, err := checker.Check(context.Background(), false, "", ""); err != nil {
+			t.Fatalf("check %d: %v", i, err)
+		}
+		simulateRollback(t, reg, testDevice, "0.5.0")
+	}
+	if err := reg.SetActiveFirmwareVersion(testDevice, "0.5.1", nil); err != nil {
+		t.Fatalf("report success: %v", err)
+	}
+	rep, err := checker.Check(context.Background(), false, "", "")
+	if err != nil {
+		t.Fatalf("post-success check: %v", err)
+	}
+	if rep.Devices[0].Action != "up_to_date" {
+		t.Fatalf("got %q, want up_to_date", rep.Devices[0].Action)
+	}
+	if streak, ok := checker.streaks[testDevice]; ok {
+		t.Fatalf("streak survived a successful install: %+v", streak)
+	}
+	if dev, _ := reg.Load(testDevice); dev.BlockedFirmwareVersion != "" {
+		t.Fatalf("a device that installed the release must not be tombstoned, got %q",
+			dev.BlockedFirmwareVersion)
+	}
+}
+
+// A dry run answers a question; it never causes a download, so it must never
+// advance the streak toward the breaker.
+func TestCheckDryRunDoesNotAdvanceStreak(t *testing.T) {
+	v := loadVectors(t)
+	canonical, sigB64 := s1Vector(t, v)
+	idx := Index{
+		Version:      "0.5.1",
+		ManifestB64:  base64.StdEncoding.EncodeToString([]byte(canonical)),
+		SignatureB64: sigB64,
+		BinURL:       "https://downloads.example/tmon-S1-0.5.1.bin",
+	}
+	srv := mockReleases(t, map[string]Index{"S1": idx})
+	defer srv.Close()
+
+	cfg := otaConfigForVectors(t, v, srv.URL)
+	reg := newRegistryWithDevice(t, testDevice, "S1", 0)
+	checker := NewChecker(cfg, reg, nil)
+
+	for i := 0; i < maxAutoStages*3; i++ {
+		rep, err := checker.Check(context.Background(), true, "", "")
+		if err != nil {
+			t.Fatalf("dry check %d: %v", i, err)
+		}
+		if rep.Devices[0].Action != "would_stage" {
+			t.Fatalf("dry check %d: got %q, want would_stage", i, rep.Devices[0].Action)
+		}
+	}
+	if len(checker.streaks) != 0 {
+		t.Fatalf("dry runs recorded streaks: %+v", checker.streaks)
+	}
+	if dev, _ := reg.Load(testDevice); dev.BlockedFirmwareVersion != "" {
+		t.Fatalf("dry runs wrote a tombstone: %q", dev.BlockedFirmwareVersion)
+	}
+}

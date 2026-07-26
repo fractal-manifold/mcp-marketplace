@@ -1,6 +1,6 @@
 ---
 name: configure
-description: tokenmonitor plugin — provision or reconfigure a TokenMonitor device from the LAN. Discovers devices in BOOT_NEEDS_CONFIG via mDNS (`_tmon._tcp.local.`), prompts the user for the 6-digit pairing code shown on the device's screen, then pushes the broker URL and an auto-generated PSK to it. Also registers the device in the local tokenmonitor-mcp registry so future control-plane polls (/device/<id>/sync) recognise it. Use this when the user says they have a new wall monitor, the device shows "Waiting for setup", they reset a device, or they ask to "configure", "provision" or "set up" a wall monitor.
+description: tokenmonitor plugin — provision or reconfigure a TokenMonitor device over the LAN or a USB cable. LAN path discovers devices in BOOT_NEEDS_CONFIG via mDNS (`_tmon._tcp.local.`); USB path (developer / rescue / reconfiguration) enumerates the device over the serial cable, works across VLANs and guest networks, and can change WiFi on an already-configured device without a factory reset — including the headline flow of pointing the device at the same WiFi the computer is on. The LAN path prompts for the 6-digit pairing code on the device's screen; the USB path needs no code at all, because the cable is itself the physical-presence proof. Both then push broker URL + an auto-generated PSK, and register the device in the local tokenmonitor-mcp registry. Use this when the user says they have a new wall monitor, the device shows "Waiting for setup", they reset a device, they want to change its WiFi, or they ask to "configure", "provision", "set up" or "reconfigure" a wall monitor — over WiFi or USB.
 ---
 
 # /tokenmonitor:configure
@@ -9,6 +9,59 @@ Provision a TokenMonitor device that has connected to WiFi but does not yet
 know which broker to talk to. The device sits at the "Waiting for setup"
 screen showing its IP and a 6-digit pairing code; this skill bridges that gap
 end-to-end without leaving Claude Code.
+
+## Choosing a transport
+
+Two ways to reach the device — pick before you start:
+
+- **LAN (mDNS)** — the consumer path. Use it for a device that has **already
+  joined WiFi** and is sitting at "Waiting for setup" on the **same LAN
+  segment** as the laptop. Steps 1–6 below.
+- **USB cable** — the developer / rescue / reconfiguration path. Use it when:
+  the device and laptop **can't share a LAN** (guest WiFi, client isolation, or
+  VLANs that block mDNS); the device is **already configured** and the user wants
+  to **change its WiFi** or broker without a factory reset; or the user simply
+  has a data cable plugged in. USB is network-independent and its headline flow
+  is **"point the device at the WiFi this computer is on."** See
+  [USB transport](#usb-transport) below.
+
+**A device straight out of the box is on neither path yet.** It has no WiFi, so
+there is nothing for mDNS to find. Its first screen is the setup screen, which
+offers the user three routes, and only the third is this skill:
+
+1. **Setup WiFi** — join the device's own WPA2 access point (`TokenMonitor-XXXX`,
+   password shown on its screen) and fill in the captive portal at
+   `http://192.168.4.1/`. Asks for SSID and WiFi password only.
+2. **On this device** — pick the network and type the password on the
+   touchscreen. No second device involved.
+3. **Over USB** — plug a data cable into the computer. **No code to read or
+   type**: the cable is the physical-presence proof, so the device does not ask
+   for one on this transport. `tokenmonitor_usb_provision` can carry WiFi,
+   broker URL and PSK in **one** payload, which is the only route that
+   configures a brand-new device completely in a single step.
+
+After routes 1 or 2 the device reboots onto WiFi and lands on "Waiting for
+setup" — that is when the LAN path becomes available.
+
+If the user hasn't said which, and a device is enumerable over USB (a quick
+`tokenmonitor_usb_scan`), offer both with `AskUserQuestion`; otherwise default to
+USB for a brand-new device (one step instead of two), LAN for a device already
+showing "Waiting for setup", and USB for a "change the WiFi / it's on a
+different network" request.
+
+**USB works on Linux only, today.** Port enumeration is implemented for Linux
+and returns "not supported" everywhere else — all three runtimes do the same
+thing, so switching runtime does not help. On macOS or Windows,
+`tokenmonitor_usb_scan` answers:
+
+> USB scan is not supported on this OS yet (Linux is the reference path;
+> macOS/Windows enumeration is deferred). Use SoftAP + LAN provisioning instead.
+
+Take that at face value and use a LAN path — do not go looking for a cable
+problem. WSL2 is a separate matter: it is a Hyper-V VM that receives no USB
+devices at all unless the user installs `usbipd-win` (admin) and runs
+`usbipd bind` + `usbipd attach --wsl` after each replug. So on WSL2 the scan can
+come up empty even though the OS check passed; say so and fall back to LAN.
 
 ## Prerequisites
 
@@ -146,10 +199,112 @@ passphrase. If the user voices any of these in the same breath, apply them
 right away with `tokenmonitor_set_device_pending` instead of making them ask
 again.
 
+## USB transport
+
+Configure or reconfigure over the serial cable — network-independent, and the
+only in-Claude way to change a device's WiFi without a factory reset.
+
+### U1. Scan
+
+Call `tokenmonitor_usb_scan`. Each port comes back with a `tier`:
+
+- **`registry-match`** — the port's iSerial (MAC-derived) matches a device
+  already in the local registry. Unambiguous identity; **safe to auto-select**
+  when it's the only one. This is the good path for reconfiguring an enrolled
+  unit.
+- **`probe`** — an Espressif USB-Serial/JTAG VID/PID (`303a:1001`). This pair is
+  burned into **every** ESP32-S3/C3/C6 — every devkit on the desk, and the stock
+  firmware on an un-provisioned box. The scan sends it **one bounded HELLO** to
+  read its `device_id`/`fw`/`state`, but you must **never auto-select it**: if
+  there is more than one, or you're unsure it's the intended unit, **list them
+  and ask** with `AskUserQuestion` (show `path`, `device_id`, `fw`, `state`).
+- **`shared`** — a generic USB-UART bridge (CH340/CP210x/FTDI) shared with
+  thousands of unrelated products (someone's 3D printer, an Arduino). The scan
+  **never writes a byte** to it. Only use it if the user **explicitly names the
+  port**, and warn them first.
+
+If the scan errors with "not supported on this OS yet", enumeration for that
+platform isn't implemented — fall back to LAN.
+
+### U2. No pairing code
+
+**Skip it.** Unlike the LAN path, USB asks for nothing: the device does not
+require a pairing code on the serial transport, because being able to write to
+its port already proves you are holding it. Do not ask the user for a code, do
+not tell them to look at the screen, and do not pass `pairing_code` — in the
+case USB exists to solve (a device whose WiFi is wrong), the screen is showing
+a dashboard that will never load, so there is no code on it to read.
+
+### U3. Choose the config — the WiFi headline flow
+
+The point-at-my-WiFi flow is the reason USB exists for most users:
+
+- **wifi_ssid** — **prefill from the computer's current network** so the device
+  joins the same one. Detect it (do not ask if you can read it):
+  `nmcli -t -f active,ssid dev wifi | grep '^yes' | cut -d: -f2` (Linux),
+  `networksetup -getairportnetwork en0` (macOS), or
+  `netsh wlan show interfaces` (Windows). Show the user the SSID you found and
+  let them override.
+- **wifi_pass** — **ASK the user.** Reading the saved WiFi password off the OS
+  needs elevated permissions (Keychain / `nmcli -s` as root / `netsh ... key=clear`)
+  and is intrusive — just prompt for it. `wifi_ssid` and `wifi_pass` **must be
+  sent together**; a bare `wifi_ssid` is rejected. For a deliberately open
+  network, pass `wifi_pass` as an explicit empty string `""`.
+- **broker_url / psk_hex / city / providers / display** — identical rules to LAN
+  step 3. **psk_hex**: don't ask, don't pass — it's reused-or-minted. Note that
+  over USB, setting `broker_url` needs the device's PSK to be resolvable, which
+  means **either `device_id`** (so the registry's PSK can be reused or derived)
+  **or an explicit `psk_hex`**. Pass `device_id` from the scan in the normal
+  case; without either, the call refuses rather than minting a PSK it cannot
+  persist, which would orphan the device. For the pure "just change my WiFi" case, send **only** `wifi_ssid` +
+  `wifi_pass` — the broker URL and PSK are preserved untouched.
+
+The remembered-networks store keeps up to 8 networks, so adding one over USB
+doesn't forget the others — the device roams between them.
+
+### U4. Provision
+
+Call `tokenmonitor_usb_provision`:
+
+- **port** — omit it only when exactly one `registry-match` exists (it
+  auto-selects); otherwise pass the explicit `path` from the scan.
+- **pairing_code** — **don't ask for it and don't send one.** USB needs no code:
+  the cable is itself the physical-presence proof, so the device never checks
+  one on the serial transport and ignores it if sent. Never send the user
+  hunting for digits on a screen that, in the case USB exists to solve, is
+  showing a dashboard that will never load. (The argument is still accepted so
+  older callers keep working; if you do pass it, it must be six digits. The LAN
+  path, `tokenmonitor_provision`, still requires a real one.)
+- plus the fields from U3.
+
+The tool runs the serial session behind a **leader-mediated port lease** so it
+never collides with the broker's live log tailer — that's automatic, nothing to
+manage. On success the device persists to NVS and reboots (~3 s); the result
+echoes `psk_generated` / `psk_reused` and, when a broker was set,
+`registered` / `reregistered`.
+
+**If the result has `outcome_unknown: true`** — PROVISION was sent but no RESULT
+came back (a lost reply, or the device reset after applying). **Do NOT blindly
+re-run** — a fresh session could double-apply or burn a pairing attempt. Instead
+reconnect and read the device's state (`tokenmonitor_usb_scan` shows its
+`state`, or check the screen), and only re-provision as a deliberate fresh action
+if it clearly didn't take.
+
+### U5. Confirm
+
+Same as LAN step 5 — after ~15 s, `tokenmonitor_list_devices` (if a broker was
+set) or re-scan to confirm the new `state`. Then U6 = LAN step 6 (what to tune
+later).
+
 ## Reconfiguring an existing device
 
-If the device is *already provisioned* (it does not show "Waiting for setup"),
-this is the wrong skill — direct the user to the on-device Settings panel or
-to `/tokenmonitor:settings`. To start over from scratch, they must
-`idf.py erase-flash` or press "Restablecer" in on-device Settings, which forces
-a return to BOOT_NEEDS_WIFI on the next boot.
+If the device is *already provisioned* (it does not show "Waiting for setup"):
+
+- **To change its WiFi or broker** — use the **USB transport** above. That's the
+  whole reason it exists: `tokenmonitor_usb_provision` with a `registry-match`
+  port rewrites credentials in place, no factory reset, preserving broker + PSK
+  when you send only WiFi fields.
+- **For display/provider tweaks over the LAN** — the on-device **Settings** panel
+  (long-press the mascot) or `/tokenmonitor:settings`.
+- **To start over from scratch** — `idf.py erase-flash` or "Restablecer" in
+  on-device Settings, which forces a return to BOOT_NEEDS_WIFI on the next boot.

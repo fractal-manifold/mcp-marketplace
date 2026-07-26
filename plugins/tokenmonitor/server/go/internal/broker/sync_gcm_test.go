@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -299,5 +300,155 @@ func TestSnapshotSlots_AlwaysArray(t *testing.T) {
 	}
 	if string(raw) != "[]" {
 		t.Errorf("slots = %s, want []", raw)
+	}
+}
+
+// signedSyncRequestOTAFail is signedSyncRequestFW plus the X-Tmon-Ota-Fail
+// header, which carries the device's own verdict on an image it installed but
+// could not boot.
+func signedSyncRequestOTAFail(t *testing.T, ts *httptest.Server, psk []byte, deviceID, fw, otaFail string) *http.Response {
+	t.Helper()
+	now := strconv.FormatInt(time.Now().Unix(), 10)
+	nonce := mustHex(t, 16)
+	path := "/device/" + deviceID + "/sync"
+	sig := auth.ComputeSignature(psk, "GET", path, now, nonce, deviceID, "0")
+
+	req, _ := http.NewRequest("GET", ts.URL+path, nil)
+	req.Header.Set("X-Tmon-Timestamp", now)
+	req.Header.Set("X-Tmon-Nonce", nonce)
+	req.Header.Set("X-Tmon-Signature", sig)
+	req.Header.Set("X-Tmon-Device", deviceID)
+	req.Header.Set("X-Tmon-Config-Version", "0")
+	if fw != "" {
+		req.Header.Set("X-Tmon-Fw-Version", fw)
+	}
+	if otaFail != "" {
+		req.Header.Set("X-Tmon-Ota-Fail", otaFail)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+// TestParseOTAFail pins the header grammar. Everything that is not an
+// unambiguous report of a definitively-failed install must return nil: this
+// value is unsigned, so it fails closed by construction.
+func TestParseOTAFail(t *testing.T) {
+	cases := []struct {
+		in       string
+		want     bool
+		version  string
+		installs int
+		why      string
+	}{
+		{in: "0.10.5:2:panic", want: true, version: "0.10.5", installs: 2, why: "the canonical report"},
+		{in: "0.10.5:3:wdt", want: true, version: "0.10.5", installs: 3, why: "any count at or above the threshold"},
+		{in: " 0.10.5:2:panic ", want: true, version: "0.10.5", installs: 2, why: "surrounding whitespace is tolerated"},
+		{in: "0.10.5-dev.202607181200:2:panic", want: true, version: "0.10.5-dev.202607181200", installs: 2, why: "dev prereleases are real versions"},
+
+		{in: "", why: "absent header"},
+		{in: "none", why: "the firmware's explicit no-failure sentinel"},
+		{in: "0.10.5:1:panic", why: "one failure may be a brownout; two is evidence"},
+		{in: "0.10.5:0:panic", why: "zero failures"},
+		{in: "0.10.5:2:pending", why: "still in flight — the install may yet succeed"},
+		{in: "0.10.5:2:", why: "empty state"},
+		{in: "0.10.5:2", why: "too few fields"},
+		{in: "0.10.5:2:panic:extra", why: "too many fields"},
+		{in: "garbage:2:panic", why: "an unparseable version would poison the tombstone forever"},
+		{in: "0.10:2:panic", why: "not MAJOR.MINOR.PATCH"},
+		{in: "0.10.5:two:panic", why: "non-numeric count"},
+		{in: "0.10.5:-3:panic", why: "negative count"},
+		{in: strings.Repeat("9", 100) + ":2:panic", why: "over the length cap"},
+	}
+	for _, c := range cases {
+		got := parseOTAFail(c.in)
+		if c.want {
+			if got == nil {
+				t.Errorf("parseOTAFail(%q) = nil, want a report (%s)", c.in, c.why)
+				continue
+			}
+			if got.version != c.version || got.installs != c.installs {
+				t.Errorf("parseOTAFail(%q) = %+v, want version=%s installs=%d",
+					c.in, *got, c.version, c.installs)
+			}
+			continue
+		}
+		if got != nil {
+			t.Errorf("parseOTAFail(%q) = %+v, want nil (%s)", c.in, *got, c.why)
+		}
+	}
+}
+
+// A device reporting that it failed to install a version twice gets that
+// version tombstoned, so auto-discovery stops offering it. This is the
+// device-driven half of the install-loop breaker.
+func TestDeviceSync_BlocksVersionOnReportedInstallFailure(t *testing.T) {
+	ts, reg := newDeviceSyncServer(t)
+	activePSK := mustHex(t, 32)
+	reg.Register(syncTestID, registry.ConfigPayload{PSKHex: activePSK, BrokerURL: "http://x"})
+	pskBytes, _ := hex.DecodeString(activePSK)
+
+	resp := signedSyncRequestOTAFail(t, ts, pskBytes, syncTestID, "0.10.3", "0.10.5:2:panic")
+	resp.Body.Close()
+
+	dev, _ := reg.Load(syncTestID)
+	if dev.BlockedFirmwareVersion != "0.10.5" {
+		t.Fatalf("tombstone = %q, want 0.10.5", dev.BlockedFirmwareVersion)
+	}
+}
+
+// The reports that must NOT block: still-pending installs, a count below the
+// threshold, garbage, and — importantly — a device reporting a failure for the
+// version it is now actually running, which means it recovered.
+func TestDeviceSync_DoesNotBlockOnWeakOTAFailReports(t *testing.T) {
+	cases := []struct {
+		name, fw, otaFail string
+	}{
+		{"still pending", "0.10.3", "0.10.5:2:pending"},
+		{"below hard threshold", "0.10.3", "0.10.5:1:panic"},
+		// The soft states take minFailedInstallsSoft. Tombstoning these at 2
+		// would silently shorten the DEVICE's own 4-attempt budget.
+		{"brownout below soft threshold", "0.10.3", "0.10.5:2:brownout"},
+		{"noconfirm below soft threshold", "0.10.3", "0.10.5:3:noconfirm"},
+		{"unknown below soft threshold", "0.10.3", "0.10.5:3:unknown"},
+		{"unrecognised state gets the soft threshold", "0.10.3", "0.10.5:2:someday"},
+		// installs is 0..255 on-device; anything else is not a record we wrote.
+		{"count above the firmware range", "0.10.3", "0.10.5:256:panic"},
+		{"malformed", "0.10.3", "not-a-version:5:panic"},
+		{"sentinel", "0.10.3", "none"},
+		{"absent", "0.10.3", ""},
+		{"empty state", "0.10.3", "0.10.5:4:"},
+		{"wrong field count", "0.10.3", "0.10.5:4"},
+		{"extra field", "0.10.3", "0.10.5:2:panic:extra"},
+		// Count-parsing cases that a laxer runtime would accept: Python's
+		// int() takes "1_0" and padded values, JS parseInt takes "2abc" and
+		// Number() takes "0x2". All three parsers reject them, and these
+		// cases exist in the py/js suites too so the agreement is enforced
+		// from both ends rather than assumed.
+		{"underscored count", "0.10.3", "0.10.5:1_0:panic"},
+		{"trailing garbage in count", "0.10.3", "0.10.5:2abc:panic"},
+		{"padded count", "0.10.3", "0.10.5: 2 :panic"},
+		{"hex count", "0.10.3", "0.10.5:0x2:panic"},
+		// The stale-record case: the device eventually booted the version it
+		// once failed on, so the record describes history, not a live problem.
+		{"failure names the running version", "0.10.5", "0.10.5:2:panic"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ts, reg := newDeviceSyncServer(t)
+			activePSK := mustHex(t, 32)
+			reg.Register(syncTestID, registry.ConfigPayload{PSKHex: activePSK, BrokerURL: "http://x"})
+			pskBytes, _ := hex.DecodeString(activePSK)
+
+			resp := signedSyncRequestOTAFail(t, ts, pskBytes, syncTestID, c.fw, c.otaFail)
+			resp.Body.Close()
+
+			dev, _ := reg.Load(syncTestID)
+			if dev.BlockedFirmwareVersion != "" {
+				t.Fatalf("tombstoned %q on a report that proves nothing", dev.BlockedFirmwareVersion)
+			}
+		})
 	}
 }

@@ -10,33 +10,72 @@ import (
 	"os"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/fractal-manifold/tokenmonitor-mcp/internal/usbprov"
 )
 
 func (t *Tailer) tailOnce(ctx context.Context) error {
-	// O_NOCTTY prevents the tty from becoming our controlling terminal.
-	// O_NONBLOCK lets Open return immediately even if the port's modem
-	// status isn't asserted; we clear it right after via fcntl so reads
-	// block normally.
-	f, err := os.OpenFile(t.Device, os.O_RDWR|unix.O_NOCTTY|unix.O_NONBLOCK, 0)
+	// Resolve to the canonical identity shared with the lease/lock, so the port
+	// lock the tailer takes is the SAME one a provisioning session takes.
+	canonical, err := usbprov.CanonicalPort(t.Device)
 	if err != nil {
+		return err // device absent → Run backs off and retries
+	}
+
+	// Acquire the port lock and open the device UNDER the gate mutex, together
+	// with a suspend re-check: this makes acquisition atomic w.r.t. SuspendPort,
+	// so a lease that arrives after Run's gate check cannot race the open. The
+	// port lock also fences an election gap — a follower mid-session under a
+	// lease a newly-elected leader never saw holds this lock and makes us wait
+	// (usbprov.ErrPortBusy) rather than byte-splitting.
+	t.ensureCond()
+	t.gmu.Lock()
+	if t.suspended || ctx.Err() != nil {
+		t.gmu.Unlock()
+		return nil // Run's gate will block on the next iteration
+	}
+	releaseLock, err := acquirePortLock(canonical)
+	if err != nil {
+		t.gmu.Unlock()
+		return err // ErrPortBusy is retryable; Run backs off
+	}
+	f, err := os.OpenFile(canonical, os.O_RDWR|unix.O_NOCTTY|unix.O_NONBLOCK, 0)
+	if err != nil {
+		_ = releaseLock()
+		t.gmu.Unlock()
 		return err
 	}
-	defer f.Close()
-
 	fd := int(f.Fd())
 	if err := setRaw(fd); err != nil {
+		_ = f.Close()
+		_ = releaseLock()
+		t.gmu.Unlock()
 		return err
 	}
-	// Drop O_NONBLOCK so subsequent reads are blocking again — saves a
-	// busy-loop on the bufio reader.
-	if flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0); err == nil {
-		_, _ = unix.FcntlInt(uintptr(fd), unix.F_SETFL, flags&^unix.O_NONBLOCK)
-	}
+	// Leave the fd in Go's poller-managed non-blocking mode (do NOT clear
+	// O_NONBLOCK): os.File already gives blocking Read semantics via the runtime
+	// poller, and — critically for suspend — a Close() from another goroutine
+	// then unblocks an in-flight Read. Clearing O_NONBLOCK would drop the read
+	// into a raw kernel syscall that Close cannot interrupt, wedging SuspendPort.
+	t.fdClose = func() { _ = f.Close() }
+	t.gmu.Unlock()
+
+	// Ordered teardown: close the fd, release the port lock, THEN clear fdClose
+	// and wake any waiting SuspendPort — so SuspendPort only returns once the
+	// port is fully free for the lessee to open.
+	defer func() {
+		_ = f.Close()
+		_ = releaseLock()
+		t.gmu.Lock()
+		t.fdClose = nil
+		t.gcond.Broadcast()
+		t.gmu.Unlock()
+	}()
 
 	t.connected.Store(true)
 	defer t.connected.Store(false)
 	if t.Logger != nil {
-		t.Logger.Printf("serial: tailing %s", t.Device)
+		t.Logger.Printf("serial: tailing %s", canonical)
 	}
 
 	// Close the fd when ctx is cancelled so the blocking read unblocks.

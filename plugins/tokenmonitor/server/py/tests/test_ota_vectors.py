@@ -139,7 +139,7 @@ async def test_check_stages_update(tmp_path):
         assert reg.load(TEST_DEVICE).pending is None
 
         # Real run: stages with firmware fields.
-        rep = await ota.check(cfg, reg, dry_run=False)
+        rep = await ota.check(cfg, reg, dry_run=False, streaks={})
         assert rep["staged"] == 1 and rep["devices"][0]["action"] == "staged"
         dev = reg.load(TEST_DEVICE)
         assert dev.pending is not None
@@ -151,7 +151,7 @@ async def test_check_stages_update(tmp_path):
         assert p.firmware_manifest_sig_b64 == sig_b64
 
         # Idempotence: pending already carries 0.5.1.
-        rep = await ota.check(cfg, reg, dry_run=False)
+        rep = await ota.check(cfg, reg, dry_run=False, streaks={})
         assert rep["staged"] == 0 and rep["devices"][0]["action"] == "skipped:already-pending"
     finally:
         await server.close()
@@ -166,7 +166,7 @@ async def test_check_up_to_date(tmp_path):
         # (packed < floor), so the broker must not stage. (Floor == release is
         # installable and covered by test_check_stages_when_release_at_floor.)
         reg = _registry_with_device(tmp_path, "S1", ota.pack_semver("0.5.2"))
-        rep = await ota.check(cfg, reg, dry_run=False)
+        rep = await ota.check(cfg, reg, dry_run=False, streaks={})
         assert rep["staged"] == 0 and rep["devices"][0]["action"] == "up_to_date"
     finally:
         await server.close()
@@ -194,7 +194,7 @@ async def test_check_rejects_tampered_signature(tmp_path):
     try:
         cfg = _cfg_for(str(server.make_url("/")).rstrip("/"))
         reg = _registry_with_device(tmp_path, "S1", 0)
-        rep = await ota.check(cfg, reg, dry_run=False)
+        rep = await ota.check(cfg, reg, dry_run=False, streaks={})
         assert rep["staged"] == 0
         assert not rep["per_sku"][0]["verified"] and rep["per_sku"][0]["error"]
         assert rep["devices"][0]["action"] == "skipped:no-release"
@@ -341,7 +341,7 @@ async def test_check_inert_when_unconfigured(tmp_path):
     cfg = Config()
     cfg.ota = OTA(enabled=True, releases_repo="https://github.com/x/y", keys=[])
     reg = _registry_with_device(tmp_path, "S1", 0)
-    rep = await ota.check(cfg, reg, dry_run=False)
+    rep = await ota.check(cfg, reg, dry_run=False, streaks={})
     assert not rep["configured"]
     assert rep["staged"] == 0
     assert rep["note"]
@@ -368,7 +368,7 @@ def test_decide_skips_blocked_version(tmp_path: Path):
     reg.set_blocked_firmware_version(TEST_DEVICE, "0.9.1")
     dev = reg.load(TEST_DEVICE)
 
-    out = ota._decide(reg, dev, _resolved("0.9.1"), dry_run=False)
+    out = ota._decide(reg, dev, _resolved("0.9.1"), dry_run=False, streaks={})
     assert out["action"] == "skipped:blocked-version"
     assert reg.load(TEST_DEVICE).pending is None
 
@@ -381,7 +381,7 @@ def test_decide_stages_newer_than_blocked(tmp_path: Path):
     reg.set_blocked_firmware_version(TEST_DEVICE, "0.9.1")
     dev = reg.load(TEST_DEVICE)
 
-    out = ota._decide(reg, dev, _resolved("0.9.2"), dry_run=False)
+    out = ota._decide(reg, dev, _resolved("0.9.2"), dry_run=False, streaks={})
     assert out["action"] == "staged"
     assert reg.load(TEST_DEVICE).pending.payload.firmware_version == "0.9.2"
 
@@ -392,7 +392,7 @@ def test_decide_no_tombstone_stages_normally(tmp_path: Path):
     reg.register(TEST_DEVICE, ConfigPayload(broker_url="http://x", psk_hex="aa" * 32))
     dev = reg.load(TEST_DEVICE)
 
-    out = ota._decide(reg, dev, _resolved("0.9.1"), dry_run=False)
+    out = ota._decide(reg, dev, _resolved("0.9.1"), dry_run=False, streaks={})
     assert out["action"] == "staged"
 
 

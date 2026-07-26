@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -24,6 +25,7 @@ import aiohttp
 from aiohttp import web
 
 from .. import auth, creds, devlog, spend, usage
+from .. import usbprov
 from ..config import Config, firmware_path
 from ..registry import crypto as reg_crypto
 from ..registry import store as registry  # alias kept for parity with Go broker
@@ -96,6 +98,7 @@ def make_app(
     registry: Registry | None,
     usage_cache: usage.Cache | None = None,
     spend_cache: spend.Cache | None = None,
+    lease: "usbprov.LeaseManager | None" = None,
 ) -> web.Application:
     app = web.Application()
     app["cfg"] = cfg
@@ -105,6 +108,9 @@ def make_app(
     app["registry"] = registry
     app["usage_cache"] = usage_cache
     app["spend_cache"] = spend_cache
+    # Leader-mediated serial-lease table (None on a host with no serial device
+    # configured → 503 so the follower falls back to a direct exclusive open).
+    app["lease"] = lease
     # One shared aiohttp.ClientSession so connections to upstream APIs
     # (Anthropic/ChatGPT/Google) are pooled across requests. Created on
     # startup so we don't pay TLS handshake on every /usage hit.
@@ -116,12 +122,48 @@ def make_app(
         if sess is not None:
             await sess.close()
 
+    # Reap lapsed leases (leader-scoped) so a follower that crashed mid-session
+    # cannot wedge the tailer off its port forever. Mirrors the Go broker's
+    # 1s ReapExpired ticker. Only runs when a lease manager is wired.
+    async def _start_reaper(_app: web.Application) -> None:
+        lm = _app.get("lease")
+        if lm is None:
+            return
+
+        async def _reap_loop() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(1.0)
+                    lm.reap_expired()
+            except asyncio.CancelledError:
+                return
+
+        _app["lease_reaper"] = asyncio.create_task(_reap_loop())
+
+    async def _stop_reaper(_app: web.Application) -> None:
+        task = _app.get("lease_reaper")
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+
     app.on_startup.append(_start)
+    app.on_startup.append(_start_reaper)
     app.on_cleanup.append(_cleanup)
+    app.on_cleanup.append(_stop_reaper)
 
     app.router.add_get("/credentials", _handle_credentials)
     app.router.add_get("/credentials/codex", _handle_credentials_codex)
     app.router.add_get("/firmware-logs", _handle_firmware_logs)
+    # Leader-mediated serial-port lease (compat/PROVISION_WIRE.md §6). Exact
+    # paths (no trailing slash); one handler dispatches on the path after auth.
+    # Registered for ALL methods so a wrong method still reaches the handler
+    # (503-before-403-before-405 ordering), mirroring the Go mux.
+    app.router.add_route("*", usbprov.leasewire.LEASE_PATH, _handle_serial_lease)
+    app.router.add_route("*", usbprov.leasewire.LEASE_RENEW_PATH, _handle_serial_lease)
+    app.router.add_route("*", usbprov.leasewire.LEASE_RELEASE_PATH, _handle_serial_lease)
     app.router.add_get("/device/{device_id}/sync", _handle_device_sync)
     app.router.add_get("/device/{device_id}/panel", _handle_device_panel)
     app.router.add_post("/device/{device_id}/logs", _handle_device_logs)
@@ -163,6 +205,210 @@ async def _not_found_or_405(req: web.Request) -> web.Response:
                 return _error(405, "method not allowed")
             break
     return _error(404, "not found")
+
+
+# Bounds a lease request body. Lease JSON is a port path or a 32-hex id plus a
+# TTL — tiny; the cap just stops a malformed peer streaming.
+_MAX_LEASE_BODY_BYTES = 4 << 10
+
+
+def _is_loopback_peer(req: web.Request) -> bool:
+    """Whether the real TCP peer is a loopback IP. Uses the transport peername
+    (never a spoofable Host / X-Forwarded-For header); a missing/unparseable
+    host fails closed (not loopback)."""
+    host = ""
+    tr = req.transport
+    if tr is not None:
+        peer = tr.get_extra_info("peername")
+        if peer:
+            host = peer[0]
+    if not host:
+        host = req.remote or ""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    # Unmap an IPv4-mapped IPv6 address (::ffff:127.0.0.1) so a loopback follower
+    # arriving over a dual-stack IPv6 socket is still recognised as loopback —
+    # Go's net.IP.IsLoopback does this; Python's is_loopback did not before 3.13.
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_loopback
+
+
+async def _handle_serial_lease(req: web.Request) -> web.Response:
+    """Service the three leader-mediated serial-lease endpoints
+    (compat/PROVISION_WIRE.md §6): a follower asks the leader to suspend its
+    tailer. `lease` is None on a host with no serial device (503). Auth is the
+    shared-PSK loopback HMAC with a MANDATORY body digest — an absent
+    X-Tmon-Body-Sha256 is 401, never a silent v2 downgrade. Mirrors the Go
+    broker's serial_lease.go byte-for-byte."""
+    cfg: Config = req.app["cfg"]
+    cache: auth.NonceCache = req.app["cache"]
+    lease: "usbprov.LeaseManager | None" = req.app.get("lease")
+
+    if lease is None:
+        return _error(503, "serial port not configured on this host")
+    # Loopback-only, INDEPENDENT of the broker's bind address: the lease grants
+    # control of a HOST-LOCAL resource; the PSK must not implicitly confer remote
+    # serial-ownership control. A follower always dials 127.0.0.1.
+    if not _is_loopback_peer(req):
+        log.info("lease %s rejected: non-loopback peer %s", req.path, req.remote)
+        return _error(403, "serial lease is loopback-only")
+    if req.method != "POST":
+        return _error(405, "method not allowed")
+
+    # Body FIRST (bounded), then body-aware auth — the v3 signature covers
+    # sha256(body). Reading before auth is safe: nothing is acted on until it
+    # checks out. Cap the read at _MAX_LEASE_BODY_BYTES streaming (like Go's
+    # http.MaxBytesReader), so a missing/lying Content-Length can't make an
+    # unauthenticated peer buffer an oversized body.
+    if req.content_length is not None and req.content_length > _MAX_LEASE_BODY_BYTES:
+        return _error(413, "body too large")
+    buf = bytearray()
+    try:
+        async for chunk in req.content.iter_chunked(4096):
+            buf += chunk
+            if len(buf) > _MAX_LEASE_BODY_BYTES:
+                return _error(413, "body too large")
+    except Exception:  # noqa: BLE001
+        return _error(400, "bad request body")
+    raw = bytes(buf)
+
+    body_sha = req.headers.get("X-Tmon-Body-Sha256", "")
+    if not body_sha:
+        # These endpoints mutate port ownership; refuse an unsigned body rather
+        # than fall back to the v2 (body-blind) canonical.
+        log.info("lease %s from %s: missing body digest", req.path, req.remote)
+        return _error(401, "unauthorized")
+    try:
+        auth.verify_multi_body(
+            [cfg.psk()],
+            "POST", req.path,
+            req.headers.get("X-Tmon-Timestamp", ""),
+            req.headers.get("X-Tmon-Nonce", ""),
+            req.headers.get("X-Tmon-Signature", ""),
+            req.headers.get("X-Tmon-Device", ""),
+            req.headers.get("X-Tmon-Config-Version", ""),
+            body_sha,
+            raw,
+            cache,
+            cfg.security.max_timestamp_skew_seconds,
+        )
+    except auth.AuthError as e:
+        log.info("auth rejected %s from %s: %s", req.path, req.remote, e)
+        return _error(401, "unauthorized")
+
+    if req.path == usbprov.leasewire.LEASE_PATH:
+        return await _handle_lease_grant(lease, raw)
+    if req.path == usbprov.leasewire.LEASE_RENEW_PATH:
+        return _handle_lease_renew(lease, raw)
+    if req.path == usbprov.leasewire.LEASE_RELEASE_PATH:
+        return _handle_lease_release(lease, raw)
+    return _error(404, "not found")
+
+
+def _lease_ttl_ms(req_obj: dict) -> int:
+    """Extract ttl_ms with Go-parity strictness: JSON int only. bool, string and
+    fractional-float values are rejected (400), matching a Go json.Unmarshal into
+    int64. A missing key is 0 (the manager then applies its default/clamp)."""
+    v = req_obj.get("ttl_ms", 0)
+    if v is None:
+        return 0
+    # bool is an int subclass in Python; Go would reject `true` for an int64.
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise ValueError("ttl_ms must be an integer")
+    # Python ints are unbounded, Go's int64 is not: a value Go answers 400 for
+    # must not quietly clamp to the max here, or the same request gets two
+    # different answers depending on which runtime is leader.
+    if not (-(2**63) <= v < 2**63):
+        raise ValueError("ttl_ms out of int64 range")
+    return v
+
+
+async def _handle_lease_grant(lease: "usbprov.LeaseManager", raw: bytes) -> web.Response:
+    try:
+        req_obj = json.loads(raw)
+        port = req_obj.get("port", "")
+        ttl_ms = _lease_ttl_ms(req_obj)
+    except (ValueError, TypeError, AttributeError):
+        return _error(400, "bad lease request")
+    if not port or not isinstance(port, str):
+        return _error(400, "bad lease request")
+    # Canonicalise on the leader (abspath + realpath) so the lease slot key
+    # matches what the tailer and the follower's open_exclusive both compute.
+    try:
+        canonical = usbprov.canonical_port(port)
+    except OSError:
+        return _error(400, "unresolvable port")
+    # grant() can BLOCK: it calls the tailer's suspend_port, which waits for the
+    # reader to close its fd + flock. Run it off the event loop so a suspend
+    # doesn't stall every other broker request on this single-threaded loop.
+    try:
+        lease_id, granted, _expires = await asyncio.to_thread(
+            lease.grant, canonical, ttl_ms / 1000.0
+        )
+    except usbprov.LeaseBusy:
+        # PROVISION_WIRE §6: the 409 body is {"error":"busy","holder":...}, not
+        # a plain error string. The port is always busy on a competing lease
+        # here (grant suspends the tailer before recording), so holder="lease".
+        return web.json_response({"error": "busy", "holder": "lease"}, status=409)
+    except Exception as e:  # noqa: BLE001
+        log.warning("lease grant %s: %s", canonical, e)
+        return _error(503, "cannot yield port")
+    return web.json_response(
+        {
+            "lease_id": lease_id,
+            # "port" echoes the CANONICAL path the leader keyed the lease on,
+            # which is not necessarily the alias the follower asked for.
+            "port": canonical,
+            "ttl_ms": int(round(granted * 1000)),
+            "expires_unix_ms": int((time.time() + granted) * 1000),
+        }
+    )
+
+
+def _handle_lease_renew(lease: "usbprov.LeaseManager", raw: bytes) -> web.Response:
+    # The renew request carries ONLY the lease id (PROVISION_WIRE §6). Any
+    # ttl_ms in the body is ignored, deliberately: the leader re-applies the
+    # TTL it originally granted so a renew can never shrink the window.
+    try:
+        req_obj = json.loads(raw)
+        lease_id = req_obj.get("lease_id", "")
+    except (ValueError, TypeError, AttributeError):
+        return _error(400, "bad renew request")
+    if not lease_id or not isinstance(lease_id, str):
+        return _error(400, "bad renew request")
+    try:
+        granted, _expires = lease.renew(lease_id)
+    except usbprov.LeaseUnknown:
+        # 410 Gone: the lease lapsed or never existed → the follower MUST abort
+        # its session (the port may already be back with the tailer). This is a
+        # KNOWN route with an unknown lease, distinct from the grant path's 404
+        # (an old leader lacking the route entirely → direct-open fallback).
+        return _error(410, "lease unknown or expired")
+    except Exception as e:  # noqa: BLE001
+        log.warning("lease renew: %s", e)
+        return _error(500, "renew error")
+    return web.json_response(
+        {
+            "ttl_ms": int(round(granted * 1000)),
+            "expires_unix_ms": int((time.time() + granted) * 1000),
+        }
+    )
+
+
+def _handle_lease_release(lease: "usbprov.LeaseManager", raw: bytes) -> web.Response:
+    try:
+        req_obj = json.loads(raw)
+        lease_id = req_obj.get("lease_id", "")
+    except (ValueError, TypeError, AttributeError):
+        return _error(400, "bad release request")
+    if not lease_id or not isinstance(lease_id, str):
+        return _error(400, "bad release request")
+    # Idempotent: an unknown/expired id is still a success.
+    lease.release(lease_id)
+    return web.json_response({"ok": True})
 
 
 _firmware_sha_cache: dict[str, tuple[float, int, str]] = {}
@@ -791,6 +1037,32 @@ async def _handle_device_sync(req: web.Request) -> web.Response:
                 log.warning("registry set_active_firmware_version %s: %s", device_id, e)
 
         dev = registry.load(device_id)
+
+        # Install-loop breaker, device-reported half. X-Tmon-Ota-Fail carries
+        # the firmware's own verdict on an image it downloaded and booted but
+        # that never self-confirmed — the device is the only party that can see
+        # a rollback, since from the broker's side every step succeeded. The
+        # stage-streak counter in ota.decide() catches the same loop without
+        # any device change, but only at the hourly poll and only while the
+        # broker stays up; either trigger alone closes the loop. Mirror of Go's
+        # block in handleDeviceSync.
+        fail = _parse_ota_fail(req.headers.get("X-Tmon-Ota-Fail", ""))
+        if (
+            fail is not None
+            and fail[0] != fw_hdr
+            and dev.blocked_firmware_version != fail[0]
+        ):
+            try:
+                registry.set_blocked_firmware_version(device_id, fail[0])
+                dev.blocked_firmware_version = fail[0]
+                log.warning(
+                    "device %s reports %s failed to install %d times (%s); "
+                    "blocking that version — publish a newer one to clear it",
+                    device_id, fail[0], fail[1], fail[2],
+                )
+            except Exception as e:
+                log.warning("registry set_blocked_firmware_version %s: %s", device_id, e)
+
         resp_body: dict[str, Any] = {"active_version": dev.active.payload.version}
         # Advertise the broker self-version-check verdict on every 200 so the
         # device can surface a "broker outdated" banner. Only once known — an
@@ -997,6 +1269,35 @@ async def _handle_device_settings(req: web.Request) -> web.Response:
         pet_name = body.get("pet_name")
         if pet_name is not None and not isinstance(pet_name, str):
             raise ValueError("bad pet_name")
+        # Remembered networks, names only. Device input, so it is sanitised
+        # before storage: entries with an empty or oversize SSID are dropped
+        # and the list is truncated to what the on-device store can hold (8).
+        # None (key absent) means firmware too old to report — distinct from
+        # an empty list, which means "I remember none".
+        wifi_known = body.get("wifi_known")
+        if wifi_known is not None:
+            if not isinstance(wifi_known, list):
+                raise ValueError("bad wifi_known")
+            cleaned = []
+            for n in wifi_known:
+                if not isinstance(n, dict):
+                    continue
+                ssid = n.get("ssid")
+                # Bytes, not characters: the 802.11 SSID field is 32 OCTETS,
+                # which is how the device and the Go broker both measure it.
+                if (not isinstance(ssid, str) or not ssid
+                        or len(ssid.encode("utf-8")) > 32):
+                    continue
+                verified, is_open = n.get("verified", False), n.get("open", False)
+                # Strict, not truthy: Go's typed decode rejects a non-boolean
+                # outright, and a coerced "false" string would silently flip a
+                # network to open and make set_wifi refuse it forever.
+                if not isinstance(verified, bool) or not isinstance(is_open, bool):
+                    raise ValueError("bad wifi_known")
+                cleaned.append({"ssid": ssid, "verified": verified, "open": is_open})
+                if len(cleaned) == 8:
+                    break
+            wifi_known = cleaned
     except ValueError:
         return _error(400, "bad settings body")
 
@@ -1013,6 +1314,7 @@ async def _handle_device_settings(req: web.Request) -> web.Response:
             panel_enabled=panel_enabled,
             pet_species=pet_species,
             pet_name=pet_name,
+            wifi_known=wifi_known,
         )
     except NotFound:
         return _error(404, "unknown device")
@@ -1022,6 +1324,80 @@ async def _handle_device_settings(req: web.Request) -> web.Response:
         log.warning("report settings %s: %s", device_id, e)
         return _error(500, "registry error")
     return web.Response(status=204)
+
+
+# How many failed installs the DEVICE must report before the broker stops
+# offering that version. See _parse_ota_fail.
+#
+# Two thresholds, mirroring TMON_OTA_MAX_INSTALLS / _SOFT in the firmware. They
+# MUST match: the device gives up at its own threshold, and a broker that
+# tombstoned earlier would silently shorten the device's retry budget — a
+# version the firmware was still willing to try twice more would stop being
+# offered after the first two circumstantial failures.
+#
+# Hard states are faults we can pin on the image (it crashed or hung before
+# confirming); everything else — a brownout, a power cut before the confirm
+# window closed, a reset we could not attribute — is circumstantial and needs
+# more evidence before condemning a build that may well be fine.
+#
+# Unrecognised states get the SOFT threshold rather than being rejected:
+# firmware and broker version independently, so a future firmware adding a
+# state must not silently disable the breaker.
+MIN_FAILED_INSTALLS_HARD = 2
+MIN_FAILED_INSTALLS_SOFT = 4
+_HARD_STATES = ("panic", "wdt")
+
+
+def _ota_fail_threshold(state: str) -> int:
+    return MIN_FAILED_INSTALLS_HARD if state in _HARD_STATES else MIN_FAILED_INSTALLS_SOFT
+
+
+def _parse_ota_fail(h: str) -> tuple[str, int, str] | None:
+    """Parse X-Tmon-Ota-Fail ("<version>:<installs>:<state>").
+
+    Returns (version, installs, state) ONLY when the value is a well-formed
+    report of a version that has definitively failed to install. Everything
+    else — "none", an empty header, a malformed value, a still-in-flight
+    "pending" state, or a count below the threshold — returns None.
+
+    The header is unsigned metadata (like X-Tmon-Fw-Version and X-Tmon-Serial
+    alongside it), so it is parsed defensively and fails closed: the worst a
+    spoofer can achieve is to deny UPDATES to one device it can already
+    impersonate, never to cause an install. See compat/SECURITY.md.
+
+    Byte-for-byte mirror of Go parseOTAFail / JS parseOtaFail.
+    """
+    from ..ota import valid_version  # lazy: avoid import cycle (ota → registry)
+
+    h = h.strip()
+    if not h or h == "none" or len(h) > 64:
+        return None
+    parts = h.split(":")
+    if len(parts) != 3:
+        return None
+    version, state = parts[0], parts[2]
+    # Must name a real version, or a garbage string could be written into the
+    # tombstone and then never match (and never clear) a published release.
+    if not valid_version(version):
+        return None
+    # Strict digits, matching Go's strconv.Atoi. Bare int() would also accept
+    # "1_0" (== 10) and surrounding whitespace, which Go rejects — and this
+    # parser has to agree across all three runtimes byte for byte.
+    if not re.fullmatch(r"[+-]?[0-9]+", parts[1]):
+        return None
+    n = int(parts[1])
+    # The firmware stores installs as 0..255 (tmon_ota_fail_parse enforces it),
+    # so anything outside that is not a record we wrote. Python ints are
+    # unbounded, so without this an absurd count would sail past the threshold.
+    if n < 0 or n > 255:
+        return None
+    # "pending" means the device armed the image but has not yet reported back
+    # on it — the install may still succeed, so it is not evidence of failure.
+    if not state or state == "pending":
+        return None
+    if n < _ota_fail_threshold(state):
+        return None
+    return version, n, state
 
 
 def _parse_uint32(s: str) -> int:
@@ -1098,6 +1474,16 @@ def _pending_payload_json(p) -> str:
         wire["pet_species"] = int(p.pet_species)
     if p.pet_name:
         wire["pet_name"] = str(p.pet_name)
+    if p.wifi_ssid:
+        wire["wifi_ssid"] = str(p.wifi_ssid)
+        # Emitted ONLY alongside an SSID, and only when non-empty. A bare
+        # wifi_pass is meaningless, and an empty one is not "open network"
+        # here the way it is over the cable — the device never auto-joins an
+        # open network, so the only thing an empty string could do is
+        # overwrite a good stored password with nothing. Absent means "switch
+        # to a network you already remember".
+        if p.wifi_pass:
+            wire["wifi_pass"] = str(p.wifi_pass)
     gm = getattr(p, "gemini_models", None)
     if gm is not None and len(gm) > 0:
         # Dual-emit the per-device model override CSV under the new

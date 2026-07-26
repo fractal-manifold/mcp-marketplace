@@ -148,7 +148,12 @@ export class Registry {
       const prev = dev.active;
       active.firmware_version = prev && prev.payload ? prev.payload.firmware_version : "";
       active.min_secure_version = prev && prev.payload ? prev.payload.min_secure_version : 0;
-      dev.active = { payload: active, lastSeen: prev ? prev.lastSeen : null };
+      // wifiKnown is device-observation state like lastSeen, so a
+      // re-provision keeps it: the device still remembers the same networks
+      // and has no reason to re-report them just because the broker record
+      // was replaced.
+      dev.active = { payload: active, lastSeen: prev ? prev.lastSeen : null,
+                     wifiKnown: prev ? (prev.wifiKnown ?? null) : null };
       dev.pending = null;
       this._saveLocked(dev);
       return dev;
@@ -191,6 +196,17 @@ export class Registry {
     return this._withLock(id, () => {
       const dev = this._loadLocked(id);
       let changed = applyReported(dev.active.payload, s);
+      // Observed state, replaced wholesale rather than merged: the device is
+      // the only authority on what it remembers, and a network it has
+      // forgotten must disappear here too, or set_wifi would keep offering a
+      // password-free switch to something no longer stored. A null/absent
+      // report (firmware too old to send the list) leaves the last known one
+      // alone instead of erasing it.
+      if (s.wifi_known != null &&
+          JSON.stringify(dev.active.wifiKnown ?? null) !== JSON.stringify(s.wifi_known)) {
+        dev.active.wifiKnown = s.wifi_known;
+        changed = true;
+      }
       if (dev.pending) {
         changed = applyReported(dev.pending.payload, s) || changed;
       }
@@ -209,7 +225,22 @@ export class Registry {
       // rotation does not actually change the PSK. Otherwise theme- /
       // city- / brightness-only pending updates would never promote.
       if (!usedPendingPSK && dev.pending.payload.psk_hex !== dev.active.payload.psk_hex) return false;
-      dev.active = { payload: dev.pending.payload, lastSeen: new Date() };
+      const promotedPayload = dev.pending.payload;
+      // The device has applied this payload, so the WiFi password has done its
+      // one job and now lives in the device's own store. Dropping it here is
+      // what keeps the registry from accumulating every network credential the
+      // fleet was ever handed. The SSID stays: it is not a secret, and it is
+      // genuinely useful to see which network a device is meant to be on.
+      promotedPayload.wifi_pass = "";
+      dev.active = {
+        payload: promotedPayload,
+        lastSeen: new Date(),
+        // Observed state survives a config promote untouched — the device
+        // reports it on its own cadence and a promote knows nothing about it.
+        // Without this the list would be wiped on every promote and set_wifi
+        // would fall back to asking for a password it already has.
+        wifiKnown: dev.active.wifiKnown ?? null,
+      };
       dev.pending = null;
       this._saveLocked(dev);
       return true;
@@ -375,6 +406,18 @@ function emptyPayload() {
     // pet_enabled null = no change (default true on-device); pet_species null =
     // not picked yet (no sentinel stored); pet_name "" = use species default.
     pet_enabled: null, pet_species: null, pet_name: "",
+    // WiFi. wifi_ssid alone means "switch to a network the device already
+    // remembers" — it holds the password, so asking the operator to retype it
+    // is the friction tokenmonitor_set_wifi exists to remove. A password is
+    // only needed for a network the device has never seen.
+    //
+    // wifi_pass is deliberately NOT carried into active on promote. Unlike
+    // psk_hex, which the broker must keep to sign every later request, a WiFi
+    // password has exactly one job — get onto the network once — after which
+    // the device holds it in its own remembered-networks store. Keeping it
+    // would mean the registry accumulated every network credential the fleet
+    // was ever given, on disk, to no purpose.
+    wifi_ssid: "", wifi_pass: "",
     // Custom panel — device-owned display setting, same shape as pet_enabled.
     // null = no change (default false on-device, opt-in).
     panel_enabled: null,
@@ -419,6 +462,8 @@ function payloadToTomlObj(p) {
   if (p.pet_enabled != null) d.pet_enabled = !!p.pet_enabled;
   if (p.pet_species != null) d.pet_species = Number(p.pet_species);
   if (p.pet_name) d.pet_name = String(p.pet_name);
+  if (p.wifi_ssid) d.wifi_ssid = String(p.wifi_ssid);
+  if (p.wifi_pass) d.wifi_pass = String(p.wifi_pass);
   if (p.panel_enabled != null) d.panel_enabled = !!p.panel_enabled;
   if (Array.isArray(p.gemini_models) && p.gemini_models.length > 0) {
     d.gemini_models = p.gemini_models.map(String);
@@ -456,6 +501,8 @@ function tomlObjToPayload(d) {
     pet_enabled: typeof d.pet_enabled === "boolean" ? d.pet_enabled : null,
     pet_species: typeof d.pet_species === "number" ? d.pet_species : null,
     pet_name: String(d.pet_name || ""),
+    wifi_ssid: String(d.wifi_ssid || ""),
+    wifi_pass: String(d.wifi_pass || ""),
     panel_enabled: typeof d.panel_enabled === "boolean" ? d.panel_enabled : null,
     gemini_models: Array.isArray(d.gemini_models) ? d.gemini_models.map(String) : null,
     log_enabled: typeof d.log_enabled === "boolean" ? d.log_enabled : null,
@@ -523,6 +570,17 @@ function deviceToTOML(dev) {
   if (dev.blockedFirmwareVersion) doc.blocked_firmware_version = dev.blockedFirmwareVersion;
   const a = payloadToTomlObj(dev.active.payload);
   if (dev.active.lastSeen) a.last_seen = dev.active.lastSeen;
+  // != null, not truthiness on length: an empty list means the device reported
+  // remembering NO networks, a different answer from never having reported at
+  // all — and every load() re-reads this file, so collapsing them here would
+  // make the empty case unreachable.
+  if (dev.active.wifiKnown != null) {
+    a.wifi_known = dev.active.wifiKnown.map((n) => ({
+      ssid: String(n.ssid || ""),
+      verified: Boolean(n.verified),
+      open: Boolean(n.open),
+    }));
+  }
   doc.active = a;
   if (dev.pending) {
     const p = payloadToTomlObj(dev.pending.payload);
@@ -534,7 +592,20 @@ function deviceToTOML(dev) {
 
 function deviceFromTOML(text) {
   const d = TOML.parse(text);
-  const active = { payload: tomlObjToPayload(d.active), lastSeen: d.active?.last_seen ? new Date(d.active.last_seen) : null };
+  const active = {
+    payload: tomlObjToPayload(d.active),
+    lastSeen: d.active?.last_seen ? new Date(d.active.last_seen) : null,
+    // Device-OBSERVED state, not configuration: the networks the device
+    // remembers, by NAME only. null means the device never reported (firmware
+    // predating the field) — distinct from [] meaning "I remember none".
+    wifiKnown: d.active?.wifi_known != null
+      ? d.active.wifi_known.map((n) => ({
+          ssid: String(n.ssid || ""),
+          verified: Boolean(n.verified),
+          open: Boolean(n.open),
+        }))
+      : null,
+  };
   let pending = null;
   if (d.pending) {
     pending = { payload: tomlObjToPayload(d.pending), createdAt: d.pending.created_at ? new Date(d.pending.created_at) : new Date() };
@@ -621,6 +692,13 @@ function mergePayload(base, upd) {
     pet_enabled: upd.pet_enabled != null ? upd.pet_enabled : base.pet_enabled,
     pet_species: upd.pet_species != null ? upd.pet_species : base.pet_species,
     pet_name: upd.pet_name || base.pet_name,
+    // WiFi moves as a PAIR, always. A password belongs to one SSID, so a new
+    // SSID takes the update's password even when that is empty ("switch to a
+    // network you already remember") — carrying the previous SSID's password
+    // forward would ship the wrong credential for the new network. Keyed on
+    // the SSID: a bare password has nothing to apply to.
+    wifi_ssid: upd.wifi_ssid || base.wifi_ssid,
+    wifi_pass: upd.wifi_ssid ? upd.wifi_pass : base.wifi_pass,
     panel_enabled: upd.panel_enabled != null ? upd.panel_enabled : base.panel_enabled,
     gemini_models: Array.isArray(upd.gemini_models)
       ? upd.gemini_models.slice()
@@ -653,6 +731,13 @@ function payloadEquivalent(a, b) {
   if ((a.pet_species == null) !== (b.pet_species == null)) return false;
   if (a.pet_species != null && a.pet_species !== b.pet_species) return false;
   if ((a.pet_name || "") !== (b.pet_name || "")) return false;
+  // wifi_pass is compared even though a promoted active always has it empty.
+  // That asymmetry is the point: re-staging the SSID the device is already on,
+  // WITH a password, is how an operator fixes a network whose password
+  // changed. Comparing the SSID alone would call that a no-op and silently
+  // drop the fix.
+  if ((a.wifi_ssid || "") !== (b.wifi_ssid || "")) return false;
+  if ((a.wifi_pass || "") !== (b.wifi_pass || "")) return false;
   const am = Array.isArray(a.gemini_models) ? a.gemini_models : [];
   const bm = Array.isArray(b.gemini_models) ? b.gemini_models : [];
   if (am.length !== bm.length) return false;

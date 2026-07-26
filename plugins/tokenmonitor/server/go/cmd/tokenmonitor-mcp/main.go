@@ -6,18 +6,19 @@
 // background and take over if the leader exits. See internal/leader.
 //
 // Flags:
-//   --daemon   Standalone broker. Just binds and serves; no leader probing.
-//              Use this when running under systemd or any always-on supervisor.
-//   --once     Validate that the credentials file is readable + not expired,
-//              print a one-line summary, and exit. Useful for smoke tests.
-//   --status   Probe the local broker (if any) for a status JSON dump.
-//   --config   Path to tokenmonitor.toml (default: ~/.config/tokenmonitor/tokenmonitor.toml,
-//              with fallback to service.toml for legacy installations).
-//   --version  Print version and exit.
-//   --probe    Report the runtime ("go") plus version to stderr and exit
-//              0 if this binary is healthy enough for the launcher to
-//              dispatch to it. Used by tokenmonitor-mcp-launcher (POSIX sh) to
-//              pick between the Go, Python and JS impls.
+//
+//	--daemon   Standalone broker. Just binds and serves; no leader probing.
+//	           Use this when running under systemd or any always-on supervisor.
+//	--once     Validate that the credentials file is readable + not expired,
+//	           print a one-line summary, and exit. Useful for smoke tests.
+//	--status   Probe the local broker (if any) for a status JSON dump.
+//	--config   Path to tokenmonitor.toml (default: ~/.config/tokenmonitor/tokenmonitor.toml,
+//	           with fallback to service.toml for legacy installations).
+//	--version  Print version and exit.
+//	--probe    Report the runtime ("go") plus version to stderr and exit
+//	           0 if this binary is healthy enough for the launcher to
+//	           dispatch to it. Used by tokenmonitor-mcp-launcher (POSIX sh) to
+//	           pick between the Go, Python and JS impls.
 package main
 
 import (
@@ -57,6 +58,7 @@ import (
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/state"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/updatecheck"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/usage"
+	"github.com/fractal-manifold/tokenmonitor-mcp/internal/usbprov"
 )
 
 // Version is overridden at build time via -ldflags "-X main.Version=...".
@@ -156,8 +158,10 @@ func runDaemon(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	fwBuf, fwLogs, stopTailer := startFirmwareTailer(ctx, cfg, logger)
+	fwBuf, fwLogs, serialCtrl, stopTailer := startFirmwareTailer(ctx, cfg, logger)
 	defer stopTailer()
+	// Serial-lease table: followers ask this leader to yield the USB port.
+	lease := usbprov.NewLeaseManager(serialCtrl, 0)
 
 	reg := openRegistry(logger)
 	mdnsPub := startMDNS(ctx, cfg, reg, logger)
@@ -171,7 +175,7 @@ func runDaemon(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int 
 	go ota.Run(ctx, cfg, reg, logger)
 	usageCache := buildUsageCache(cfg, logger)
 	spendCache := buildSpendCache(cfg, logger)
-	if err := broker.Serve(ctx, ln, cfg, st, logger, fwLogs, reg, usageCache, spendCache); err != nil {
+	if err := broker.Serve(ctx, ln, cfg, st, logger, fwLogs, reg, usageCache, spendCache, lease); err != nil {
 		logger.Printf("broker: %v", err)
 		return 1
 	}
@@ -228,18 +232,18 @@ func buildUsageCache(cfg *config.Config, logger *log.Logger) *usage.Cache {
 // [spend].enabled is false, which makes /spend/* answer 501.
 func buildSpendCache(cfg *config.Config, logger *log.Logger) *spend.Cache {
 	return spend.BuildCache(spend.SpendConfig{
-		Enabled:          cfg.Spend.Enabled,
-		CacheTTLSeconds:  cfg.Spend.CacheTTLSeconds,
-		ClaudeProjects:    cfg.ClaudeProjectsPath(),
-		CodexSessions:     cfg.CodexSessionsPath(),
-		AntigravityConv:   cfg.AntigravityConvPath(),
-		ClaudeCredsPath:   cfg.OAuthPath(),
-		CodexAuthPath:     cfg.CodexAuthPath(),
-		CodexEnabled:      cfg.Codex.Enabled,
+		Enabled:            cfg.Spend.Enabled,
+		CacheTTLSeconds:    cfg.Spend.CacheTTLSeconds,
+		ClaudeProjects:     cfg.ClaudeProjectsPath(),
+		CodexSessions:      cfg.CodexSessionsPath(),
+		AntigravityConv:    cfg.AntigravityConvPath(),
+		ClaudeCredsPath:    cfg.OAuthPath(),
+		CodexAuthPath:      cfg.CodexAuthPath(),
+		CodexEnabled:       cfg.Codex.Enabled,
 		AntigravityEnabled: cfg.Antigravity.Enabled,
-		PricingURL:       cfg.Pricing.URL,
-		PricingCachePath: cfg.PricingCachePath(),
-		PricingTTLHours:  cfg.Pricing.TTLHours,
+		PricingURL:         cfg.Pricing.URL,
+		PricingCachePath:   cfg.PricingCachePath(),
+		PricingTTLHours:    cfg.Pricing.TTLHours,
 	}, logger)
 }
 
@@ -256,14 +260,17 @@ func keysOf(m map[string]usage.Fetcher) []string {
 // FirmwareLogSource is what the broker mux serves on /firmware-logs.
 // stopTailer is a no-op when the tailer is disabled; otherwise it cancels
 // the goroutine's context.
-func startFirmwareTailer(ctx context.Context, cfg *config.Config, logger *log.Logger) (*logbuf.Buffer, broker.FirmwareLogSource, func()) {
+// The returned SerialController is the lease manager's owner of the port: the
+// live tailer when a serial device is configured, else a NopController (every
+// port is "already free", so a lease Grant never has to suspend anything).
+func startFirmwareTailer(ctx context.Context, cfg *config.Config, logger *log.Logger) (*logbuf.Buffer, broker.FirmwareLogSource, usbprov.SerialController, func()) {
 	size := cfg.Serial.Lines
 	if size <= 0 {
 		size = 2000
 	}
 	buf := logbuf.New(size)
 	if cfg.Serial.Device == "" {
-		return buf, broker.NewFirmwareLogs(buf, func() bool { return false }), func() {}
+		return buf, broker.NewFirmwareLogs(buf, func() bool { return false }), usbprov.NopController{}, func() {}
 	}
 	tailer := &serial.Tailer{
 		Device: cfg.Serial.Device,
@@ -272,7 +279,7 @@ func startFirmwareTailer(ctx context.Context, cfg *config.Config, logger *log.Lo
 	}
 	tailCtx, cancel := context.WithCancel(ctx)
 	go tailer.Run(tailCtx)
-	return buf, broker.NewFirmwareLogs(buf, tailer.Connected), cancel
+	return buf, broker.NewFirmwareLogs(buf, tailer.Connected), tailer, cancel
 }
 
 // startPanelGenerators launches the leader-scoped custom-panel generator
@@ -334,8 +341,11 @@ func runMCP(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int {
 		// loses leadership (or shuts down).
 		reg := openRegistry(logger)
 		err := leader.Run(ctx, addrOf(cfg), st, logger, func(c context.Context, ln net.Listener) error {
-			_, fwLogs, stopTailer := startFirmwareTailer(c, cfg, logger)
+			_, fwLogs, serialCtrl, stopTailer := startFirmwareTailer(c, cfg, logger)
 			defer stopTailer()
+			// Serial-lease table: followers ask this leader (the sole tailer
+			// owner) to yield the USB port for a provisioning session.
+			lease := usbprov.NewLeaseManager(serialCtrl, 0)
 			// mDNS publication is scoped to the leader: only the
 			// process that actually owns the bound port should be
 			// answering "I'm the broker" on the LAN.
@@ -352,7 +362,7 @@ func runMCP(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int {
 			go ota.Run(c, cfg, reg, logger)
 			usageCache := buildUsageCache(cfg, logger)
 			spendCache := buildSpendCache(cfg, logger)
-			return broker.Serve(c, ln, cfg, st, logger, fwLogs, reg, usageCache, spendCache)
+			return broker.Serve(c, ln, cfg, st, logger, fwLogs, reg, usageCache, spendCache, lease)
 		})
 		if err != nil && !errors.Is(err, context.Canceled) {
 			logger.Printf("leader: %v", err)

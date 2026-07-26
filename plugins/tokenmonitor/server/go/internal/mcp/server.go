@@ -202,6 +202,8 @@ func NewServer(d Deps) *server.MCPServer {
 		handleSetDevicePending(d),
 	)
 
+	s.AddTool(setWiFiTool(), handleSetWiFi(d))
+
 	s.AddTool(
 		mcp.NewTool("tokenmonitor_revert_firmware",
 			mcp.WithDescription("Stage a rollback to a previously-shipped firmware version. The broker enforces anti-rollback: if target_min_secure_version is below the device's current floor (Active.MinSecureVersion in the registry), the call is rejected upfront. The device's own gate against the manifest's min_secure_version is the ultimate authority."),
@@ -249,6 +251,7 @@ func NewServer(d Deps) *server.MCPServer {
 	)
 
 	registerDiscoveryTools(s, d)
+	registerUSBTools(s, d)
 
 	return s
 }

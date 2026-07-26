@@ -255,6 +255,8 @@ async def _dispatch(deps: Deps, name: str, args: dict) -> Any:
         return _register_device(deps, args)
     if name == "tokenmonitor_set_device_pending":
         return _set_device_pending(deps, args)
+    if name == "tokenmonitor_set_wifi":
+        return _set_wifi(deps, args)
     if name == "tokenmonitor_publish_firmware":
         return _publish_firmware(deps, args)
     if name == "tokenmonitor_revert_firmware":
@@ -265,6 +267,12 @@ async def _dispatch(deps: Deps, name: str, args: dict) -> Any:
         return await _provision(deps, args)
     if name == "tokenmonitor_check_updates":
         return await _check_updates(deps, args)
+    if name == "tokenmonitor_usb_scan":
+        from . import usb
+        return await usb.handle_usb_scan(deps, args)
+    if name == "tokenmonitor_usb_provision":
+        from . import usb
+        return await usb.handle_usb_provision(deps, args)
     return {"error": f"unknown tool {name}"}
 
 
@@ -713,6 +721,111 @@ def _revert_firmware(deps: Deps, args: dict) -> dict:
         return {"error": str(e)}
     return {"ok": True, "reverts_to": fv, "device": _device_summary(dev2)}
 
+
+
+# 802.11 limits. The device enforces these too (tmon_wifi_store.h); checking
+# here turns a silent device-side rejection into an immediate error.
+_WIFI_SSID_MAX = 32
+_WIFI_PASS_MAX = 63
+
+
+def _known_network_names(nets: list[dict]) -> str:
+    """Render the remembered list for an error message. Names only, which is
+    all the broker has — no password ever travels device->broker."""
+    if not nets:
+        return "(none reported)"
+    parts = []
+    for n in nets:
+        s = str(n.get("ssid", ""))
+        if n.get("open"):
+            s += " (open — cannot be switched to remotely)"
+        elif not n.get("verified"):
+            s += " (never connected successfully)"
+        parts.append(s)
+    return ", ".join(parts)
+
+
+def _set_wifi(deps: Deps, args: dict) -> dict:
+    """Mirror of Go's handleSetWiFi. See compat/tool-schemas.json.
+
+    The interesting behaviour is the decision in the middle: a network the
+    device already remembers needs no password, because the device is holding
+    it. Only an unknown network makes this ask.
+    """
+    if deps.registry is None:
+        return {"error": _registry_unavailable_text()}
+    device_id = (args.get("device_id") or "").strip().lower()
+    if not valid_device_id(device_id):
+        return {"error": "device_id must be 8 lowercase hex chars"}
+
+    # NOT stripped: leading and trailing spaces are legal in an SSID and
+    # trimming them would silently target a different network than the caller
+    # named — one the device may not remember at all.
+    ssid = args.get("ssid") or ""
+    if not isinstance(ssid, str) or not ssid:
+        return {"error": "ssid is required"}
+    # Byte length, not character count: the 802.11 field is 32 OCTETS and the
+    # device measures it the same way, so a non-ASCII SSID must be rejected
+    # here exactly where the device would reject it.
+    ssid_bytes = len(ssid.encode("utf-8"))
+    if ssid_bytes > _WIFI_SSID_MAX:
+        return {"error": f"ssid is {ssid_bytes} bytes; the 802.11 limit is {_WIFI_SSID_MAX}"}
+    passphrase = args.get("pass") or ""
+    if not isinstance(passphrase, str):
+        return {"error": "pass must be a string"}
+    pass_bytes = len(passphrase.encode("utf-8"))
+    if pass_bytes > _WIFI_PASS_MAX:
+        return {"error": f"pass is {pass_bytes} bytes; the WPA2 limit is {_WIFI_PASS_MAX}"}
+
+    try:
+        dev = deps.registry.load(device_id)
+    except NotFound:
+        return {"error": f"device {device_id} not registered — call tokenmonitor_register_device first"}
+
+    # Decide whether a password is needed, but ONLY when none was given. A
+    # supplied password is always honoured: it is how an operator fixes a
+    # network whose password changed, and second-guessing that would make a
+    # rotated credential unfixable from here.
+    if not passphrase:
+        known = dev.active.wifi_known
+        match = None
+        for n in known or []:
+            if str(n.get("ssid", "")) == ssid:
+                match = n
+                break
+        if match is None:
+            # Distinguish "the device told us its networks and this is not
+            # one" from "the device never told us anything", because the
+            # second is old firmware and the fix is different.
+            if known is None:
+                return {"error": (
+                    f"this device has not reported its remembered networks, so I cannot tell "
+                    f"whether it knows {ssid!r}. That report needs firmware with wifi_known "
+                    f"support. Supply `pass` to switch to it regardless.")}
+            return {"error": (
+                f"needs_password=true: the device does not remember {ssid!r}, so it needs the "
+                f"passphrase. Ask the user for it and call again with `pass`. Networks it does "
+                f"remember: {_known_network_names(known)}")}
+        if match.get("open"):
+            return {"error": (
+                f"{ssid!r} is remembered but is an OPEN network, and the device never auto-joins "
+                f"open networks — an SSID alone is trivially impersonated. Switch to it with the "
+                f"USB cable (tokenmonitor_usb_provision) or on the device's own screen.")}
+
+    updated = deps.registry.set_pending(
+        device_id, ConfigPayload(wifi_ssid=ssid, wifi_pass=passphrase)
+    )
+    if updated.pending is None:
+        # set_pending drops a pending identical to active. Reached when the
+        # device is already being sent to this network.
+        return {"text": f"No change staged: {device_id} is already set to switch to {ssid!r}."}
+
+    how = "using the password you supplied" if passphrase else "using the password it already remembers"
+    return {"text": (
+        f"Staged config v{updated.pending.payload.version} for {device_id}: switch to WiFi "
+        f"{ssid!r}, {how}. The device applies it on its next sync (~10 s) and reboots onto the "
+        f"new network. If it does not come up there, it falls back through its remembered "
+        f"networks on boot.")}
 
 def _publish_firmware(deps: Deps, args: dict) -> dict:
     """Mirror of Go's handlePublishFirmware. Copies the .bin into

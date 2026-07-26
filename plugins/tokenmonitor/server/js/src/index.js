@@ -20,7 +20,8 @@ import { createHandler } from "./broker/server.js";
 import { run as leaderRun, tryListen } from "./leader.js";
 import { serve as mcpServe } from "./mcp/server.js";
 import { Publisher as MdnsPublisher } from "./mdns.js";
-import { Tailer } from "./serialTailer.js";
+import { Tailer, TailerController } from "./serialTailer.js";
+import { LeaseManager, NopController } from "./usbprov/lease.js";
 import { PanelGenerator } from "./panelGenerator.js";
 
 function parseFlags(argv) {
@@ -128,9 +129,16 @@ async function runDaemon(cfg, logs, logger) {
   let tailer = null;
   if (cfg.serial.device) { tailer = new Tailer(cfg.serial.device, fwBuf, { baud: cfg.serial.baud }); tailer.start(); }
   const fwLogs = (limit) => ({ connected: tailer ? tailer.connected() : false, total_available: fwBuf.length, lines: fwBuf.tail(limit) });
+  // Serial-lease table: followers ask this leader to yield the USB port. The
+  // controller is the live tailer when a serial device is configured, else a
+  // NopController (every port free). Mirrors Go main.go.
+  const serialCtrl = cfg.serial.device
+    ? new TailerController(() => tailer)
+    : new NopController();
+  const leaseManager = new LeaseManager(serialCtrl, 0);
   const usageCache = usage.buildCache(cfg, { credsModule: creds, logger });
   const spendCache = spend.buildSpendCache(cfg, { logger });
-  const handler = createHandler({ cfg, cache, state, fwLogs, registry, logger, usageCache, spendCache });
+  const handler = createHandler({ cfg, cache, state, fwLogs, registry, logger, usageCache, spendCache, leaseManager });
   const server = await tryListen(() => createServer(handler), cfg.server.bind, cfg.server.port);
   if (!server) { logger.error(`listen ${cfg.server.bind}:${cfg.server.port}: address in use`); return 1; }
   logger.info(`broker: serving on ${cfg.server.bind}:${cfg.server.port}`);
@@ -142,6 +150,10 @@ async function runDaemon(cfg, logs, logger) {
   // Pull-OTA poller (inert unless [ota] is configured). This process is the
   // leader by construction in daemon mode — it owns the bound socket.
   const otaAbort = new AbortController();
+  // Reap lapsed leases so a follower that crashed mid-session cannot wedge the
+  // tailer off its port forever. Scoped to the leader's lifecycle.
+  const leaseReaper = setInterval(() => { try { leaseManager.ReapExpired(); } catch {} }, 1000);
+  otaAbort.signal.addEventListener("abort", () => clearInterval(leaseReaper), { once: true });
   ota.run(cfg, registry, otaAbort.signal, logger);
   // Custom-panel generators: leader-scoped (daemon is always the leader).
   // No-op when [panel.command] is unconfigured; shares the OTA abort.
@@ -177,6 +189,13 @@ async function runMCP(cfg, logs, logger) {
   const fwLogs = (limit) => ({ connected: tailer ? tailer.connected() : false, total_available: fwBuf.length, lines: fwBuf.tail(limit) });
   const abortCtrl = new AbortController();
   const registry = openRegistry(logger);
+  // Serial-lease table: followers ask this leader to yield the USB port. Built
+  // once; the controller reaches the lazily-created tailer via a getter. When
+  // no serial device is configured, a NopController leaves every port free.
+  const serialCtrl = cfg.serial.device
+    ? new TailerController(() => tailer)
+    : new NopController();
+  const leaseManager = new LeaseManager(serialCtrl, 0);
 
   // Broker self-version check: best-effort, started once at startup and NOT
   // scoped to leadership — even a follower session should surface "broker
@@ -194,11 +213,14 @@ async function runMCP(cfg, logs, logger) {
     }
     const usageCache = usage.buildCache(cfg, { credsModule: creds, logger });
     const spendCache = spend.buildSpendCache(cfg, { logger });
-    const handler = createHandler({ cfg, cache, state, fwLogs, registry, logger, usageCache, spendCache });
+    const handler = createHandler({ cfg, cache, state, fwLogs, registry, logger, usageCache, spendCache, leaseManager });
     return createServer(handler);
   };
 
   const onAcquired = async (_server) => {
+    // Reap lapsed leases (leader-scoped): a crashed follower's lease must not
+    // wedge the tailer off its port forever.
+    const leaseReaper = setInterval(() => { try { leaseManager.ReapExpired(); } catch {} }, 1000);
     // The HTTP server is already listening. Hold until aborted.
     // mDNS publication is scoped to the leader: only the process that
     // actually owns the bound port should answer "I'm the broker" on
@@ -220,6 +242,7 @@ async function runMCP(cfg, logs, logger) {
         abortCtrl.signal.addEventListener("abort", resolve, { once: true });
       });
     } finally {
+      clearInterval(leaseReaper);
       await panelGen.stop();
       if (mdnsPub) await mdnsPub.close();
       if (tailer) { tailer.stop(); tailer = null; }

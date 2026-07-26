@@ -393,6 +393,72 @@ test("malformed percent-escape in path → 400", async () => {
   assert.equal(res.statusCode, 400, res.body);
 });
 
+
+// Install-loop breaker, device-reported half: X-Tmon-Ota-Fail tombstones the
+// version the DEVICE says it downloaded, booted and could not confirm. Kept in
+// lock-step with Go TestDeviceSync_{Blocks,DoesNotBlockOn}OTAFail* and the Py
+// equivalents — all three parsers must agree byte for byte.
+test("device-sync tombstones a version on a definitive X-Tmon-Ota-Fail report", async () => {
+  const { dir, reg } = newReg();
+  try {
+    reg.register(DEVID, { ..._testing.emptyPayload(), broker_url: "http://x", psk_hex: PSK_HEX });
+    const handler = createHandler({
+      cfg: makeCfg(), cache: new auth.NonceCache(300), state: new State(),
+      fwLogs: null, registry: reg, logger: silentLogger(),
+    });
+    const req = makeReq("GET", `/device/${DEVID}/sync`, syncHeaders(DEVID, 1, {
+      "x-tmon-fw-version": "0.10.3",
+      "x-tmon-ota-fail": "0.10.5:2:panic",
+    }));
+    const res = new FakeRes();
+    await dispatch(handler, req, res);
+    assert.equal(res.statusCode, 200);
+    assert.equal(reg.load(DEVID).blockedFirmwareVersion, "0.10.5");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// The reports that must NOT block: still-pending installs, a count below the
+// threshold, garbage, and a device reporting a failure for the version it is
+// now actually running (it recovered — the record is history).
+for (const [name, fw, otaFail] of [
+  ["still pending", "0.10.3", "0.10.5:2:pending"],
+  ["below hard threshold", "0.10.3", "0.10.5:1:panic"],
+  // Soft states take MIN_FAILED_INSTALLS_SOFT. Tombstoning these at 2 would
+  // silently shorten the DEVICE's own 4-attempt budget.
+  ["brownout below soft threshold", "0.10.3", "0.10.5:2:brownout"],
+  ["noconfirm below soft threshold", "0.10.3", "0.10.5:3:noconfirm"],
+  ["unrecognised state gets the soft threshold", "0.10.3", "0.10.5:2:someday"],
+  // installs is 0..255 on-device; anything else is not a record we wrote, and
+  // a long digit string would otherwise become an imprecise double.
+  ["count above the firmware range", "0.10.3", "0.10.5:256:panic"],
+  ["absurd count", "0.10.3", "0.10.5:99999999999999999999:panic"],
+  ["malformed version", "0.10.3", "not-a-version:5:panic"],
+  ["non-numeric count", "0.10.3", "0.10.5:2abc:panic"],
+  ["wrong field count", "0.10.3", "0.10.5:4"],
+  ["sentinel", "0.10.3", "none"],
+  ["absent", "0.10.3", ""],
+  ["failure names the running version", "0.10.5", "0.10.5:2:panic"],
+]) {
+  test(`device-sync does not tombstone on a weak OTA-fail report: ${name}`, async () => {
+    const { dir, reg } = newReg();
+    try {
+      reg.register(DEVID, { ..._testing.emptyPayload(), broker_url: "http://x", psk_hex: PSK_HEX });
+      const handler = createHandler({
+        cfg: makeCfg(), cache: new auth.NonceCache(300), state: new State(),
+        fwLogs: null, registry: reg, logger: silentLogger(),
+      });
+      const req = makeReq("GET", `/device/${DEVID}/sync`, syncHeaders(DEVID, 1, {
+        "x-tmon-fw-version": fw,
+        "x-tmon-ota-fail": otaFail,
+      }));
+      const res = new FakeRes();
+      await dispatch(handler, req, res);
+      assert.equal(reg.load(DEVID).blockedFirmwareVersion, "",
+        "tombstoned on a report that proves nothing");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
 function silentLogger() {
   return { info: () => {}, warn: () => {}, error: () => {} };
 }

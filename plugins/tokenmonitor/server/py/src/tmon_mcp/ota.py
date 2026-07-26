@@ -389,7 +389,25 @@ def _resolve_sku(cfg: Config, idx: dict, sku: str, channel: str = "stable") -> t
     return {"idx": idx, "mf": mf}, sres
 
 
-def _decide(reg: Registry, dev, resolved: dict, dry_run: bool) -> dict:
+# MAX_AUTO_STAGES: install-loop breaker of last resort. Lock-step with Go
+# maxAutoStages / JS MAX_AUTO_STAGES — see the long stageStreak comment in
+# go/internal/ota/ota.go for the full reasoning, in particular why a repeated
+# stage is NOT proof of a repeated download (a pending is consumed by the
+# config-version ack, which happens before any firmware transfer) and why the
+# threshold is therefore generous.
+#
+# The counter itself is passed IN, never module state. Go keeps it on the
+# Checker, and the caller decides the lifetime: the background auto-stage loop
+# owns one store for the life of the process, while an on-demand
+# tokenmonitor_check_updates gets a fresh one. That distinction matters —
+# module state would let an operator poking at a device with repeated manual
+# non-dry-run checks walk the streak up to the threshold and tombstone a
+# release that was never actually failing.
+MAX_AUTO_STAGES = 5
+
+
+def _decide(reg: Registry, dev, resolved: dict, dry_run: bool,
+            streaks: dict[str, tuple[str, int]]) -> dict:
     """Compute the action for one device against a resolved release,
     staging a pending when appropriate (unless dry_run). Mirrors Go decide."""
     mf = resolved["mf"]
@@ -421,6 +439,11 @@ def _decide(reg: Registry, dev, resolved: dict, dry_run: bool) -> dict:
     # Go/JS decide.
     cmp = compare_semver(str(mf.get("version", "")), str(dev.active.payload.firmware_version or ""))
     if cmp is not None and cmp <= 0:
+        # The device is at or past this release, so any streak we were tracking
+        # ended in a successful install. Forget it, otherwise a later
+        # re-publish of a version this device once struggled with would inherit
+        # a stale count.
+        streaks.pop(dev.device_id, None)
         out["action"] = "up_to_date"
         return out
     # Compare against the device's reported anti-rollback floor. The device
@@ -438,7 +461,33 @@ def _decide(reg: Registry, dev, resolved: dict, dry_run: bool) -> dict:
         out["action"] = "skipped:already-pending"
         return out
     if dry_run:
+        # A dry run must not advance the streak: check_updates dry_run:true is
+        # a read-only query and never causes a download.
         out["action"] = "would_stage"
+        return out
+    # Install-loop breaker. Reaching this point again for a version we have
+    # already staged MAX_AUTO_STAGES times means the device consumed every one
+    # of those pendings and still is not running it. Stop feeding it and record
+    # the verdict in the same tombstone a manual revert uses, so all three
+    # runtimes honour it and it survives a broker restart.
+    version = str(mf.get("version", ""))
+    prev_ver, prev_n = streaks.get(dev.device_id, ("", 0))
+    n = prev_n + 1 if prev_ver == version else 1
+    if n > MAX_AUTO_STAGES:
+        try:
+            reg.set_blocked_firmware_version(dev.device_id, version)
+        except Exception as e:  # noqa: BLE001
+            out["action"] = "error:" + str(e)
+            return out
+        streaks.pop(dev.device_id, None)
+        log.warning(
+            "device %s: staged %s %d times and it never came back running it "
+            "(still on %s); blocking that version for this device — publish a "
+            "newer version to clear, or use tokenmonitor_set_device_pending to "
+            "override",
+            dev.device_id, version, MAX_AUTO_STAGES, out["from"],
+        )
+        out["action"] = "skipped:install-loop"
         return out
     update = ConfigPayload(
         firmware_url=str(idx["bin_url"]),
@@ -452,7 +501,9 @@ def _decide(reg: Registry, dev, resolved: dict, dry_run: bool) -> dict:
     except Exception as e:  # noqa: BLE001
         out["action"] = "error:" + str(e)
         return out
-    log.info("staged %s -> %s for device %s (sku=%s)", out["from"], mf.get("version"), dev.device_id, dev.hw_sku)
+    streaks[dev.device_id] = (version, n)
+    log.info("staged %s -> %s for device %s (sku=%s, attempt %d/%d)",
+             out["from"], mf.get("version"), dev.device_id, dev.hw_sku, n, MAX_AUTO_STAGES)
     out["action"] = "staged"
     return out
 
@@ -473,11 +524,18 @@ async def check(
     sku_filter: str = "",
     device_filter: str = "",
     session=None,
+    streaks: dict[str, tuple[str, int]] | None = None,
 ) -> dict:
     """Run one pass. dry_run=True reports without writing. sku_filter (if
     non-empty) restricts to one SKU; device_filter (if non-empty) restricts
-    staging to one device id. Returns a dict mirroring Go Report JSON."""
+    staging to one device id. `streaks` is the install-loop breaker's counter
+    store (see MAX_AUTO_STAGES); pass the same dict across calls to accumulate,
+    omit it for a one-off check that must not affect the background loop's
+    tally. Returns a dict mirroring Go Report JSON."""
     import aiohttp
+
+    if streaks is None:
+        streaks = {}
 
     o = cfg.ota
     rep: dict = {
@@ -580,7 +638,7 @@ async def check(
         if best is None:
             rep["devices"].append({"device_id": dev.device_id, "sku": dev.hw_sku, "channel": effective_channel(dev), "action": "skipped:no-release"})
             continue
-        res = _decide(reg, dev, best, dry_run)
+        res = _decide(reg, dev, best, dry_run, streaks)
         res["channel"] = best_channel
         if res.get("action") == "staged":
             rep["staged"] += 1
@@ -618,9 +676,14 @@ async def run(cfg: Config, reg: Registry | None, stop: asyncio.Event) -> None:
     except asyncio.TimeoutError:
         pass
 
+    # The install-loop breaker's counter, owned by this loop for the life of
+    # the process — mirroring Go, where the background loop holds one Checker
+    # and every on-demand tokenmonitor_check_updates builds a fresh one.
+    streaks: dict[str, tuple[str, int]] = {}
+
     while not stop.is_set():
         try:
-            rep = await check(cfg, reg, dry_run=False)
+            rep = await check(cfg, reg, dry_run=False, streaks=streaks)
             log.info(
                 "ota: check done, staged=%d skus=%d devices=%d",
                 rep["staged"], len(rep["per_sku"]), len(rep["devices"]),

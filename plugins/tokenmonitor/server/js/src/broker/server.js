@@ -10,7 +10,10 @@ import * as devlog from "../devlog.js";
 import { encryptPending, encryptPendingGCM, gcmFwGate } from "../registry/crypto.js";
 import { NotFound, validDeviceID } from "../registry/store.js";
 import { firmwarePath } from "../config.js";
-import { packSemver } from "../ota.js";
+import { compareSemver, validVersion } from "../ota.js";
+import { LEASE_PATH, LEASE_RENEW_PATH, LEASE_RELEASE_PATH } from "../usbprov/leasewire.js";
+import { LeaseBusyError, LeaseUnknownError } from "../usbprov/lease.js";
+import { canonicalPort } from "../usbprov/serial.js";
 import { createHash } from "node:crypto";
 import { createReadStream, statSync, readFileSync } from "node:fs";
 import { resolve as resolvePath, sep as pathSep, join as joinPath } from "node:path";
@@ -55,7 +58,7 @@ function authHeadersAreASCII(req) {
   return true;
 }
 
-export function createHandler({ cfg, cache, state, fwLogs, registry, logger, usageCache, spendCache }) {
+export function createHandler({ cfg, cache, state, fwLogs, registry, logger, usageCache, spendCache, leaseManager }) {
   return (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     // Sign and route off the PERCENT-DECODED path, matching Go's
@@ -87,11 +90,17 @@ export function createHandler({ cfg, cache, state, fwLogs, registry, logger, usa
       { re: /^\/device\/([^/]+)\/logs$/, methods: ["POST"], h: (m2) => handleDeviceLogs({ cfg, cache, state, registry, logger, deviceID: m2[1] }, req, res) },
       { re: /^\/device\/([^/]+)\/settings$/, methods: ["POST"], h: (m2) => handleDeviceSettings({ cfg, cache, state, registry, logger, deviceID: m2[1] }, req, res) },
       { re: /^\/firmware\/([^/]+)$/, methods: ["GET", "HEAD"], h: (m2) => handleFirmware({ cfg, cache, registry, logger, name: m2[1] }, req, res) },
+      // Leader-mediated serial lease (compat/PROVISION_WIRE.md §6). anyMethod so
+      // the handler itself returns 405 AFTER the 503 (no manager) / 403
+      // (non-loopback) checks, matching the Go handler's ordering.
+      { re: /^\/serial\/lease$/, anyMethod: true, h: () => handleSerialLease({ cfg, cache, logger, leaseManager, subpath: LEASE_PATH }, req, res) },
+      { re: /^\/serial\/lease\/renew$/, anyMethod: true, h: () => handleSerialLease({ cfg, cache, logger, leaseManager, subpath: LEASE_RENEW_PATH }, req, res) },
+      { re: /^\/serial\/lease\/release$/, anyMethod: true, h: () => handleSerialLease({ cfg, cache, logger, leaseManager, subpath: LEASE_RELEASE_PATH }, req, res) },
     ];
     for (const route of routes) {
       const rm = path.match(route.re);
       if (!rm) continue;
-      if (!route.methods.includes(req.method)) return writeError(res, 405, "method not allowed");
+      if (!route.anyMethod && !route.methods.includes(req.method)) return writeError(res, 405, "method not allowed");
       return route.h(rm);
     }
     writeError(res, 404, "not found");
@@ -595,15 +604,35 @@ function handleDeviceSync({ cfg, cache, state, registry, logger, deviceID }, req
 
     // Clear a stale revert tombstone once the device has reached a version
     // STRICTLY NEWER than the blocked one (a fixed release landed), so the
-    // tombstone doesn't outlive the bad release. Uses packSemver so an
-    // unparseable header never clears it. Mirrors Go/Py.
+    // tombstone doesn't outlive the bad release. Uses compareSemver so an
+    // unparseable header never clears it — and, unlike packSemver, so that two
+    // builds sharing a base still order: packSemver drops the "-dev.<ts>"
+    // prerelease, so 0.10.0-dev.<later> would pack EQUAL to a blocked
+    // 0.10.0-dev.<earlier> and never clear it. Mirrors Go/Py.
     if (dev.blockedFirmwareVersion && fwHdr) {
-      const got = packSemver(fwHdr);
-      const blk = packSemver(dev.blockedFirmwareVersion);
-      if (got !== null && blk !== null && got > blk) {
+      const cmp = compareSemver(fwHdr, dev.blockedFirmwareVersion);
+      if (cmp !== null && cmp > 0) {
         try { registry.setBlockedFirmwareVersion(deviceID, ""); dev.blockedFirmwareVersion = ""; }
         catch (e) { logger.warn(`clear-blocked: ${e.message}`); }
       }
+    }
+
+    // Install-loop breaker, device-reported half. X-Tmon-Ota-Fail carries the
+    // firmware's own verdict on an image it downloaded and booted but that
+    // never self-confirmed — the device is the only party that can see a
+    // rollback, since from the broker's side every step succeeded. The
+    // stage-streak counter in ota.js decide() catches the same loop without
+    // any device change, but only at the hourly poll and only while the broker
+    // stays up; either trigger alone closes the loop. Mirrors Go/Py.
+    const fail = parseOtaFail(String(req.headers["x-tmon-ota-fail"] || ""));
+    if (fail && fail.version !== fwHdr && dev.blockedFirmwareVersion !== fail.version) {
+      try {
+        registry.setBlockedFirmwareVersion(deviceID, fail.version);
+        dev.blockedFirmwareVersion = fail.version;
+        logger.warn(`device ${deviceID} reports ${fail.version} failed to install ` +
+          `${fail.installs} times (${fail.state}); blocking that version — ` +
+          `publish a newer one to clear it`);
+      } catch (e) { logger.warn(`set-blocked: ${e.message}`); }
     }
 
     const out = { active_version: dev.active.payload.version };
@@ -718,6 +747,70 @@ function validUint(v, max) {
   return typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= max;
 }
 
+// How many failed installs the DEVICE must report before the broker stops
+// offering that version. See parseOtaFail.
+//
+// Two thresholds, mirroring TMON_OTA_MAX_INSTALLS / _SOFT in the firmware. They
+// MUST match: the device gives up at its own threshold, and a broker that
+// tombstoned earlier would silently shorten the device's retry budget — a
+// version the firmware was still willing to try twice more would stop being
+// offered after the first two circumstantial failures.
+//
+// Hard states are faults we can pin on the image (it crashed or hung before
+// confirming); everything else — a brownout, a power cut before the confirm
+// window closed, a reset we could not attribute — is circumstantial and needs
+// more evidence before condemning a build that may well be fine.
+//
+// Unrecognised states get the SOFT threshold rather than being rejected:
+// firmware and broker version independently, so a future firmware adding a
+// state must not silently disable the breaker.
+const MIN_FAILED_INSTALLS_HARD = 2;
+const MIN_FAILED_INSTALLS_SOFT = 4;
+
+function otaFailThreshold(state) {
+  return state === "panic" || state === "wdt"
+    ? MIN_FAILED_INSTALLS_HARD
+    : MIN_FAILED_INSTALLS_SOFT;
+}
+
+// parseOtaFail parses X-Tmon-Ota-Fail ("<version>:<installs>:<state>") and
+// returns an object ONLY when the value is a well-formed report of a version
+// that has definitively failed to install. Everything else — "none", an empty
+// header, a malformed value, a still-in-flight "pending" state, or a count
+// below the threshold — returns null.
+//
+// The header is unsigned metadata (like X-Tmon-Fw-Version and X-Tmon-Serial
+// alongside it), so it is parsed defensively and fails closed: the worst a
+// spoofer can achieve is to deny UPDATES to one device it can already
+// impersonate, never to cause an install. See compat/SECURITY.md.
+//
+// Byte-for-byte mirror of Go parseOTAFail / Py _parse_ota_fail.
+function parseOtaFail(h) {
+  h = String(h || "").trim();
+  if (!h || h === "none" || h.length > 64) return null;
+  const parts = h.split(":");
+  if (parts.length !== 3) return null;
+  const version = parts[0], state = parts[2];
+  // Must name a real version, or a garbage string could be written into the
+  // tombstone and then never match (and never clear) a published release.
+  if (!validVersion(version)) return null;
+  // Strict digits, matching Go's strconv.Atoi. parseInt would also accept
+  // "2abc" (== 2) and Number() would accept "0x2" / " 2 ", none of which Go
+  // takes — and this parser has to agree across all three runtimes.
+  if (!/^[+-]?[0-9]+$/.test(parts[1])) return null;
+  const installs = Number(parts[1]);
+  // The firmware stores installs as 0..255 (tmon_ota_fail_parse enforces it),
+  // so anything outside that is not a record we wrote. Without the upper bound
+  // a long digit string becomes an imprecise double (or Infinity) that would
+  // sail past the threshold.
+  if (!Number.isInteger(installs) || installs < 0 || installs > 255) return null;
+  // "pending" means the device armed the image but has not yet reported back
+  // on it — the install may still succeed, so it is not evidence of failure.
+  if (!state || state === "pending") return null;
+  if (installs < otaFailThreshold(state)) return null;
+  return { version, installs, state };
+}
+
 // handleDeviceSettings ingests a device-reported display-settings update and
 // mirrors it into the registry (compat/SETTINGS_REPORT.md). The device owns
 // these fields, so this converges the broker's stored config to the device's
@@ -821,6 +914,32 @@ function handleDeviceSettings({ cfg, cache, state, registry, logger, deviceID },
       if (!validUint(body.pet_species, 255)) return finishErr(400, "bad settings body");
       s.pet_species = body.pet_species;
     }
+    if (body.wifi_known != null) {
+      // Remembered networks, names only. Device input, so it is sanitised
+      // before storage: entries with an empty or oversize SSID are dropped and
+      // the list is truncated to what the on-device store can hold (8).
+      // Absent means firmware too old to report — distinct from an empty list,
+      // which means "I remember none".
+      if (!Array.isArray(body.wifi_known)) return finishErr(400, "bad settings body");
+      const cleaned = [];
+      for (const n of body.wifi_known) {
+        if (!n || typeof n !== "object") continue;
+        const ssid = n.ssid;
+        // Bytes, not UTF-16 units: the 802.11 SSID field is 32 OCTETS, which
+        // is how the device and the Go broker both measure it.
+        if (typeof ssid !== "string" || !ssid || Buffer.byteLength(ssid, "utf8") > 32) continue;
+        const verified = n.verified ?? false, isOpen = n.open ?? false;
+        // Strict, not truthy: Go's typed decode rejects a non-boolean
+        // outright, and a coerced "false" string would silently flip a network
+        // to open and make set_wifi refuse it forever.
+        if (typeof verified !== "boolean" || typeof isOpen !== "boolean") {
+          return finishErr(400, "bad settings body");
+        }
+        cleaned.push({ ssid, verified, open: isOpen });
+        if (cleaned.length === 8) break;
+      }
+      s.wifi_known = cleaned;
+    }
     if (body.pet_name != null) {
       if (typeof body.pet_name !== "string") return finishErr(400, "bad settings body");
       s.pet_name = body.pet_name;  // truncated to 15 chars downstream
@@ -873,6 +992,16 @@ function pendingPayloadJSON(p) {
   if (p.pet_enabled != null) wire.pet_enabled = !!p.pet_enabled;
   if (p.pet_species != null) wire.pet_species = Number(p.pet_species);
   if (p.pet_name) wire.pet_name = String(p.pet_name);
+  if (p.wifi_ssid) {
+    wire.wifi_ssid = String(p.wifi_ssid);
+    // Emitted ONLY alongside an SSID, and only when non-empty. A bare
+    // wifi_pass is meaningless, and an empty one is not "open network" here
+    // the way it is over the cable — the device never auto-joins an open
+    // network, so the only thing an empty string could do is overwrite a good
+    // stored password with nothing. Absent means "switch to a network you
+    // already remember".
+    if (p.wifi_pass) wire.wifi_pass = String(p.wifi_pass);
+  }
   if (p.panel_enabled != null) wire.panel_enabled = !!p.panel_enabled;
   if (Array.isArray(p.gemini_models) && p.gemini_models.length > 0) {
     // Dual-emit the per-device model override CSV under the new
@@ -915,4 +1044,195 @@ function sortKeysDeep(v) {
     return out;
   }
   return v;
+}
+
+// --- Leader-mediated serial lease (compat/PROVISION_WIRE.md §6) -----------
+//
+// A follower that wants to open the USB port asks the leader to suspend its
+// tailer. `leaseManager` is null on a host with no serial device configured
+// (the tailer never runs) → 503 so the follower falls back to a direct open.
+// Auth is the shared-PSK loopback HMAC with a MANDATORY body digest — an absent
+// X-Tmon-Body-Sha256 is rejected (401) rather than silently downgraded to v2.
+// Loopback-only, INDEPENDENT of the broker's bind address (the lease grants
+// control of a HOST-LOCAL resource; the device PSK must not confer remote
+// serial-ownership control).
+
+const MAX_LEASE_BODY_BYTES = 4 << 10;
+
+// isLoopbackAddr reports whether a socket peer address is a loopback IP. A
+// missing/unparseable host fails closed (not loopback). Mirrors Go's
+// net.IP.IsLoopback including IPv4-mapped IPv6 (::ffff:127.0.0.1).
+function isLoopbackAddr(addr) {
+  if (!addr) return false;
+  let host = addr;
+  const mapped = host.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+  if (mapped) host = mapped[1];
+  if (host === "::1") return true;
+  const m = host.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (m) {
+    const o = m.slice(1).map(Number);
+    if (o.some((x) => x > 255)) return false;
+    return o[0] === 127; // 127.0.0.0/8
+  }
+  return false;
+}
+
+function handleSerialLease({ cfg, cache, logger, leaseManager, subpath }, req, res) {
+  if (!leaseManager) {
+    return writeError(res, 503, "serial port not configured on this host");
+  }
+  // RemoteAddr is the real TCP peer — never a spoofable Host/X-Forwarded-For.
+  const peer = req.socket && req.socket.remoteAddress;
+  if (!isLoopbackAddr(peer)) {
+    logger.info(`lease ${subpath} rejected: non-loopback peer ${peer}`);
+    return writeError(res, 403, "serial lease is loopback-only");
+  }
+  if (req.method !== "POST") {
+    return writeError(res, 405, "method not allowed");
+  }
+
+  const cl = Number.parseInt(req.headers["content-length"] || "", 10);
+  if (Number.isFinite(cl) && cl > MAX_LEASE_BODY_BYTES) return writeError(res, 413, "body too large");
+
+  const chunks = [];
+  let total = 0;
+  let aborted = false;
+  req.on("data", (c) => {
+    total += c.length;
+    if (total > MAX_LEASE_BODY_BYTES) {
+      if (!aborted) {
+        aborted = true;
+        writeError(res, 413, "body too large");
+      }
+      req.destroy();
+      return;
+    }
+    chunks.push(c);
+  });
+  req.on("error", () => {
+    if (!aborted) {
+      aborted = true;
+      try {
+        writeError(res, 400, "read error");
+      } catch {}
+    }
+  });
+  req.on("end", () => {
+    if (aborted) return;
+    const raw = Buffer.concat(chunks);
+
+    const bodySHA = req.headers["x-tmon-body-sha256"] || "";
+    if (!bodySHA) {
+      // These endpoints mutate port ownership; refuse an unsigned body rather
+      // than fall back to the v2 (body-blind) canonical.
+      logger.info(`lease ${subpath} from ${req.socket && req.socket.remoteAddress}: missing body digest`);
+      return writeError(res, 401, "unauthorized");
+    }
+    try {
+      auth.verifyMultiBody(
+        [cfg.psk()],
+        "POST", subpath,
+        req.headers["x-tmon-timestamp"] || "", req.headers["x-tmon-nonce"] || "", req.headers["x-tmon-signature"] || "",
+        req.headers["x-tmon-device"] || "", req.headers["x-tmon-config-version"] || "",
+        bodySHA, raw,
+        cache, cfg.security.max_timestamp_skew_seconds,
+      );
+    } catch (e) {
+      logger.info(`auth rejected ${subpath}: ${e.message}`);
+      return writeError(res, 401, "unauthorized");
+    }
+
+    let body;
+    try {
+      body = JSON.parse(raw.toString("utf8"));
+    } catch {
+      body = null;
+    }
+
+    if (subpath === LEASE_PATH) return handleLeaseGrant(logger, leaseManager, body, res);
+    if (subpath === LEASE_RENEW_PATH) return handleLeaseRenew(logger, leaseManager, body, res);
+    if (subpath === LEASE_RELEASE_PATH) return handleLeaseRelease(leaseManager, body, res);
+    return writeError(res, 404, "not found");
+  });
+}
+
+// leaseTTL mirrors Go's json.Unmarshal into an int64 field: a missing ttl_ms is
+// the zero value (0, later clamped to the minimum); a present ttl_ms must be an
+// integer JSON number — a fractional/NaN/non-number value fails the unmarshal,
+// which the caller reports as a 400. Returns null on a bad value.
+function leaseTTL(v) {
+  if (v === undefined || v === null) return 0;
+  if (typeof v !== "number" || !Number.isInteger(v)) return null;
+  // int64 range, because Go's unmarshal enforces it: a value Go answers 400 for
+  // must not quietly clamp to the max here, or the same request gets two
+  // different answers depending on which runtime is leader. (2^63 is not exact
+  // in a double, so the comparison is deliberately against the boundary value
+  // itself rather than 2^63 - 1.)
+  if (v < -(2 ** 63) || v >= 2 ** 63) return null;
+  return v;
+}
+
+async function handleLeaseGrant(logger, leaseManager, body, res) {
+  if (!body || typeof body !== "object" || typeof body.port !== "string" || body.port === "") {
+    return writeError(res, 400, "bad lease request");
+  }
+  const ttlMs = leaseTTL(body.ttl_ms);
+  if (ttlMs === null) return writeError(res, 400, "bad lease request");
+  let canonical;
+  try {
+    canonical = canonicalPort(body.port);
+  } catch {
+    return writeError(res, 400, "unresolvable port");
+  }
+  try {
+    const { id, grantedMs, expiresUnixMs } = await leaseManager.Grant(canonical, ttlMs);
+    // Field names are the cross-runtime contract (PROVISION_WIRE §6): `ttl_ms`,
+    // and `port` echoing the CANONICAL path — the follower may have asked with
+    // an alias, and it keys its own bookkeeping on what comes back.
+    return writeJSON(res, 200, {
+      lease_id: id,
+      port: canonical,
+      ttl_ms: grantedMs,
+      expires_unix_ms: expiresUnixMs,
+    });
+  } catch (e) {
+    if (e instanceof LeaseBusyError) {
+      // PROVISION_WIRE §6: the 409 body is {"error":"busy","holder":...}. Grant
+      // suspends the tailer before recording, so here the port is always busy
+      // on a competing lease.
+      return writeJSON(res, 409, { error: "busy", holder: "lease" });
+    }
+    logger.info(`lease grant ${canonical}: ${e.message}`);
+    return writeError(res, 503, "cannot yield port");
+  }
+}
+
+function handleLeaseRenew(logger, leaseManager, body, res) {
+  if (!body || typeof body !== "object" || typeof body.lease_id !== "string" || body.lease_id === "") {
+    return writeError(res, 400, "bad renew request");
+  }
+  // No ttl_ms is read here BY DESIGN (PROVISION_WIRE §6): the renew request
+  // carries only the lease id and the manager re-applies the TTL it originally
+  // granted, so a renew can never shrink the window. Honouring a ttl_ms would
+  // clamp a conforming follower's lease — which sends none — to the 1 s floor.
+  try {
+    const { grantedMs, expiresUnixMs } = leaseManager.Renew(body.lease_id);
+    return writeJSON(res, 200, { ttl_ms: grantedMs, expires_unix_ms: expiresUnixMs });
+  } catch (e) {
+    if (e instanceof LeaseUnknownError) {
+      // 410 Gone: the lease lapsed or never existed → the follower MUST abort.
+      return writeError(res, 410, "lease unknown or expired");
+    }
+    logger.info(`lease renew: ${e.message}`);
+    return writeError(res, 500, "renew error");
+  }
+}
+
+function handleLeaseRelease(leaseManager, body, res) {
+  if (!body || typeof body !== "object" || typeof body.lease_id !== "string" || body.lease_id === "") {
+    return writeError(res, 400, "bad release request");
+  }
+  // Idempotent: an unknown/expired id is still a success.
+  leaseManager.Release(body.lease_id);
+  return writeJSON(res, 200, { ok: true });
 }

@@ -33,7 +33,7 @@ func newPanelServer(t *testing.T, mutate func(*config.Config)) (*httptest.Server
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts := httptest.NewServer(NewMux(cfg, cache, state.New(), logger, nil, reg, nil, nil))
+	ts := httptest.NewServer(NewMux(cfg, cache, state.New(), logger, nil, reg, nil, nil, nil))
 	t.Cleanup(ts.Close)
 	return ts, reg
 }

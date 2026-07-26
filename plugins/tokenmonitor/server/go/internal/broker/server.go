@@ -36,6 +36,7 @@ import (
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/spend"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/state"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/usage"
+	"github.com/fractal-manifold/tokenmonitor-mcp/internal/usbprov"
 )
 
 // FirmwareLogSource is the read-side interface the broker needs to serve
@@ -109,7 +110,7 @@ func (r *statusRecorder) Unwrap() http.ResponseWriter {
 // null source that answers 200 with an empty list. `reg` may be nil
 // — when missing, /credentials falls back to the global PSK in cfg
 // (legacy mode) and /device/* answers 404.
-func NewMux(cfg *config.Config, cache *auth.NonceCache, st *state.State, logger *log.Logger, fwLogs FirmwareLogSource, reg *registry.Registry, usageCache *usage.Cache, spendCache *spend.Cache) *http.ServeMux {
+func NewMux(cfg *config.Config, cache *auth.NonceCache, st *state.State, logger *log.Logger, fwLogs FirmwareLogSource, reg *registry.Registry, usageCache *usage.Cache, spendCache *spend.Cache, lease *usbprov.LeaseManager) *http.ServeMux {
 	if fwLogs == nil {
 		fwLogs = nullFirmwareLogs{}
 	}
@@ -131,6 +132,20 @@ func NewMux(cfg *config.Config, cache *auth.NonceCache, st *state.State, logger 
 	mux.HandleFunc("/firmware-logs", func(w http.ResponseWriter, r *http.Request) {
 		handleFirmwareLogs(cfg, cache, logger, fwLogs, w, r)
 	})
+	// Leader-mediated serial-port lease (compat/PROVISION_WIRE.md §6). Exact
+	// paths (no trailing slash) so /serial/lease and /serial/lease/{renew,release}
+	// never shadow each other. All three share one handler that dispatches on
+	// the path after auth. lease is nil when no serial device is configured.
+	serialLease := func(w http.ResponseWriter, r *http.Request) {
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		handleSerialLease(cfg, cache, logger, lease, rec, r)
+		if st != nil {
+			st.RecordRequest(r.RemoteAddr, rec.status, time.Now())
+		}
+	}
+	mux.HandleFunc(usbprov.LeasePath, serialLease)
+	mux.HandleFunc(usbprov.LeaseRenewPath, serialLease)
+	mux.HandleFunc(usbprov.LeaseReleasePath, serialLease)
 	mux.HandleFunc("/device/", func(w http.ResponseWriter, r *http.Request) {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		// /device/{id}/sync (GET, control plane) vs /device/{id}/logs
@@ -813,6 +828,19 @@ func pendingPayloadJSON(p registry.ConfigPayload) ([]byte, error) {
 	if p.PetName != "" {
 		wire["pet_name"] = p.PetName
 	}
+	if p.WiFiSSID != "" {
+		wire["wifi_ssid"] = p.WiFiSSID
+		// Emitted ONLY alongside an SSID, and only when non-empty. A bare
+		// wifi_pass is meaningless, and an empty one is not "open network"
+		// here the way it is over the cable — the device never auto-joins an
+		// open network, so the only thing an empty string could do is
+		// overwrite a good stored password with nothing. Absent means
+		// "switch to a network you already remember", which is the common
+		// case and needs no credential.
+		if p.WiFiPass != "" {
+			wire["wifi_pass"] = p.WiFiPass
+		}
+	}
 	if len(p.GeminiModels) > 0 {
 		// Dual-emit the per-device model override CSV under the new
 		// "antigravity_models" key and the deprecated "gemini_models" key.
@@ -971,17 +999,51 @@ func handleDeviceSync(cfg *config.Config, cache *auth.NonceCache, logger *log.Lo
 	// Clear a stale revert tombstone once the device has reached a version
 	// STRICTLY NEWER than the blocked one (a fixed release landed), so the
 	// tombstone doesn't outlive the bad release and surprise a future
-	// re-publish of that same version number. Uses ota.PackSemver so an
-	// unparseable header never clears it.
+	// re-publish of that same version number. Uses ota.CompareSemver so an
+	// unparseable header never clears it — and, unlike PackSemver, so that two
+	// builds sharing a base still order: PackSemver drops the "-dev.<ts>"
+	// prerelease, so 0.10.0-dev.<later> would pack EQUAL to a blocked
+	// 0.10.0-dev.<earlier> and never clear it.
+	//
+	// Strictly newer, NOT ">=", even though a device reporting the blocked
+	// version is evidence that version installs fine on it. Equality would
+	// break tokenmonitor_revert_firmware: a revert tombstones the version the
+	// operator is moving the device AWAY from, and until the downgrade
+	// actually lands the device keeps reporting exactly that version — so an
+	// equality clear would wipe the tombstone on the very next sync and
+	// auto-discovery would immediately re-stage what was just reverted. The
+	// cost is that a tombstone raised in error (see stageStreak) can outlive
+	// its cause until the next release; it suppresses only AUTO-staging, and
+	// tokenmonitor_set_device_pending overrides it.
 	if dev.BlockedFirmwareVersion != "" && fwReported != "" {
-		if got, gok := ota.PackSemver(fwReported); gok {
-			if blk, bok := ota.PackSemver(dev.BlockedFirmwareVersion); bok && got > blk {
-				if cerr := reg.SetBlockedFirmwareVersion(deviceID, ""); cerr != nil {
-					logger.Printf("registry clear-blocked %s: %v", deviceID, cerr)
-				} else {
-					dev.BlockedFirmwareVersion = ""
-				}
+		if cmp, ok := ota.CompareSemver(fwReported, dev.BlockedFirmwareVersion); ok && cmp > 0 {
+			if cerr := reg.SetBlockedFirmwareVersion(deviceID, ""); cerr != nil {
+				logger.Printf("registry clear-blocked %s: %v", deviceID, cerr)
+			} else {
+				dev.BlockedFirmwareVersion = ""
 			}
+		}
+	}
+
+	// Install-loop breaker, device-reported half. X-Tmon-Ota-Fail carries the
+	// firmware's own verdict ("<version>:<installs>:<state>") on an image it
+	// downloaded and booted but that never self-confirmed — the device is the
+	// only party that can see a rollback, since from the broker's side every
+	// step succeeded. How many failures are enough depends on the state, and
+	// must match what the firmware itself would tolerate — see
+	// otaFailThreshold.
+	//
+	// This complements ota.decide's stage-streak counter, which catches the
+	// same loop without any device change but only at the hourly poll and only
+	// while the broker stays up. Either trigger alone closes the loop.
+	if fail := parseOTAFail(r.Header.Get("X-Tmon-Ota-Fail")); fail != nil &&
+		fail.version != fwReported && dev.BlockedFirmwareVersion != fail.version {
+		if berr := reg.SetBlockedFirmwareVersion(deviceID, fail.version); berr != nil {
+			logger.Printf("registry set-blocked %s: %v", deviceID, berr)
+		} else {
+			dev.BlockedFirmwareVersion = fail.version
+			logger.Printf("device %s reports %s failed to install %d times (%s); blocking that version — "+
+				"publish a newer one to clear it", deviceID, fail.version, fail.installs, fail.state)
 		}
 	}
 
@@ -1046,6 +1108,89 @@ func handleDeviceSync(cfg *config.Config, cache *auth.NonceCache, logger *log.Lo
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
+}
+
+// otaFail is a parsed X-Tmon-Ota-Fail header: a firmware version the device
+// installed but could not boot, how many times it tried, and why it died.
+type otaFail struct {
+	version  string
+	installs int
+	state    string
+}
+
+// How many failed install attempts the device must report before the broker
+// stops offering that version. See parseOTAFail.
+//
+// Two thresholds, mirroring TMON_OTA_MAX_INSTALLS / _SOFT in the firmware.
+// They MUST match: the device gives up at its own threshold, and a broker that
+// tombstoned earlier would silently shorten the device's retry budget — a
+// version that the firmware was still willing to try twice more would stop
+// being offered after the first two circumstantial failures.
+//
+// Hard states are faults we can pin on the image (it crashed or hung before
+// confirming); everything else — a brownout, a power cut before the confirm
+// window closed, a reset we could not attribute — is circumstantial and needs
+// more evidence before condemning a build that may well be fine.
+//
+// Unrecognised states get the SOFT threshold rather than being rejected:
+// firmware and broker version independently, so a future firmware adding a
+// state must not silently disable the breaker. It costs nothing against a
+// spoofer either, who could just as easily send a state name from this list.
+const (
+	minFailedInstallsHard = 2
+	minFailedInstallsSoft = 4
+)
+
+func otaFailThreshold(state string) int {
+	switch state {
+	case "panic", "wdt":
+		return minFailedInstallsHard
+	default:
+		return minFailedInstallsSoft
+	}
+}
+
+// parseOTAFail parses "<version>:<installs>:<state>" and returns non-nil ONLY
+// when the value is a well-formed report of a version that has definitively
+// failed to install. Everything else — "none", an empty header, a malformed
+// value, a still-in-flight "pending" state, or a count below the threshold —
+// returns nil.
+//
+// The header is unsigned metadata (like X-Tmon-Fw-Version and X-Tmon-Serial
+// alongside it), so it is parsed defensively and fails closed: the worst a
+// spoofer can achieve is to deny UPDATES to one device it can already
+// impersonate, never to cause an install. That asymmetry is what makes an
+// unsigned header acceptable here; see compat/SECURITY.md.
+func parseOTAFail(h string) *otaFail {
+	h = strings.TrimSpace(h)
+	if h == "" || h == "none" || len(h) > 64 {
+		return nil
+	}
+	parts := strings.Split(h, ":")
+	if len(parts) != 3 {
+		return nil
+	}
+	version, state := parts[0], parts[2]
+	// Must name a real version, or a garbage string could be written into the
+	// tombstone and then never match (and never clear) a published release.
+	if !ota.ValidVersion(version) {
+		return nil
+	}
+	n, err := strconv.Atoi(parts[1])
+	// The firmware stores installs as 0..255 (tmon_ota_fail_parse enforces it),
+	// so anything outside that is not a record we wrote.
+	if err != nil || n < 0 || n > 255 {
+		return nil
+	}
+	// "pending" means the device armed the image but has not yet reported back
+	// on it — the install may still succeed, so it is not evidence of failure.
+	if state == "" || state == "pending" {
+		return nil
+	}
+	if n < otaFailThreshold(state) {
+		return nil
+	}
+	return &otaFail{version: version, installs: n, state: state}
 }
 
 // handleDeviceLogs receives a diagnostic log batch the device POSTs to
@@ -1141,7 +1286,17 @@ type settingsReportBody struct {
 	PanelEnabled        *bool   `json:"panel_enabled"`
 	PetSpecies          *uint8  `json:"pet_species"`
 	PetName             *string `json:"pet_name"`
+	// WiFiKnown is the device's remembered networks, names only. A pointer to
+	// a slice so three states stay distinguishable: absent (firmware too old
+	// — keep whatever we last knew), present-but-empty (the device really has
+	// none), and populated.
+	WiFiKnown *[]registry.KnownNetwork `json:"wifi_known"`
 }
+
+// maxReportedNetworks bounds what a device may claim to remember. The store
+// holds 8; anything beyond that is either a firmware bug or a device trying
+// to grow the registry file without limit, and neither deserves storage.
+const maxReportedNetworks = 8
 
 // handleDeviceSettings ingests a device-reported display-settings update and
 // mirrors it into the registry (compat/SETTINGS_REPORT.md). The device owns
@@ -1231,7 +1386,26 @@ func handleDeviceSettings(cfg *config.Config, cache *auth.NonceCache, logger *lo
 		}
 	}
 
+	// Sanitise before storing: a report is device input, and this one is the
+	// only field that is a variable-length list. Entries with an empty SSID
+	// are dropped rather than stored, and the list is truncated to what the
+	// on-device store can actually hold.
+	var known []registry.KnownNetwork
+	if body.WiFiKnown != nil {
+		known = make([]registry.KnownNetwork, 0, len(*body.WiFiKnown))
+		for _, n := range *body.WiFiKnown {
+			if n.SSID == "" || len(n.SSID) > 32 {
+				continue
+			}
+			known = append(known, n)
+			if len(known) == maxReportedNetworks {
+				break
+			}
+		}
+	}
+
 	if _, rerr := reg.ReportSettings(deviceID, registry.ReportedSettings{
+		WiFiKnown:           known,
 		ThemeMode:           body.ThemeMode,
 		BrDay:               body.BrDay,
 		BrNight:             body.BrNight,
@@ -1281,14 +1455,31 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 // `fwLogs` is the read-side of the serial tailer; pass nil to keep
 // /firmware-logs answering 200 with an empty list. `reg` may be nil
 // to disable the per-device control plane (legacy global-PSK mode).
-func Serve(ctx context.Context, ln net.Listener, cfg *config.Config, st *state.State, logger *log.Logger, fwLogs FirmwareLogSource, reg *registry.Registry, usageCache *usage.Cache, spendCache *spend.Cache) error {
+func Serve(ctx context.Context, ln net.Listener, cfg *config.Config, st *state.State, logger *log.Logger, fwLogs FirmwareLogSource, reg *registry.Registry, usageCache *usage.Cache, spendCache *spend.Cache, lease *usbprov.LeaseManager) error {
 	cache := auth.NewNonceCache(time.Duration(cfg.Security.NonceCacheTTLSeconds) * time.Second)
 	srv := &http.Server{
-		Handler:           NewMux(cfg, cache, st, logger, fwLogs, reg, usageCache, spendCache),
+		Handler:           NewMux(cfg, cache, st, logger, fwLogs, reg, usageCache, spendCache, lease),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       30 * time.Second,
+	}
+
+	// Reap lapsed leases so a follower that crashed mid-session cannot wedge the
+	// tailer off its port forever. Scoped to ctx (the leader's lifecycle).
+	if lease != nil {
+		go func() {
+			t := time.NewTicker(time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					lease.ReapExpired()
+				}
+			}
+		}()
 	}
 
 	errCh := make(chan error, 1)

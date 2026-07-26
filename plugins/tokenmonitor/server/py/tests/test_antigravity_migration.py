@@ -175,10 +175,14 @@ enabled = true
     cfg = config.load(path)
     cache = spend.build_cache(cfg)
     assert cache is not None
-    # Antigravity is enabled but no spend fetcher is wired: only claude.
+    # Antigravity is enabled but no spend fetcher is wired for it. This is the
+    # only assertion this test is about; the exact provider LIST is not, and
+    # pinning it to ["claude"] made the test fail the moment [codex] started
+    # defaulting to enabled (broker 0.10.7, "default all 3 providers") — codex
+    # has a real spend fetcher, so it belongs in the list.
     assert "antigravity" not in cache.providers()
     assert "gemini" not in cache.providers()
-    assert cache.providers() == ["claude"]
+    assert cache.providers() == ["claude", "codex"]
 
 
 async def test_spend_antigravity_returns_not_implemented(tmp_path):

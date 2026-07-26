@@ -17,6 +17,8 @@ import * as devlog from "../devlog.js";
 import { validDeviceID, effectiveChannel, providerModeEnabled, providerModeFromBool, validProviderMode } from "../registry/store.js";
 import { firmwarePath } from "../config.js";
 import { clipCodePoints } from "../textutil.js";
+import { handleUSBScan, handleUSBProvision } from "./usb.js";
+import { setWiFiTool } from "./wifi.js";
 
 function compatDir() {
   let dir = dirname(fileURLToPath(import.meta.url));
@@ -127,7 +129,7 @@ function localIPv4s() {
   return out.sort();
 }
 
-function registryUnavailableMsg() {
+export function registryUnavailableMsg() {
   return "device registry is not configured on this tokenmonitor-mcp install; configure ~/.config/tokenmonitor/devices/ and retry";
 }
 
@@ -173,11 +175,14 @@ async function dispatch(deps, name, args) {
     case "tokenmonitor_list_devices": return listDevicesTool(deps);
     case "tokenmonitor_register_device": return registerDeviceTool(deps, args);
     case "tokenmonitor_set_device_pending": return setDevicePendingTool(deps, args);
+    case "tokenmonitor_set_wifi": return setWiFiTool(deps, args);
     case "tokenmonitor_publish_firmware": return publishFirmwareTool(deps, args);
     case "tokenmonitor_revert_firmware": return revertFirmwareTool(deps, args);
     case "tokenmonitor_discover_devices": return await discoverDevicesTool(args);
     case "tokenmonitor_provision": return await provisionTool(deps, args);
     case "tokenmonitor_check_updates": return await checkUpdatesTool(deps, args);
+    case "tokenmonitor_usb_scan": return await handleUSBScan(deps, args);
+    case "tokenmonitor_usb_provision": return await handleUSBProvision(deps, args);
     default: return { error: `unknown tool ${name}` };
   }
 }

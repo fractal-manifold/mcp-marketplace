@@ -179,6 +179,22 @@ type ConfigPayload struct {
 	PanelEnabled *bool  `toml:"panel_enabled,omitempty"`
 	PetSpecies   *uint8 `toml:"pet_species,omitempty"`
 	PetName      string `toml:"pet_name,omitempty"`
+	// WiFiSSID / WiFiPass move the device onto a different network. Sending
+	// the SSID alone means "switch to a network you already remember" — the
+	// device holds the password and asking the operator to retype it is the
+	// friction this exists to remove. A password is only needed for a network
+	// the device has never seen; tokenmonitor_set_wifi checks the device's
+	// reported WiFiKnown list and asks for one only then.
+	//
+	// WiFiPass is deliberately NOT carried into Active when a pending is
+	// promoted (see StripConsumedSecrets). Unlike PSKHex, which the broker
+	// must keep to sign every subsequent request, a WiFi password has exactly
+	// one job — get onto the network once — after which the device holds it
+	// in its own remembered-networks store. Keeping it would mean the
+	// registry accumulated every network credential the fleet was ever given,
+	// on disk, to no purpose.
+	WiFiSSID string `toml:"wifi_ssid,omitempty"`
+	WiFiPass string `toml:"wifi_pass,omitempty"`
 	// GeminiModels overrides service.toml [gemini].models for this
 	// device. The broker honours this list when serving /usage/gemini
 	// for the device. Empty means "use the global default". Max 3 entries;
@@ -224,6 +240,18 @@ type ConfigPayload struct {
 type Active struct {
 	ConfigPayload
 	LastSeen time.Time `toml:"last_seen,omitempty"`
+	// WiFiKnown is device-OBSERVED state, not configuration: the list of
+	// networks the device remembers, by name only. It lives here beside
+	// LastSeen rather than in ConfigPayload because nothing may ever push it
+	// TO a device — it is only ever reported back FROM one, and putting it in
+	// the payload would make it look settable.
+	// A POINTER, so the two states stay distinct on disk: nil = the device
+	// never reported (firmware predating the field), non-nil-but-empty = it
+	// reported remembering none. A plain slice cannot express that in TOML —
+	// `omitempty` drops both, and without it a nil slice encodes as `[]` —
+	// and the distinction is exactly what set_wifi answers with ("supply a
+	// password anyway" vs "this firmware cannot tell me").
+	WiFiKnown *[]KnownNetwork `toml:"wifi_known,omitempty"`
 }
 
 type Pending struct {
@@ -652,7 +680,12 @@ func (r *Registry) ReplaceActive(deviceID string, active ConfigPayload, channel 
 		prev := dev.Active
 		active.FirmwareVersion = prev.FirmwareVersion
 		active.MinSecureVersion = prev.MinSecureVersion
-		dev.Active = Active{ConfigPayload: active, LastSeen: prev.LastSeen}
+		// WiFiKnown is device-observation state like LastSeen, so a
+		// re-provision keeps it: the device still remembers the same networks
+		// and has no reason to re-report them just because the broker record
+		// was replaced.
+		dev.Active = Active{ConfigPayload: active, LastSeen: prev.LastSeen,
+			WiFiKnown: prev.WiFiKnown}
 		dev.Pending = nil
 		if len(channel) > 0 {
 			dev.Channel = normalizeChannel(channel[0])
@@ -680,6 +713,26 @@ type ReportedSettings struct {
 	PanelEnabled        *bool
 	PetSpecies          *uint8
 	PetName             *string
+	// WiFiKnown is the device's remembered-networks list — NAMES ONLY, never
+	// passwords. It exists so "switch to the office WiFi" can know, before it
+	// is sent, whether it needs to ask the user for a password. nil means the
+	// device did not report it (older firmware); an empty non-nil slice means
+	// it reported having none.
+	WiFiKnown []KnownNetwork
+}
+
+// KnownNetwork is one entry of a device's remembered-networks list as
+// reported over POST /device/{id}/settings. It carries no credential.
+//
+// Verified is false for a network whose credentials have never reached
+// GOT_IP, which changes what an operator should be told: switching to one
+// may simply fail. Open marks a network that cannot be switched to remotely
+// at all — the device never auto-joins an open network, because an SSID
+// alone is trivially impersonated (compat/WIFI_STORE.md §8).
+type KnownNetwork struct {
+	SSID     string `json:"ssid"     toml:"ssid"`
+	Verified bool   `json:"verified" toml:"verified"`
+	Open     bool   `json:"open"     toml:"open"`
 }
 
 // applyReported overlays the reported device-owned fields onto a payload,
@@ -786,6 +839,18 @@ func (r *Registry) ReportSettings(deviceID string, s ReportedSettings) (*Device,
 			return err
 		}
 		changed := applyReported(&dev.Active.ConfigPayload, s)
+		// Observed state, replaced wholesale rather than merged: the device
+		// is the only authority on what it remembers, and a network it has
+		// forgotten must disappear here too, or set_wifi would keep offering
+		// a password-free switch to something that is no longer stored. A nil
+		// report (firmware too old to send the list) leaves the last known
+		// one alone instead of erasing it.
+		if s.WiFiKnown != nil &&
+			(dev.Active.WiFiKnown == nil || !sameKnownNetworks(*dev.Active.WiFiKnown, s.WiFiKnown)) {
+			reported := s.WiFiKnown
+			dev.Active.WiFiKnown = &reported
+			changed = true
+		}
 		if dev.Pending != nil {
 			// Keep the queued pending in sync too, but never let it collapse
 			// to "no change" here — that is MaybePromote's job.
@@ -800,6 +865,22 @@ func (r *Registry) ReportSettings(deviceID string, s ReportedSettings) (*Device,
 		return nil
 	})
 	return out, err
+}
+
+// sameKnownNetworks compares two remembered-networks lists, order included.
+// Order carries meaning — the device reports most-recently-used first, which
+// is the order a later roam will try — so a reordering is a real change and
+// must be saved, not treated as noise.
+func sameKnownNetworks(a, b []KnownNetwork) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // MaybePromote moves pending → active when the device proves it has
@@ -840,9 +921,22 @@ func (r *Registry) MaybePromote(deviceID string, observedVersion uint32, usedPen
 		if !usedPendingPSK && dev.Pending.PSKHex != dev.Active.PSKHex {
 			return nil
 		}
+		promotedPayload := dev.Pending.ConfigPayload
+		// The device has applied this payload, so the WiFi password has done
+		// its one job and now lives in the device's own store. Dropping it
+		// here is what keeps the registry from accumulating every network
+		// credential the fleet was ever handed. The SSID stays: it is not a
+		// secret, and it is genuinely useful to see which network a device is
+		// meant to be on. See the note on ConfigPayload.WiFiPass.
+		promotedPayload.WiFiPass = ""
 		dev.Active = Active{
-			ConfigPayload: dev.Pending.ConfigPayload,
+			ConfigPayload: promotedPayload,
 			LastSeen:      time.Now().UTC(),
+			// Observed state survives a config promote untouched — the device
+			// reports it on its own cadence and a promote knows nothing about
+			// it. Without this the list would be wiped on every promote and
+			// set_wifi would fall back to asking for a password it has.
+			WiFiKnown: dev.Active.WiFiKnown,
 		}
 		dev.Pending = nil
 		promoted = true
@@ -1119,6 +1213,15 @@ func (r *Registry) List() ([]*Device, error) {
 // updates idempotent: "no opinion" stays as "no opinion".
 func mergePayload(base, upd ConfigPayload) ConfigPayload {
 	out := base
+	// WiFi moves as a PAIR, always. A password belongs to one SSID, so a new
+	// SSID takes the update's password even when that is empty ("switch to a
+	// network you already remember") — carrying the previous SSID's password
+	// forward would ship the wrong credential for the new network. Keyed on
+	// the SSID because a bare password with no SSID has nothing to apply to.
+	if upd.WiFiSSID != "" {
+		out.WiFiSSID = upd.WiFiSSID
+		out.WiFiPass = upd.WiFiPass
+	}
 	if upd.BrokerURL != "" {
 		out.BrokerURL = upd.BrokerURL
 	}
@@ -1218,8 +1321,15 @@ func mergePayload(base, upd ConfigPayload) ConfigPayload {
 }
 
 func payloadEquivalent(a, b ConfigPayload) bool {
+	// WiFiPass is compared even though a promoted Active always has it empty.
+	// That asymmetry is the point: re-staging the SSID the device is already
+	// on, WITH a password, is how an operator fixes a network whose password
+	// changed. Comparing the SSID alone would call that a no-op and silently
+	// drop the fix.
 	if a.BrokerURL != b.BrokerURL ||
 		a.PSKHex != b.PSKHex ||
+		a.WiFiSSID != b.WiFiSSID ||
+		a.WiFiPass != b.WiFiPass ||
 		a.City != b.City ||
 		a.ThemeMode != b.ThemeMode ||
 		a.PetName != b.PetName ||

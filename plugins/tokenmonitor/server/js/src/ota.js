@@ -314,9 +314,25 @@ function resolveSKU(cfg, idx, sku, channel = "stable") {
   return { resolved: { idx, mf }, skuResult: sres };
 }
 
+// MAX_AUTO_STAGES: install-loop breaker of last resort.
+// Lock-step with Go maxAutoStages / Py MAX_AUTO_STAGES — see the long
+// stageStreak comment in go/internal/ota/ota.go for the full reasoning, in
+// particular why a repeated stage is NOT proof of a repeated download (a
+// pending is consumed by the config-version ack, which happens before any
+// firmware transfer) and why the threshold is therefore generous.
+//
+// The counter itself is passed IN, never module state. Go keeps it on the
+// Checker, and the caller decides the lifetime: the background auto-stage loop
+// owns one Map for the life of the process, while an on-demand
+// tokenmonitor_check_updates gets a fresh one. That distinction matters —
+// module state would let an operator poking at a device with repeated manual
+// non-dry-run checks walk the streak up to the threshold and tombstone a
+// release that was never actually failing.
+const MAX_AUTO_STAGES = 5;
+
 // decide computes the action for one device against a resolved release,
 // staging a pending when appropriate (unless dryRun). Mirrors Go decide.
-function decide(reg, dev, resolved, dryRun, logger) {
+function decide(reg, dev, resolved, dryRun, logger, stageStreaks) {
   const { idx, mf } = resolved;
   const out = { device_id: dev.deviceID, sku: dev.hwSku, channel: effectiveChannel(dev), to: String(mf.version || "") };
   const releasePacked = packSemver(String(mf.version || ""));
@@ -342,14 +358,46 @@ function decide(reg, dev, resolved, dryRun, logger) {
   // a base, and the newer timestamp must still stage over the older. Mirrors
   // Go decide.
   const cmp = compareSemver(String(mf.version || ""), String(dev.active.payload.firmware_version || ""));
-  if (cmp !== null && cmp <= 0) { out.action = "up_to_date"; return out; }
+  if (cmp !== null && cmp <= 0) {
+    // The device is at or past this release, so any streak we were tracking
+    // ended in a successful install. Forget it, otherwise a later re-publish of
+    // a version this device once struggled with would inherit a stale count.
+    stageStreaks.delete(dev.deviceID);
+    out.action = "up_to_date";
+    return out;
+  }
   // Floor guard: device refuses only packed(version) STRICTLY BELOW the floor
   // (tmon_ota.c: `mf_packed < floor`), so mirror with `<` — NOT `<=`. A release
   // packing EQUAL to the floor is installable; `<=` would wrongly skip a newer
   // same-base dev canary that the device accepts.
   if (releasePacked < Number(dev.active.payload.min_secure_version || 0)) { out.action = "up_to_date"; return out; }
   if (dev.pending && dev.pending.payload.firmware_version === String(mf.version || "")) { out.action = "skipped:already-pending"; return out; }
+  // A dry run must not advance the streak: check_updates dry_run:true is a
+  // read-only query and never causes a download.
   if (dryRun) { out.action = "would_stage"; return out; }
+  // Install-loop breaker. Reaching this point again for a version we have
+  // already staged MAX_AUTO_STAGES times means the device consumed every one of
+  // those pendings and still is not running it. Stop feeding it and record the
+  // verdict in the same tombstone a manual revert uses, so all three runtimes
+  // honour it and it survives a broker restart.
+  const version = String(mf.version || "");
+  const prev = stageStreaks.get(dev.deviceID);
+  const n = prev && prev.version === version ? prev.count + 1 : 1;
+  if (n > MAX_AUTO_STAGES) {
+    try {
+      reg.setBlockedFirmwareVersion(dev.deviceID, version);
+    } catch (e) {
+      out.action = "error:" + e.message;
+      return out;
+    }
+    stageStreaks.delete(dev.deviceID);
+    if (logger) logger.warn(`ota: device ${dev.deviceID}: staged ${version} ${MAX_AUTO_STAGES} ` +
+      `times and it never came back running it (still on ${out.from}); blocking that version ` +
+      `for this device — publish a newer version to clear, or use ` +
+      `tokenmonitor_set_device_pending to override`);
+    out.action = "skipped:install-loop";
+    return out;
+  }
   const update = {
     firmware_url: String(idx.bin_url),
     firmware_sha256: String(mf.sha256 || ""),
@@ -363,7 +411,8 @@ function decide(reg, dev, resolved, dryRun, logger) {
     out.action = "error:" + e.message;
     return out;
   }
-  if (logger) logger.info(`ota: staged ${out.from} -> ${mf.version} for device ${dev.deviceID} (sku=${dev.hwSku})`);
+  stageStreaks.set(dev.deviceID, { version, count: n });
+  if (logger) logger.info(`ota: staged ${out.from} -> ${mf.version} for device ${dev.deviceID} (sku=${dev.hwSku}, attempt ${n}/${MAX_AUTO_STAGES})`);
   out.action = "staged";
   return out;
 }
@@ -378,7 +427,7 @@ function dropEmpty(obj, keys) {
 // check runs one pass. dryRun=true reports without writing. skuFilter (if
 // non-empty) restricts to one SKU; deviceFilter (if non-empty) restricts
 // staging to one device id. Returns an object mirroring Go Report JSON.
-export async function check(cfg, reg, { dryRun, skuFilter = "", deviceFilter = "", logger = null } = {}) {
+export async function check(cfg, reg, { dryRun, skuFilter = "", deviceFilter = "", logger = null, stageStreaks = new Map() } = {}) {
   const o = cfg.ota;
   const rep = {
     repo: o.releases_repo,
@@ -469,7 +518,7 @@ export async function check(cfg, reg, { dryRun, skuFilter = "", deviceFilter = "
       rep.devices.push({ device_id: dev.deviceID, sku: dev.hwSku, channel: effectiveChannel(dev), action: "skipped:no-release" });
       continue;
     }
-    const res = decide(reg, dev, best, dryRun, logger);
+    const res = decide(reg, dev, best, dryRun, logger, stageStreaks);
     res.channel = bestChannel;
     if (res.action === "staged") rep.staged++;
     rep.devices.push(dropEmpty(res, ["from", "to"]));
@@ -512,9 +561,14 @@ export async function run(cfg, reg, abortSignal, logger) {
 
   if (await interruptibleSleep(INITIAL_DELAY_MS, abortSignal)) return;
 
+  // The install-loop breaker's counter, owned by this loop for the life of the
+  // process — mirroring Go, where the background loop holds one Checker and
+  // every on-demand tokenmonitor_check_updates builds a fresh one.
+  const stageStreaks = new Map();
+
   while (!(abortSignal && abortSignal.aborted)) {
     try {
-      const rep = await check(cfg, reg, { dryRun: false, logger });
+      const rep = await check(cfg, reg, { dryRun: false, logger, stageStreaks });
       if (logger) logger.info(`ota: check done, staged=${rep.staged} skus=${rep.per_sku.length} devices=${rep.devices.length}`);
     } catch (e) {
       if (logger) logger.warn(`ota: check failed: ${e.message}`);

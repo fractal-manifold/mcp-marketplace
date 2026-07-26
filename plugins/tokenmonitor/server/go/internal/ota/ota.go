@@ -43,6 +43,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/config"
@@ -248,6 +249,64 @@ func VerifyManifest(pubkey, manifest, sig []byte) bool {
 	return ed25519.Verify(ed25519.PublicKey(pubkey), manifest, sig)
 }
 
+// maxAutoStages is how many times auto-discovery will stage the SAME firmware
+// version to one device, without the device ever advancing onto it, before
+// tombstoning that version for this device.
+//
+// Five, not three, because of what a stage actually proves — see stageStreak.
+// The asymmetry is the whole argument: in the FALSE-positive cases the device
+// is not downloading anything (it deferred), so extra stages cost a registry
+// write and nothing else; in the TRUE-positive case each extra stage costs one
+// real 2.2 MB download. Two extra downloads is a cheap price for not
+// wrongly condemning a version on a device that was merely on battery. The
+// device-reported X-Tmon-Ota-Fail trigger in the sync handler is the precise
+// mechanism and fires at two ATTEMPTS; this is the blunt one that also works
+// against firmware too old to send that header.
+const maxAutoStages = 5
+
+// stageStreak counts consecutive auto-stages of one version to one device.
+//
+// It is the install-loop breaker of last resort. A device that downloads an
+// image, boots it, panics before self-confirming and rolls back reverts to
+// reporting the OLD running version — so decide()'s newer-than-running guard
+// passes again and the same release re-stages forever, one full 2.2 MB
+// download per cycle. Nothing in the existing guards can see that, because
+// from the broker's side every step succeeded.
+//
+// WHAT A STREAK DOES AND DOES NOT PROVE. It is tempting to read a repeated
+// stage as a repeated download, on the grounds that the already-pending guard
+// below refuses to re-stage until the device consumes the pending. It is not:
+// a pending is consumed when the device acks the new CONFIG version, which it
+// does after PROMOTING the candidate and rebooting — before, and independently
+// of, any firmware download. So a stage that gets consumed without a download
+// is entirely normal. Known paths: the device is below the battery gate with
+// no USB power and defers the install (backing off up to an hour at a time);
+// the firmware URL host is unreachable while the broker is not; the device is
+// still inside a previous image's PENDING_VERIFY window; the device's own
+// poison record refuses to re-arm the version while the config promote still
+// completes. Registry-side, SetPending drops a pending whose merged payload
+// equals Active, and ReplaceActive clears one outright.
+//
+// What a streak DOES prove is exactly its name: we staged this version N times
+// in a row and the device never came back running it. That is a real symptom
+// with more than one cause, which is why the threshold is generous and the log
+// line says what is actually known rather than diagnosing it. A tombstone
+// raised in error suppresses only AUTO-staging of that one version for that
+// one device; a newer release clears it, and tokenmonitor_set_device_pending
+// overrides it.
+//
+// Deliberately in-memory and Go-only: the *decision* it produces
+// (BlockedFirmwareVersion) is what gets persisted and honoured by all three
+// runtimes. Persisting the counter itself would cost a registry field in
+// go/py/js plus three golden round-trips to protect a number whose only job is
+// to reach maxAutoStages. The cost of it being volatile is that a broker
+// restart grants that many more cycles — bounded, only advancing at the hourly
+// poll, and backstopped independently by the device-side poison record.
+type stageStreak struct {
+	version string
+	count   int
+}
+
 // Checker performs one or more OTA checks against the configured repo and
 // keyring, staging pendings into the registry.
 type Checker struct {
@@ -255,17 +314,51 @@ type Checker struct {
 	reg    *registry.Registry
 	client *http.Client
 	logger *log.Logger
+
+	// mu guards streaks. Check() is sequential today and the background loop
+	// owns its Checker, but the zero cost here is worth not depending on that.
+	mu      sync.Mutex
+	streaks map[string]stageStreak // device id -> consecutive stages
 }
 
 // NewChecker builds a Checker. logger may be nil (used by the on-demand
 // MCP tool, which has no logger to share).
+//
+// Note the on-demand MCP path (internal/mcp/ota.go) builds a FRESH Checker per
+// call, so its streaks always start empty. That is intentional: a human running
+// check_updates is an explicit override, in the same spirit as
+// set_device_pending, which bypasses the tombstone entirely.
 func NewChecker(cfg *config.Config, reg *registry.Registry, logger *log.Logger) *Checker {
 	return &Checker{
-		cfg:    cfg,
-		reg:    reg,
-		client: &http.Client{Timeout: httpTimeout},
-		logger: logger,
+		cfg:     cfg,
+		reg:     reg,
+		client:  &http.Client{Timeout: httpTimeout},
+		logger:  logger,
+		streaks: map[string]stageStreak{},
 	}
+}
+
+// bumpStreak returns the stage count this device would reach by staging
+// version now, without recording it. clearStreak/recordStage do the writes.
+func (c *Checker) bumpStreak(deviceID, version string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if s, ok := c.streaks[deviceID]; ok && s.version == version {
+		return s.count + 1
+	}
+	return 1
+}
+
+func (c *Checker) recordStage(deviceID, version string, n int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.streaks[deviceID] = stageStreak{version: version, count: n}
+}
+
+func (c *Checker) clearStreak(deviceID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.streaks, deviceID)
 }
 
 func (c *Checker) logf(format string, args ...any) {
@@ -555,6 +648,11 @@ func (c *Checker) decide(dev *registry.Device, r *resolved, dryRun bool) DeviceR
 	// "0.6.8-dev.<ts>" builds share a base, and the newer timestamp must still
 	// stage over the older — base-only packing would wrongly call them equal.
 	if cmp, ok := CompareSemver(r.mf.Version, dev.Active.FirmwareVersion); ok && cmp <= 0 {
+		// The device is at or past this release, so any streak we were
+		// tracking ended in a successful install. Forget it, otherwise a
+		// later re-publish of a version this device once struggled with
+		// would inherit a stale count.
+		c.clearStreak(dev.DeviceID)
 		out.Action = "up_to_date"
 		return out
 	}
@@ -575,7 +673,30 @@ func (c *Checker) decide(dev *registry.Device, r *resolved, dryRun bool) DeviceR
 		return out
 	}
 	if dryRun {
+		// A dry run must not advance the streak: check_updates dry_run:true is
+		// a read-only query and never causes a download.
 		out.Action = "would_stage"
+		return out
+	}
+	// Install-loop breaker. Reaching this point again for a version we have
+	// already staged maxAutoStages times means the device consumed every one
+	// of those pendings and still is not running it. Stop feeding it and
+	// record the verdict in the same tombstone a manual revert uses, so all
+	// three runtimes honour it and it survives a broker restart. The message
+	// claims only what a streak actually establishes — see stageStreak for why
+	// "failed to install" would be an overstatement.
+	n := c.bumpStreak(dev.DeviceID, r.mf.Version)
+	if n > maxAutoStages {
+		if berr := c.reg.SetBlockedFirmwareVersion(dev.DeviceID, r.mf.Version); berr != nil {
+			out.Action = "error:" + berr.Error()
+			return out
+		}
+		c.clearStreak(dev.DeviceID)
+		c.logf("device %s: staged %s %d times and it never came back running it (still on %s); "+
+			"blocking that version for this device — publish a newer version to clear, "+
+			"or use tokenmonitor_set_device_pending to override",
+			dev.DeviceID, r.mf.Version, maxAutoStages, out.From)
+		out.Action = "skipped:install-loop"
 		return out
 	}
 	update := registry.ConfigPayload{
@@ -589,7 +710,9 @@ func (c *Checker) decide(dev *registry.Device, r *resolved, dryRun bool) DeviceR
 		out.Action = "error:" + err.Error()
 		return out
 	}
-	c.logf("staged %s -> %s for device %s (sku=%s)", out.From, r.mf.Version, dev.DeviceID, dev.HWSku)
+	c.recordStage(dev.DeviceID, r.mf.Version, n)
+	c.logf("staged %s -> %s for device %s (sku=%s, attempt %d/%d)",
+		out.From, r.mf.Version, dev.DeviceID, dev.HWSku, n, maxAutoStages)
 	out.Action = "staged"
 	return out
 }

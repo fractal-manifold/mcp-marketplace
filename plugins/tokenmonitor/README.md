@@ -78,7 +78,7 @@ and put `server/tokenmonitor-mcp` and `server/install.sh` on your `PATH`.
 
 ## Tools exposed to the model
 
-The bundled server exposes 14 tools (see
+The bundled server exposes 17 tools (see
 [`server/compat/tool-schemas.json`](./server/compat/tool-schemas.json) for
 the authoritative schemas):
 
@@ -98,6 +98,9 @@ the authoritative schemas):
 | `tokenmonitor_discover_devices` | mDNS scan (`_tmon._tcp.local.`) for devices waiting for initial config. |
 | `tokenmonitor_provision`      | Send the initial config to a device in BOOT_NEEDS_CONFIG. |
 | `tokenmonitor_check_updates`  | Poll the public OTA releases repo and stage a pending OTA per matching, out-of-date device. |
+| `tokenmonitor_set_wifi`       | Stage a WiFi change for a registered device. Needs `pass` unless the device has reported that it already remembers the SSID; refuses a remembered **open** network, which the device never auto-joins. |
+| `tokenmonitor_usb_scan`       | Enumerate TokenMonitor devices on the serial bus, with a match tier per port. **Linux only** — macOS/Windows enumeration is not implemented. |
+| `tokenmonitor_usb_provision`  | Provision or reconfigure a device over the USB cable: WiFi, broker URL and PSK in one payload, independent of the LAN. |
 
 ## Coexistence with `service-go`
 
