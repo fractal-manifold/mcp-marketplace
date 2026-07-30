@@ -15,6 +15,10 @@
 // are still the leader, it is respawned with exponential backoff. On teardown
 // the whole process group is sent SIGTERM, then SIGKILL after a grace period,
 // so nothing is orphaned.
+//
+// A command that samples once and exits rather than looping can say so with
+// [panel.command_interval_s]: then it is re-run on that period instead, and
+// exiting is the normal case rather than a failure.
 
 import { spawn } from "node:child_process";
 import { join as joinPath } from "node:path";
@@ -89,8 +93,11 @@ export class PanelGenerator {
       const targets = this._targets();
       const removals = [];
       for (const [id, child] of [...this._children]) {
-        const argv = targets.get(id);
-        if (!argv || !sameArgv(argv, child.argv)) {
+        // The interval is part of the identity: re-pacing a generator has to
+        // restart it, or the change would only land whenever the child
+        // happened to die.
+        const t = targets.get(id);
+        if (!t || !sameArgv(t.argv, child.argv) || t.interval !== child.interval) {
           this._children.delete(id);
           removals.push(this._stopChild(child));
         }
@@ -99,9 +106,12 @@ export class PanelGenerator {
       // has two processes writing the same file during the term grace.
       if (removals.length) await Promise.all(removals);
       if (!this._started) return;
-      for (const [id, argv] of targets) {
+      for (const [id, t] of targets) {
         if (this._children.has(id)) continue;
-        const child = { id, argv, stopped: false, proc: null, wakeBackoff: null };
+        const child = {
+          id, argv: t.argv, interval: t.interval,
+          stopped: false, proc: null, wakeBackoff: null,
+        };
         child.done = this._supervise(child);
         this._children.set(id, child);
       }
@@ -117,14 +127,18 @@ export class PanelGenerator {
     try { await child.done; } catch { /* supervisor never rejects */ }
   }
 
-  // targets: desired {deviceID -> argv}. Per device: its own command, else
-  // "default". Every registered device is a candidate; explicit non-default
-  // keys run even for unregistered devices. With no devices at all, a lone
-  // "default" runs one global generator (empty id → feeds file.default).
+  // targets: desired {deviceID -> {argv, interval}}. Per device: its own
+  // command, else "default"; the interval resolves the same way, so a device
+  // can be paced differently from the default one. interval 0 = long-lived
+  // process (the default contract), >0 = one-shot re-run on that period in ms.
+  // Every registered device is a candidate; explicit non-default keys run even
+  // for unregistered devices. With no devices at all, a lone "default" runs one
+  // global generator (empty id → feeds file.default).
   _targets() {
     const cmds = this.cfg.panelCommandMap();
     const out = new Map();
     if (Object.keys(cmds).length === 0) return out;
+    const mk = (id, argv) => ({ argv, interval: this.cfg.panelCommandIntervalFor(id) * 1000 });
     let ids = [];
     if (this.registry) {
       try { ids = this.registry.listDeviceIds(); }
@@ -132,13 +146,13 @@ export class PanelGenerator {
     }
     for (const id of ids) {
       const argv = cmds[id] || cmds.default;
-      if (argv) out.set(id, argv);
+      if (argv) out.set(id, mk(id, argv));
     }
     for (const [k, argv] of Object.entries(cmds)) {
       if (k === "default") continue;
-      if (!out.has(k)) out.set(k, argv);
+      if (!out.has(k)) out.set(k, mk(k, argv));
     }
-    if (out.size === 0 && cmds.default) out.set("", cmds.default);
+    if (out.size === 0 && cmds.default) out.set("", mk("", cmds.default));
     return out;
   }
 
@@ -150,40 +164,85 @@ export class PanelGenerator {
     return this.cfg.panelFileDefaultAbs();
   }
 
+  // _supervise runs one generator until the child is stopped. Which of the two
+  // contracts applies is the child's interval:
+  //
+  // - 0 (the default): the command is expected to loop forever. Exiting is a
+  //   failure, so it restarts with exponential backoff.
+  // - >0: the command is expected to sample once and exit, and we re-run it on
+  //   that period. Exiting is the normal case, so there is no backoff — the
+  //   interval is already the rate limit.
   async _supervise(child) {
+    if (child.interval > 0) return this._superviseInterval(child);
     let backoff = this.backoffInitial;
     while (!child.stopped) {
       const start = Date.now();
-      let proc;
-      try {
-        proc = spawn(child.argv[0], child.argv.slice(1), {
-          env: { ...process.env, TMON_DEVICE_ID: child.id, TMON_PANEL_PATH: this._targetPath(child.id) },
-          detached: true, // own process group so we can SIGTERM/SIGKILL the group
-          stdio: ["ignore", "pipe", "pipe"],
-        });
-      } catch (e) {
-        this.logger.error(`panelgen[${label(child.id)}]: ${e.message}`);
-        if (!(await this._backoffSleep(child, backoff))) return;
-        backoff = Math.min(backoff * 2, this.backoffMax);
-        continue;
-      }
-      child.proc = proc;
-      this.logger.info(`panelgen[${label(child.id)}]: started pid=${proc.pid} ${JSON.stringify(child.argv)}`);
-      this._pipeLogs(child.id, proc);
-
-      const exited = new Promise((resolve) => {
-        proc.once("exit", () => resolve("exit"));
-        proc.once("error", (e) => { this.logger.error(`panelgen[${label(child.id)}]: ${e.message}`); resolve("error"); });
-      });
-      await exited;
-
+      const started = await this._runOnce(child);
       if (child.stopped) return; // stop path already terminated / will not restart
-      const ran = Date.now() - start;
-      this.logger.info(`panelgen[${label(child.id)}]: exited after ${(ran / 1000).toFixed(1)}s; restarting`);
-      if (ran >= this.backoffReset) backoff = this.backoffInitial;
-      if (!(await this._backoffSleep(child, backoff))) return;
+      if (started) {
+        const ran = Date.now() - start;
+        this.logger.info(`panelgen[${label(child.id)}]: exited after ${(ran / 1000).toFixed(1)}s; restarting`);
+        // A generator that stayed up a good while is not crash-looping.
+        if (ran >= this.backoffReset) backoff = this.backoffInitial;
+      }
+      if (!(await this._sleepUnlessStopped(child, backoff))) return;
       backoff = Math.min(backoff * 2, this.backoffMax);
     }
+  }
+
+  // _superviseInterval re-runs a one-shot generator every child.interval ms,
+  // measured start-to-start so the cadence does not drift with how long a run
+  // takes.
+  //
+  // Runs never overlap: a run that overruns its period simply delays the next
+  // one, which then starts immediately. We do not kill a slow generator — it
+  // may be mid-write, and half a document served to the device is worse than a
+  // late one. A run that fails waits the same interval as one that succeeds; a
+  // generator that cannot reach its source is expected to write its own "no
+  // data" document (docs/custom-panel.md), not to be retried harder.
+  async _superviseInterval(child) {
+    const secs = (child.interval / 1000).toFixed(0);
+    this.logger.info(`panelgen[${label(child.id)}]: every ${secs}s ${JSON.stringify(child.argv)}`);
+    while (!child.stopped) {
+      const start = Date.now();
+      const started = await this._runOnce(child);
+      if (child.stopped) return;
+      if (started) {
+        this.logger.info(`panelgen[${label(child.id)}]: run finished in ${((Date.now() - start) / 1000).toFixed(1)}s`);
+      }
+      const wait = child.interval - (Date.now() - start);
+      if (wait <= 0) {
+        this.logger.info(`panelgen[${label(child.id)}]: run outlasted its ${secs}s interval; starting the next one now`);
+        continue;
+      }
+      if (!(await this._sleepUnlessStopped(child, wait))) return;
+    }
+  }
+
+  // _runOnce spawns the generator and waits for it to exit. Returns false when
+  // it could not be spawned at all — already logged.
+  async _runOnce(child) {
+    let proc;
+    try {
+      proc = spawn(child.argv[0], child.argv.slice(1), {
+        env: { ...process.env, TMON_DEVICE_ID: child.id, TMON_PANEL_PATH: this._targetPath(child.id) },
+        detached: true, // own process group so we can SIGTERM/SIGKILL the group
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (e) {
+      this.logger.error(`panelgen[${label(child.id)}]: ${e.message}`);
+      return false;
+    }
+    child.proc = proc;
+    this.logger.info(`panelgen[${label(child.id)}]: started pid=${proc.pid} ${JSON.stringify(child.argv)}`);
+    this._pipeLogs(child.id, proc);
+
+    const exited = new Promise((resolve) => {
+      proc.once("exit", () => resolve("exit"));
+      proc.once("error", (e) => { this.logger.error(`panelgen[${label(child.id)}]: ${e.message}`); resolve("error"); });
+    });
+    await exited;
+    return true;
   }
 
   // _terminate sends the child's process group SIGTERM, waits up to termGrace,
@@ -206,9 +265,9 @@ export class PanelGenerator {
     await exited;
   }
 
-  // _backoffSleep resolves true after `ms`, or false early if the child is
-  // stopped meanwhile (so the supervisor bails out promptly).
-  _backoffSleep(child, ms) {
+  // _sleepUnlessStopped resolves true after `ms`, or false early if the child
+  // is stopped meanwhile (so the supervisor bails out promptly).
+  _sleepUnlessStopped(child, ms) {
     if (child.stopped) return Promise.resolve(false);
     if (ms <= 0) return Promise.resolve(true);
     return new Promise((resolve) => {

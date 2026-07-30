@@ -136,11 +136,17 @@ class Panel:
     command: optional per-device generator the broker launches itself
           (leader-scoped — see panel_generator). A [panel.command] table keyed
           by device id with a "default" fallback; each value is an argv list
-          run without a shell."""
+          run without a shell.
+    command_interval_s: optional pacing for those generators. Absent (or 0)
+          keeps the default contract — the command is a long-lived process the
+          broker keeps alive. Set, it makes the command a periodic one-shot,
+          re-run every N seconds. Same two spellings as `file`: a bare number
+          (the "default" entry) or a table keyed by device id."""
 
     file: str | dict = ""
     dir: str = ""
     command: dict = field(default_factory=dict)
+    command_interval_s: int | float | dict = 0
 
 
 @dataclass
@@ -298,6 +304,23 @@ class Config:
             out[key] = [_expand_argv_elem(a) for a in argv]
         return out
 
+    def panel_command_interval_for(self, device_id: str) -> float:
+        """How often (seconds) to re-run device_id's generator: its own
+        [panel.command_interval_s] entry, else "default", else 0.
+
+        Zero means unset — panel_generator keeps that generator as a long-lived
+        process, which is what every config did before this key existed.
+
+        load() already rejects a negative, fractional or non-numeric entry (as
+        Go does at TOML parse time), so those never reach here from a real
+        config file; the coercion below only guards a Config built by hand in
+        a test."""
+        iv = self.panel.command_interval_s
+        raw = iv.get(device_id, iv.get("default", 0)) if isinstance(iv, dict) else iv
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return 0.0
+        return float(raw) if raw > 0 else 0.0
+
     def antigravity_models(self) -> list[str]:
         """Return the configured model list, clamped to MAX_ANTIGRAVITY_MODELS.
 
@@ -318,6 +341,29 @@ def _section(raw: dict, name: str, target: object) -> None:
     for key, value in sect.items():
         if hasattr(target, key):
             setattr(target, key, value)
+
+
+def _validate_panel_command_interval(cfg: Config) -> None:
+    """Reject a [panel.command_interval_s] the user clearly did not mean.
+
+    Go refuses to start on these, so we do too — the three impls are supposed
+    to behave identically on the same toml, and a broker that silently ignores
+    the key leaves the user wondering why their pacing never took effect.
+    Whole seconds only: rounding 0.5 to 0 would quietly turn "twice a second"
+    into "long-lived process", the opposite contract."""
+    iv = cfg.panel.command_interval_s
+    entries = iv.items() if isinstance(iv, dict) else [("default", iv)]
+    for key, raw in entries:
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise ValueError(
+                f"panel.command_interval_s[{key!r}]: expected integer, got {type(raw).__name__}"
+            )
+        if raw < 0:
+            raise ValueError(f"panel.command_interval_s[{key!r}]: must be >= 0, got {raw}")
+        if float(raw) != int(raw):
+            raise ValueError(
+                f"panel.command_interval_s[{key!r}]: whole seconds only, got {raw}"
+            )
 
 
 def _merge_legacy_gemini(cfg: Config, raw: dict) -> None:
@@ -397,6 +443,7 @@ def load(path: str | None = None) -> Config:
     ]
 
     _merge_legacy_gemini(cfg, raw)
+    _validate_panel_command_interval(cfg)
 
     if cfg.auth.psk_passphrase:
         if len(cfg.auth.psk_passphrase) < 8:

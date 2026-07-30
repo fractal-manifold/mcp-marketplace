@@ -70,6 +70,71 @@ default = ["python3", "~/bin/gen.py"]
 	}
 }
 
+func TestPanelCommandIntervalBareNumber(t *testing.T) {
+	cfg := loadTOML(t, authHeader+`
+[panel]
+command_interval_s = 900
+`)
+	if got := cfg.PanelCommandIntervalFor("anything"); got != 900 {
+		t.Errorf("bare number should become the default entry: got %d", got)
+	}
+}
+
+func TestPanelCommandIntervalTable(t *testing.T) {
+	cfg := loadTOML(t, authHeader+`
+[panel.command_interval_s]
+default = 900
+"tmon-ab12" = 60
+`)
+	if got := cfg.PanelCommandIntervalFor("tmon-ab12"); got != 60 {
+		t.Errorf("explicit device interval: got %d", got)
+	}
+	if got := cfg.PanelCommandIntervalFor("other"); got != 900 {
+		t.Errorf("unknown device falls back to default: got %d", got)
+	}
+}
+
+func TestPanelCommandIntervalAbsentIsZero(t *testing.T) {
+	cfg := loadTOML(t, authHeader+`
+[panel.command]
+default = ["gen"]
+`)
+	if got := cfg.PanelCommandIntervalFor("dev1"); got != 0 {
+		t.Errorf("absent interval must be 0 (long-lived process), got %d", got)
+	}
+}
+
+// A bad interval must fail loudly rather than silently disabling pacing — and
+// identically in the py/js brokers, which validate the same three cases.
+func TestPanelCommandIntervalRejectsBadValues(t *testing.T) {
+	for name, body := range map[string]string{
+		"negative": "[panel]\ncommand_interval_s = -5\n",
+		// 0.5 s truncated to 0 would mean "long-lived process" — the opposite
+		// contract to what was asked for, so it is an error, not a rounding.
+		"fractional": "[panel]\ncommand_interval_s = 0.5\n",
+		"string":     "[panel]\ncommand_interval_s = \"900\"\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "tokenmonitor.toml")
+			if err := os.WriteFile(p, []byte(authHeader+body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(p); err == nil {
+				t.Errorf("%s interval must be rejected at load", name)
+			}
+		})
+	}
+}
+
+// A float that IS a whole number is fine — `900.0` is just how some editors
+// (and some TOML writers) spell 900.
+func TestPanelCommandIntervalAcceptsIntegralFloat(t *testing.T) {
+	cfg := loadTOML(t, authHeader+"[panel]\ncommand_interval_s = 900.0\n")
+	if got := cfg.PanelCommandIntervalFor("dev1"); got != 900 {
+		t.Errorf("900.0 should parse as 900, got %d", got)
+	}
+}
+
 func TestPanelUnconfigured(t *testing.T) {
 	cfg := loadTOML(t, authHeader)
 	if cfg.PanelCommandMap() != nil {

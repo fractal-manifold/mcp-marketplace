@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -48,16 +49,16 @@ type Config struct {
 	// (`agy`); the provider was renamed accordingly. A legacy tokenmonitor.toml
 	// with a [gemini] section is still honoured — Load() merges it into
 	// Antigravity when the new section is absent.
-	Gemini Gemini `toml:"gemini"`
-	Usage  Usage  `toml:"usage"`
-	Spend       Spend       `toml:"spend"`
-	Pricing     Pricing     `toml:"pricing"`
-	Panel       Panel       `toml:"panel"`
-	Security    Security    `toml:"security"`
-	Logging     Logging     `toml:"logging"`
-	Serial      Serial      `toml:"serial"`
-	OTA         OTAConfig   `toml:"ota"`
-	pskBytes    []byte
+	Gemini   Gemini    `toml:"gemini"`
+	Usage    Usage     `toml:"usage"`
+	Spend    Spend     `toml:"spend"`
+	Pricing  Pricing   `toml:"pricing"`
+	Panel    Panel     `toml:"panel"`
+	Security Security  `toml:"security"`
+	Logging  Logging   `toml:"logging"`
+	Serial   Serial    `toml:"serial"`
+	OTA      OTAConfig `toml:"ota"`
+	pskBytes []byte
 }
 
 type Server struct {
@@ -184,10 +185,15 @@ type Pricing struct {
 //   - Command: optional per-device generator the broker itself launches
 //     (leader-scoped — see internal/panelgen). Keyed by device id with a
 //     "default" fallback; each value is an argv array run without a shell.
+//   - CommandIntervalS: optional pacing for those generators. Absent (or 0)
+//     keeps the default contract — the command is a long-lived process the
+//     broker keeps alive. Set, it makes the command a periodic one-shot run
+//     every N seconds instead. See PanelCommandIntervals.
 type Panel struct {
-	File    PanelPaths    `toml:"file"`
-	Dir     string        `toml:"dir"`
-	Command PanelCommands `toml:"command"`
+	File             PanelPaths            `toml:"file"`
+	Dir              string                `toml:"dir"`
+	Command          PanelCommands         `toml:"command"`
+	CommandIntervalS PanelCommandIntervals `toml:"command_interval_s"`
 }
 
 // PanelPaths maps a device id to the panel document path to serve it, with a
@@ -230,6 +236,64 @@ func (p *PanelPaths) UnmarshalTOML(v interface{}) error {
 // its arguments.
 type PanelCommands map[string][]string
 
+// PanelCommandIntervals maps a device id to how often (seconds) to re-run its
+// generator, with a "default" fallback. It implements toml.Unmarshaler so
+// `command_interval_s` accepts either form, exactly like `file`:
+//
+//	command_interval_s = 900              # => {"default": 900}
+//	[panel.command_interval_s]            # per-device table
+//	default    = 900
+//	"tmon-ab12" = 60
+//
+// An entry of 0 means "unset" — that device's generator stays a long-lived
+// supervised process. A negative value is a config error rather than a silent
+// fallback: it can only be a typo, and swallowing it would leave the user
+// wondering why their pacing never took effect. So is a fractional one: the
+// unit is whole seconds, and rounding 0.5 to 0 would silently turn "twice a
+// second" into "long-lived process" — the opposite contract. The py and js
+// brokers reject both the same way, so one toml behaves identically on all
+// three.
+type PanelCommandIntervals map[string]int
+
+func (p *PanelCommandIntervals) UnmarshalTOML(v interface{}) error {
+	out := PanelCommandIntervals{}
+	set := func(k string, raw interface{}) error {
+		var n int
+		switch t := raw.(type) {
+		case int64:
+			n = int(t)
+		case float64: // `command_interval_s = 900.0` is fine; 900.7 is not
+			if t != math.Trunc(t) {
+				return fmt.Errorf("panel.command_interval_s[%q]: whole seconds only, got %v", k, t)
+			}
+			n = int(t)
+		default:
+			return fmt.Errorf("panel.command_interval_s[%q]: expected integer, got %T", k, raw)
+		}
+		if n < 0 {
+			return fmt.Errorf("panel.command_interval_s[%q]: must be >= 0, got %d", k, n)
+		}
+		out[k] = n
+		return nil
+	}
+	switch t := v.(type) {
+	case int64, float64:
+		if err := set("default", t); err != nil {
+			return err
+		}
+	case map[string]interface{}:
+		for k, raw := range t {
+			if err := set(k, raw); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("panel.command_interval_s: expected integer or table, got %T", v)
+	}
+	*p = out
+	return nil
+}
+
 type Security struct {
 	MaxTimestampSkewSeconds int `toml:"max_timestamp_skew_seconds"`
 	NonceCacheTTLSeconds    int `toml:"nonce_cache_ttl_seconds"`
@@ -261,9 +325,9 @@ type Serial struct {
 // len(Keys) > 0, because without a pubkey the broker cannot verify a
 // manifest and refuses to stage one it can't authenticate.
 type OTAConfig struct {
-	Enabled             bool     `toml:"enabled"`
-	ReleasesRepo        string   `toml:"releases_repo"`
-	PollIntervalMinutes int      `toml:"poll_interval_minutes"`
+	Enabled             bool   `toml:"enabled"`
+	ReleasesRepo        string `toml:"releases_repo"`
+	PollIntervalMinutes int    `toml:"poll_interval_minutes"`
 	// DevTag is DEPRECATED and ignored. Dev builds now publish immutable
 	// per-version prerelease tags (vX.Y.Z-dev.<ts>); the broker resolves the
 	// newest one via the GitHub Releases API rather than a single rolling
@@ -374,6 +438,17 @@ func (c *Config) PanelCommandMap() map[string][]string {
 		out[k] = cp
 	}
 	return out
+}
+
+// PanelCommandIntervalFor returns how often (seconds) to re-run device id's
+// generator: its own [panel.command_interval_s] entry, else "default", else 0.
+// Zero means unset — panelgen keeps that generator as a long-lived process,
+// which is the behaviour every config had before this key existed.
+func (c *Config) PanelCommandIntervalFor(deviceID string) int {
+	if n, ok := c.Panel.CommandIntervalS[deviceID]; ok {
+		return n
+	}
+	return c.Panel.CommandIntervalS["default"]
 }
 
 func expandUser(p string) string {
@@ -606,9 +681,19 @@ cache_ttl_seconds = 30
 # and torn down when it loses the port, so exactly one copy runs. The child
 # gets TMON_DEVICE_ID and TMON_PANEL_PATH in its environment. Keyed by device
 # id with a "default" fallback; omit entirely to keep running it yourself.
+#
+# By default the command is expected to loop forever (the broker only restarts
+# it if it dies). If your generator samples once and exits, give it a cadence
+# with command_interval_s and the broker re-runs it every N seconds instead.
+# A bare number is the "default" entry; it must sit HERE, under [panel] and
+# BEFORE the [panel.command] header — a key written after a sub-table header
+# belongs to that sub-table, and TOML rejects it there. (Or spell it as its
+# own [panel.command_interval_s] table, keyed like [panel.command].)
+# command_interval_s = 900
+#
 # [panel.command]
-# default     = ["python3", "~/bin/gen_panel.py"]
-# "tmon-ab12" = ["python3", "~/bin/gen_special.py"]
+# default     = ["python3", "~/bin/gen_panel.py", "--once"]
+# "tmon-ab12" = ["python3", "~/bin/gen_special.py", "--once"]
 #
 # Document format + limits (tiles<=4, points<=64, body<=8KB) live in
 # docs/custom-panel.md and compat/PANEL_WIRE.md.

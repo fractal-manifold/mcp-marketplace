@@ -89,7 +89,11 @@ function defaults() {
     //   (leader-scoped — see panelGenerator.js). A [panel.command] table keyed
     //   by device id with a "default" fallback; each value is an argv array
     //   run without a shell.
-    panel: { file: "", dir: "", command: {} },
+    // - command_interval_s: optional pacing for those generators. Absent (or
+    //   0) keeps the default contract — the command is a long-lived process
+    //   the broker keeps alive. Set, it makes the command a periodic one-shot,
+    //   re-run every N seconds. Bare number or per-device table, like `file`.
+    panel: { file: "", dir: "", command: {}, command_interval_s: 0 },
     security: { max_timestamp_skew_seconds: 60, nonce_cache_ttl_seconds: 300 },
     logging: { level: "INFO" },
     serial: { device: "", baud: 115200, lines: 2000 },
@@ -168,6 +172,25 @@ export function load(path) {
     key_id: String((k && k.key_id) || ""),
     pubkey_b64: String((k && k.pubkey_b64) || ""),
   }));
+  // Reject a [panel.command_interval_s] the user clearly did not mean. Go
+  // refuses to start on these, so we do too — the three impls are supposed to
+  // behave identically on the same toml, and a broker that silently ignores
+  // the key leaves the user wondering why their pacing never took effect.
+  // Whole seconds only: rounding 0.5 to 0 would quietly turn "twice a second"
+  // into "long-lived process", the opposite contract.
+  {
+    const iv = cfg.panel.command_interval_s;
+    const entries = (iv && typeof iv === "object") ? Object.entries(iv) : [["default", iv]];
+    for (const [k, v] of entries) {
+      if (typeof v !== "number" || !Number.isFinite(v)) {
+        throw new Error(`panel.command_interval_s["${k}"]: expected integer, got ${typeof v}`);
+      }
+      if (v < 0) throw new Error(`panel.command_interval_s["${k}"]: must be >= 0, got ${v}`);
+      if (!Number.isInteger(v)) {
+        throw new Error(`panel.command_interval_s["${k}"]: whole seconds only, got ${v}`);
+      }
+    }
+  }
   if (cfg.auth.psk_passphrase) {
     if (cfg.auth.psk_passphrase.length < 8) throw new Error("auth.psk_passphrase must be at least 8 characters");
     cfg.pskBytes = createHash("sha256").update(cfg.auth.psk_passphrase, "utf8").digest();
@@ -226,6 +249,25 @@ export function load(path) {
       out[k] = argv.map((a) => (a.startsWith("~/") ? expandUser(a) : a));
     }
     return out;
+  };
+  // How often (seconds) to re-run a device's generator: its own
+  // [panel.command_interval_s] entry, else "default", else 0. Accepts the same
+  // two spellings as `file` — a bare number is the "default" entry.
+  //
+  // 0 means unset: panelGenerator keeps that generator as a long-lived process,
+  // which is what every config did before this key existed.
+  //
+  // load() already rejects a negative, fractional or non-numeric entry (as Go
+  // does at TOML parse time), so those never reach here from a real config
+  // file; the coercion below only guards a cfg built by hand in a test.
+  cfg.panelCommandIntervalFor = (deviceID) => {
+    const iv = cfg.panel.command_interval_s;
+    let raw = iv;
+    if (iv && typeof iv === "object") {
+      raw = deviceID in iv ? iv[deviceID] : iv.default;
+    }
+    if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) return 0;
+    return raw;
   };
   cfg.antigravityModels = () => {
     const src = (cfg.antigravity.models && cfg.antigravity.models.length > 0)

@@ -12,6 +12,8 @@ import logging
 import time
 from pathlib import Path
 
+import pytest
+
 from tmon_mcp.config import Config, load
 from tmon_mcp.panel_generator import PanelGenerator
 
@@ -65,6 +67,44 @@ def test_panel_unconfigured(tmp_path):
     assert cfg.panel_dir_abs() == ""
 
 
+def test_panel_command_interval_bare_number(tmp_path):
+    cfg = _load(tmp_path, "[panel]\ncommand_interval_s = 900\n")
+    assert cfg.panel_command_interval_for("anything") == 900
+
+
+def test_panel_command_interval_table(tmp_path):
+    cfg = _load(tmp_path, '[panel.command_interval_s]\ndefault = 900\n"tmon-ab12" = 60\n')
+    assert cfg.panel_command_interval_for("tmon-ab12") == 60
+    assert cfg.panel_command_interval_for("other") == 900
+
+
+def test_panel_command_interval_absent_is_zero(tmp_path):
+    cfg = _load(tmp_path, '[panel.command]\ndefault = ["gen"]\n')
+    # 0 = unset = the long-lived-process contract every config had before.
+    assert cfg.panel_command_interval_for("dev1") == 0
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "[panel]\ncommand_interval_s = -5\n",
+        # 0.5 s truncated to 0 would mean "long-lived process" — the opposite
+        # contract to what was asked for, so it is an error, not a rounding.
+        "[panel]\ncommand_interval_s = 0.5\n",
+        '[panel]\ncommand_interval_s = "900"\n',
+    ],
+)
+def test_panel_command_interval_rejects_bad_values(tmp_path, body):
+    """Must fail loudly, exactly as the Go broker does on the same toml."""
+    with pytest.raises(ValueError):
+        _load(tmp_path, body)
+
+
+def test_panel_command_interval_accepts_integral_float(tmp_path):
+    cfg = _load(tmp_path, "[panel]\ncommand_interval_s = 900.0\n")
+    assert cfg.panel_command_interval_for("dev1") == 900
+
+
 # --- target resolution ----------------------------------------------------
 
 
@@ -100,8 +140,8 @@ def test_targets_per_device_resolution():
     special = ["gen", "special"]
     gen = _gen(_cfg_command({"default": default, "dev1": special}), _FakeReg(["dev1", "dev2"]))
     got = gen._targets()
-    assert got["dev1"] == special
-    assert got["dev2"] == default  # falls back to default
+    assert got["dev1"].argv == tuple(special)
+    assert got["dev2"].argv == tuple(default)  # falls back to default
     assert "" not in got  # no global default when devices present
 
 
@@ -109,7 +149,7 @@ def test_targets_explicit_key_for_unregistered_device():
     special = ["gen", "special"]
     gen = _gen(_cfg_command({"tmon-ab12": special}), None)
     got = gen._targets()
-    assert got["tmon-ab12"] == special
+    assert got["tmon-ab12"].argv == tuple(special)
     assert "" not in got
 
 
@@ -117,7 +157,9 @@ def test_targets_global_default_when_no_devices():
     default = ["gen"]
     gen = _gen(_cfg_command({"default": default}), None)
     got = gen._targets()
-    assert got == {"": default}
+    assert list(got) == [""]
+    assert got[""].argv == tuple(default)
+    assert got[""].interval == 0  # absent [panel.command_interval_s] = long-lived
 
 
 def test_target_path():
@@ -167,6 +209,69 @@ async def test_supervisor_restarts_on_exit(tmp_path):
     gen.start()
     try:
         assert await _wait_for(2.0, lambda: f.exists() and f.stat().st_size >= 3), "expected >=3 restarts"
+    finally:
+        await gen.stop()
+
+
+async def test_interval_mode_reruns_one_shot(tmp_path):
+    """The point of the feature: a command that samples once and exits gets
+    re-run on its own period instead of being treated as a crash."""
+    f = tmp_path / "runs"
+    argv = ["sh", "-c", f"printf x >> '{f}'"]
+    cfg = _cfg_command({"default": argv})
+    cfg.panel.command_interval_s = 0.06  # sub-second so the test stays quick
+    gen = _gen(cfg)
+    gen.start()
+    try:
+        assert await _wait_for(2.0, lambda: f.exists() and f.stat().st_size >= 3), (
+            "expected >=3 paced runs"
+        )
+    finally:
+        await gen.stop()
+
+
+async def test_interval_mode_does_not_overlap_runs(tmp_path):
+    """A run that outlasts its period must delay the next one, not overlap it."""
+    f = tmp_path / "runs"
+    # 's' on entry, 'e' on exit: overlapping runs would show up as "ss"/"ee".
+    argv = ["sh", "-c", f"printf s >> '{f}'; sleep 0.2; printf e >> '{f}'"]
+    cfg = _cfg_command({"default": argv})
+    cfg.panel.command_interval_s = 0.02
+    gen = _gen(cfg)
+    gen.start()
+    try:
+        # Assert the wait, or a generator that never ran would make the marker
+        # loop below iterate over nothing and pass vacuously.
+        assert await _wait_for(3.0, lambda: f.exists() and f.stat().st_size >= 4), (
+            "expected at least two complete runs"
+        )
+    finally:
+        await gen.stop()
+    got = f.read_text()
+    if got.endswith("s"):  # the run the stop interrupted
+        got = got[:-1]
+    assert all(got[i : i + 2] == "se" for i in range(0, len(got) - 1, 2)), f"runs overlapped: {got!r}"
+
+
+async def test_interval_change_restarts_child(tmp_path):
+    """Re-pacing has to restart the child, or the new interval would only land
+    whenever the old one happened to die."""
+    argv = ["sh", "-c", "sleep 5"]
+    cfg = _cfg_command({"default": argv})
+    cfg.panel.command_interval_s = 60
+    gen = _gen(cfg)
+    gen.start()
+    try:
+        assert await _wait_for(2.0, lambda: bool(gen._children)), "child never started"
+        first = gen._children[""]
+        cfg.panel.command_interval_s = 30
+        # Wait for the REPLACEMENT, not merely for the old entry to go:
+        # _reconcile deletes before it re-adds, so `is not first` is briefly
+        # true with no child at all.
+        assert await _wait_for(
+            2.0, lambda: (c := gen._children.get("")) is not None and c is not first
+        ), "reconcile kept the old child after the interval changed"
+        assert gen._children[""].interval == 30
     finally:
         await gen.stop()
 

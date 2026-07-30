@@ -15,6 +15,10 @@ Each generator is supervised: if it exits (cleanly or by crashing) while we are
 still the leader, it is respawned with exponential backoff. On teardown the
 whole process group is sent SIGTERM, then SIGKILL after a grace period, so
 nothing is orphaned.
+
+A command that samples once and exits rather than looping can say so with
+[panel.command_interval_s]: then it is re-run on that period instead, and
+exiting is the normal case rather than a failure.
 """
 
 from __future__ import annotations
@@ -25,16 +29,34 @@ import os
 import signal
 from contextlib import suppress
 from pathlib import Path
+from typing import NamedTuple
+
+
+class _Target(NamedTuple):
+    """One device's desired generator: what to run, and how to pace it.
+    interval == 0 means "long-lived process" (the default contract); anything
+    else means "one-shot, re-run on that period"."""
+
+    argv: tuple[str, ...]
+    interval: float
 
 
 class _Child:
-    """One supervised generator process (its argv + a per-child stop event)."""
+    """One supervised generator process (its target + a per-child stop event)."""
 
-    def __init__(self, device_id: str, argv: list[str]) -> None:
+    def __init__(self, device_id: str, target: _Target) -> None:
         self.id = device_id
-        self.argv = argv
+        self.target = target
         self.stop = asyncio.Event()
         self.task: asyncio.Task | None = None
+
+    @property
+    def argv(self) -> list[str]:
+        return list(self.target.argv)
+
+    @property
+    def interval(self) -> float:
+        return self.target.interval
 
     @property
     def label(self) -> str:
@@ -98,14 +120,17 @@ class PanelGenerator:
             return
         targets = self._targets()
         for device_id, child in list(self._children.items()):
-            argv = targets.get(device_id)
-            if argv is None or argv != child.argv:
+            # The interval is part of the identity: re-pacing a generator has
+            # to restart it, or the change would only land whenever the child
+            # happened to die.
+            target = targets.get(device_id)
+            if target is None or target != child.target:
                 await self._stop_child(child)
                 del self._children[device_id]
-        for device_id, argv in targets.items():
+        for device_id, target in targets.items():
             if device_id in self._children:
                 continue
-            child = _Child(device_id, argv)
+            child = _Child(device_id, target)
             child.task = asyncio.create_task(self._supervise(child))
             self._children[device_id] = child
 
@@ -124,15 +149,21 @@ class PanelGenerator:
                     await child.task
         self._children.clear()
 
-    def _targets(self) -> dict[str, list[str]]:
-        """Desired {device_id: argv}. Per device: its own command, else
-        "default". Every registered device is a candidate; explicit non-default
-        keys run even for unregistered devices. With no devices at all, a lone
-        "default" runs one global generator (empty id → feeds file.default)."""
+    def _targets(self) -> dict[str, _Target]:
+        """Desired {device_id: target}. Per device: its own command, else
+        "default"; the interval resolves the same way, so a device can be paced
+        differently from the default one. Every registered device is a
+        candidate; explicit non-default keys run even for unregistered devices.
+        With no devices at all, a lone "default" runs one global generator
+        (empty id → feeds file.default)."""
         cmds = self.cfg.panel_command_map()
         if not cmds:
             return {}
-        out: dict[str, list[str]] = {}
+        out: dict[str, _Target] = {}
+
+        def make(device_id: str, argv: list[str]) -> _Target:
+            return _Target(tuple(argv), self.cfg.panel_command_interval_for(device_id))
+
         ids: list[str] = []
         if self.registry is not None:
             try:
@@ -142,13 +173,14 @@ class PanelGenerator:
         for device_id in ids:
             argv = cmds.get(device_id) or cmds.get("default")
             if argv:
-                out[device_id] = argv
+                out[device_id] = make(device_id, argv)
         for key, argv in cmds.items():
             if key == "default":
                 continue
-            out.setdefault(key, argv)
+            if key not in out:
+                out[key] = make(key, argv)
         if not out and "default" in cmds:
-            out[""] = cmds["default"]
+            out[""] = make("", cmds["default"])
         return out
 
     def _child_env(self, device_id: str) -> dict[str, str]:
@@ -172,48 +204,97 @@ class PanelGenerator:
         return self.cfg.panel_file_default_abs()
 
     async def _supervise(self, child: _Child) -> None:
+        """Run one generator until the child is stopped. Which of the two
+        contracts applies is the target's interval:
+
+        - 0 (the default): the command is expected to loop forever. Exiting is
+          a failure, so it restarts with exponential backoff.
+        - >0: the command is expected to sample once and exit, and we re-run it
+          on that period. Exiting is the normal case, so there is no backoff —
+          the interval is already the rate limit."""
+        if child.interval > 0:
+            await self._supervise_interval(child)
+            return
         loop = asyncio.get_event_loop()
         backoff = self.backoff_initial
         while not child.stop.is_set():
             start = loop.time()
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *child.argv,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                    env=self._child_env(child.id),
-                    start_new_session=True,  # own process group for group-kill
-                )
-            except Exception as e:  # noqa: BLE001
-                self.logger.error("panelgen[%s]: %s", child.label, e)
-                if not await self._backoff_sleep(child, backoff):
-                    return
-                backoff = min(backoff * 2, self.backoff_max)
-                continue
-
-            self.logger.info("panelgen[%s]: started pid=%d %s", child.label, proc.pid, child.argv)
-            log_task = asyncio.create_task(self._pump_logs(child.label, proc.stdout))
-            stop_wait = asyncio.create_task(child.stop.wait())
-            exited = asyncio.create_task(proc.wait())
-            done, _ = await asyncio.wait({stop_wait, exited}, return_when=asyncio.FIRST_COMPLETED)
-
-            if stop_wait in done:
-                await self._terminate(proc, exited)
-            else:
-                stop_wait.cancel()
-                with suppress(asyncio.CancelledError):
-                    await stop_wait
-            await log_task
-
+            started = await self._run_once(child)
             if child.stop.is_set():
                 return
-            ran = loop.time() - start
-            self.logger.info("panelgen[%s]: exited after %.1fs; restarting", child.label, ran)
-            if ran >= self.backoff_reset:
-                backoff = self.backoff_initial
-            if not await self._backoff_sleep(child, backoff):
+            if started:
+                ran = loop.time() - start
+                self.logger.info("panelgen[%s]: exited after %.1fs; restarting", child.label, ran)
+                # A generator that stayed up a good while is not crash-looping.
+                if ran >= self.backoff_reset:
+                    backoff = self.backoff_initial
+            if not await self._sleep_unless_stopped(child, backoff):
                 return
             backoff = min(backoff * 2, self.backoff_max)
+
+    async def _supervise_interval(self, child: _Child) -> None:
+        """Re-run a one-shot generator every child.interval, measured
+        start-to-start so the cadence does not drift with how long a run takes.
+
+        Runs never overlap: a run that overruns its period simply delays the
+        next one, which then starts immediately. We do not kill a slow
+        generator — it may be mid-write, and half a document served to the
+        device is worse than a late one. A run that fails waits the same
+        interval as one that succeeds; a generator that cannot reach its source
+        is expected to write its own "no data" document
+        (docs/custom-panel.md), not to be retried harder."""
+        loop = asyncio.get_event_loop()
+        self.logger.info("panelgen[%s]: every %.0fs %s", child.label, child.interval, child.argv)
+        while not child.stop.is_set():
+            start = loop.time()
+            started = await self._run_once(child)
+            if child.stop.is_set():
+                return
+            if started:
+                self.logger.info(
+                    "panelgen[%s]: run finished in %.1fs", child.label, loop.time() - start
+                )
+            wait = child.interval - (loop.time() - start)
+            if wait <= 0:
+                self.logger.info(
+                    "panelgen[%s]: run outlasted its %.0fs interval; starting the next one now",
+                    child.label,
+                    child.interval,
+                )
+                continue
+            if not await self._sleep_unless_stopped(child, wait):
+                return
+
+    async def _run_once(self, child: _Child) -> bool:
+        """Start the generator and wait for it to exit (or for a stop, which
+        tears the process group down). False when it could not be started at
+        all — already logged."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *child.argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=self._child_env(child.id),
+                start_new_session=True,  # own process group for group-kill
+            )
+        except Exception as e:  # noqa: BLE001
+            self.logger.error("panelgen[%s]: %s", child.label, e)
+            return False
+
+        self.logger.info("panelgen[%s]: started pid=%d %s", child.label, proc.pid, child.argv)
+        log_task = asyncio.create_task(self._pump_logs(child.label, proc.stdout))
+        stop_wait = asyncio.create_task(child.stop.wait())
+        exited = asyncio.create_task(proc.wait())
+        done, _ = await asyncio.wait({stop_wait, exited}, return_when=asyncio.FIRST_COMPLETED)
+
+        if stop_wait in done:
+            await self._terminate(proc, exited)
+        else:
+            stop_wait.cancel()
+            with suppress(asyncio.CancelledError):
+                await stop_wait
+        await log_task
+        return True
 
     async def _terminate(self, proc, exited: asyncio.Task) -> None:
         """SIGTERM the child's process group, then SIGKILL after term_grace.
@@ -234,7 +315,7 @@ class PanelGenerator:
         with suppress(asyncio.CancelledError):
             await exited
 
-    async def _backoff_sleep(self, child: _Child, delay: float) -> bool:
+    async def _sleep_unless_stopped(self, child: _Child, delay: float) -> bool:
         """Sleep `delay` unless the child is stopped first. Returns False if a
         stop was requested (caller should exit), True if the delay elapsed."""
         if delay <= 0:

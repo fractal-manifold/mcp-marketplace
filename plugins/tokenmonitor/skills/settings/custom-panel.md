@@ -63,5 +63,12 @@ points, 8 KB file; solid `#rrggbb` colours only. **Write atomically** (temp
 file + rename) so the broker never serves a half-written file — it picks the
 change up on the next request, no restart.
 
+If the user wants a number bigger or smaller than it comes out, that is the
+tile's optional `size`: `small` (18 px) / `medium` (22) / `large` (30) /
+`huge` (48). Absent means the size follows the layout — a `text` tile draws at
+30 px alone and 18 px when it shares the screen, a `table` at 18 / 14 px — so
+a headline number next to a chart needs `size` set explicitly to stay
+readable.
+
 The full field list and examples live in the monorepo's `docs/custom-panel.md`
 and `compat/PANEL_WIRE.md` (not bundled with a standalone plugin install).

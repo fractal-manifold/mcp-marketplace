@@ -12,10 +12,19 @@
 // as the broker's user with a shell-free argv. The control plane / config_sync
 // can never populate them — that path writes device NVS, not the broker toml.
 //
-// Each generator is supervised: if it exits (cleanly or by crashing) while we
-// are still the leader, it is respawned with exponential backoff. When the
-// scoping ctx is cancelled the whole process group is sent SIGTERM, then
-// SIGKILL after a grace period, so nothing is orphaned.
+// Each generator is supervised in one of two modes, chosen per device by
+// [panel.command_interval_s]:
+//
+//   - interval unset (0) — the long-lived contract every config had before:
+//     the command is expected to keep running and write the panel file on its
+//     own schedule. If it exits (cleanly or by crashing) while we are still
+//     the leader, it is respawned with exponential backoff.
+//   - interval > 0 — the command is a one-shot sampler: it is re-run every N
+//     seconds, and a clean exit is the expected outcome rather than a crash.
+//     Runs never overlap; a run that outlasts its period delays the next one.
+//
+// Either way, when the scoping ctx is cancelled the whole process group is
+// sent SIGTERM, then SIGKILL after a grace period, so nothing is orphaned.
 package panelgen
 
 import (
@@ -92,9 +101,17 @@ func Start(ctx context.Context, cfg *config.Config, reg DeviceLister, logger *lo
 	}
 }
 
+// target is one device's desired generator: what to run, and how to pace it.
+// interval == 0 means "long-lived process" (the default contract); anything
+// else means "one-shot, re-run on that period".
+type target struct {
+	argv     []string
+	interval time.Duration
+}
+
 // child is one supervised generator process.
 type child struct {
-	argv   []string
+	target target
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -135,26 +152,26 @@ func (m *Manager) reconcile(ctx context.Context, children map[string]*child) {
 	targets := m.targets()
 
 	for id, c := range children {
-		argv, ok := targets[id]
-		if !ok || !sameArgv(argv, c.argv) {
+		t, ok := targets[id]
+		if !ok || !sameTarget(t, c.target) {
 			c.cancel()
 			<-c.done
 			delete(children, id)
 		}
 	}
 
-	for id, argv := range targets {
+	for id, t := range targets {
 		if _, ok := children[id]; ok {
 			continue
 		}
 		cctx, ccancel := context.WithCancel(ctx)
 		done := make(chan struct{})
-		c := &child{argv: argv, cancel: ccancel, done: done}
+		c := &child{target: t, cancel: ccancel, done: done}
 		children[id] = c
-		go func(id string, argv []string) {
+		go func(id string, t target) {
 			defer close(done)
-			m.supervise(cctx, id, argv)
-		}(id, argv)
+			m.supervise(cctx, id, t)
+		}(id, t)
 	}
 }
 
@@ -163,12 +180,20 @@ func (m *Manager) reconcile(ctx context.Context, children map[string]*child) {
 // candidate; explicit non-default keys are honoured even for devices not (yet)
 // in the registry. With no registered devices at all, a lone "default" runs a
 // single global generator (empty device id → feeds [panel.file].default).
-func (m *Manager) targets() map[string][]string {
+func (m *Manager) targets() map[string]target {
 	cmds := m.cfg.PanelCommandMap()
 	if len(cmds) == 0 {
 		return nil
 	}
-	out := map[string][]string{}
+	out := map[string]target{}
+	// The interval is resolved per id the same way the argv is, so a device
+	// can be paced differently from the "default" one.
+	add := func(id string, argv []string) {
+		out[id] = target{
+			argv:     argv,
+			interval: time.Duration(m.cfg.PanelCommandIntervalFor(id)) * time.Second,
+		}
+	}
 
 	var ids []string
 	if m.reg != nil {
@@ -180,7 +205,7 @@ func (m *Manager) targets() map[string][]string {
 	}
 	for _, id := range ids {
 		if argv := resolveArgv(cmds, id); argv != nil {
-			out[id] = argv
+			add(id, argv)
 		}
 	}
 	// Explicit per-device keys for devices not in the registry snapshot.
@@ -189,13 +214,13 @@ func (m *Manager) targets() map[string][]string {
 			continue
 		}
 		if _, ok := out[k]; !ok {
-			out[k] = argv
+			add(k, argv)
 		}
 	}
 	// Global default when nothing device-specific applies.
 	if len(out) == 0 {
 		if argv, ok := cmds["default"]; ok {
-			out[""] = argv
+			add("", argv)
 		}
 	}
 	return out
@@ -211,16 +236,26 @@ func resolveArgv(cmds map[string][]string, id string) []string {
 	return nil
 }
 
-// supervise runs one generator until ctx is cancelled, restarting it with
-// exponential backoff whenever it exits on its own.
-func (m *Manager) supervise(ctx context.Context, id string, argv []string) {
+// supervise runs one generator until ctx is cancelled. Which of the two
+// contracts applies is the target's interval:
+//
+//   - 0 (the default): the command is expected to loop forever. Exiting is a
+//     failure, so it restarts with exponential backoff.
+//   - >0: the command is expected to sample once and exit, and we re-run it on
+//     that period. Exiting is the normal case, so there is no backoff — the
+//     interval is already the rate limit.
+func (m *Manager) supervise(ctx context.Context, id string, t target) {
+	if t.interval > 0 {
+		m.superviseInterval(ctx, id, t)
+		return
+	}
 	backoff := m.backoffInitial
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 		start := time.Now()
-		ran, err := m.runOnce(ctx, id, argv)
+		ran, err := m.runOnce(ctx, id, t.argv)
 		if ctx.Err() != nil {
 			return
 		}
@@ -239,6 +274,43 @@ func (m *Manager) supervise(ctx context.Context, id string, argv []string) {
 		}
 		if backoff *= 2; backoff > m.backoffMax {
 			backoff = m.backoffMax
+		}
+	}
+}
+
+// superviseInterval re-runs a one-shot generator every t.interval, measured
+// start-to-start so the cadence does not drift with how long a run takes.
+//
+// Runs never overlap: a run that overruns its period simply delays the next
+// one, which then starts immediately. We do not kill a slow generator — it
+// may be mid-write, and half a document served to the device is worse than a
+// late one. A run that fails waits the same interval as one that succeeds; a
+// generator that cannot reach its source is expected to write its own "no
+// data" document (docs/custom-panel.md), not to be retried harder.
+func (m *Manager) superviseInterval(ctx context.Context, id string, t target) {
+	m.logger.Printf("panelgen[%s]: every %s %v", labelOf(id), t.interval, t.argv)
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		start := time.Now()
+		ran, err := m.runOnce(ctx, id, t.argv)
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			m.logger.Printf("panelgen[%s]: %v", labelOf(id), err)
+		} else {
+			m.logger.Printf("panelgen[%s]: run finished in %s", labelOf(id), ran.Round(time.Millisecond))
+		}
+		wait := t.interval - time.Since(start)
+		if wait <= 0 {
+			m.logger.Printf("panelgen[%s]: run outlasted its %s interval; starting the next one now",
+				labelOf(id), t.interval)
+			continue
+		}
+		if !sleepCtx(ctx, wait) {
+			return
 		}
 	}
 }
@@ -318,6 +390,13 @@ func labelOf(id string) string {
 		return "default"
 	}
 	return id
+}
+
+// sameTarget decides whether a running child still matches what the config
+// wants. The interval counts: re-pacing a generator has to restart it, or the
+// change would only land whenever the child happened to die.
+func sameTarget(a, b target) bool {
+	return a.interval == b.interval && sameArgv(a.argv, b.argv)
 }
 
 func sameArgv(a, b []string) bool {
