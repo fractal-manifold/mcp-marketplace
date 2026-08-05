@@ -1,9 +1,17 @@
 // TOML config loader, schema-compatible with tokenmonitor-mcp Go.
 
-import { readFileSync, existsSync } from "node:fs";
-import { createHash } from "node:crypto";
+import {
+  readFileSync,
+  existsSync,
+  mkdirSync,
+  chmodSync,
+  writeFileSync,
+  linkSync,
+  unlinkSync,
+} from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import TOML from "@iarna/toml";
 
@@ -24,6 +32,106 @@ export function devicesPath() {
 
 export function firmwarePath() {
   return expandUser(FIRMWARE_DIR);
+}
+
+// The token BOOTSTRAP_TOML carries where the generated passphrase goes. Kept as
+// a distinct constant so the substitution can never silently no-op if the
+// template is reworded.
+const BOOTSTRAP_PASSPHRASE_PLACEHOLDER = "@@PSK_PASSPHRASE@@";
+
+// Minimal first-run config. Deliberately much shorter than the Go SampleTOML:
+// every key here is one a fresh install genuinely needs, and the three runtimes
+// (go / py / js) carry it verbatim, so a short template is a small drift
+// surface. Everything else falls back to defaults().
+//
+// Keep byte-identical with config.BootstrapTOML (go) and
+// tmon_mcp.config.BOOTSTRAP_TOML (py).
+export const BOOTSTRAP_TOML = `# TokenMonitor broker configuration.
+# Created automatically on first run. Full documented reference:
+# mcp-marketplace/plugins/tokenmonitor/server/go/README.md
+
+[server]
+# 0.0.0.0 so the ESP32 can reach the broker over the LAN. Use 127.0.0.1 to
+# keep it host-local (the device then cannot poll it).
+bind = "0.0.0.0"
+port = 8765
+
+[auth]
+# Shared secret with the device; both sides SHA-256 it to derive the HMAC
+# key. Generated randomly at first run — the pairing flow mints a separate
+# per-device PSK, so you normally never have to type this one.
+psk_passphrase = "${BOOTSTRAP_PASSPHRASE_PLACEHOLDER}"
+
+[credentials]
+oauth_path = "~/.claude/.credentials.json"
+
+[codex]
+# Shows "creds missing" until you log in with codex. Set false to hide it.
+enabled = true
+auth_path = "~/.codex/auth.json"
+
+[antigravity]
+# Shows "creds missing" until you log in with agy. Set false to hide it.
+enabled = true
+keyring_service = "gemini"
+
+[logging]
+level = "INFO"
+`;
+
+// Write a first-run config at `path` and return its text. The config dir is
+// tightened to 0700 (it also holds the device registry, i.e. the per-device
+// PSKs) and the file is 0600 — it holds a shared secret.
+//
+// Several tokenmonitor-mcp processes can start at once (leader election happens
+// later, on the port), so the publish has to be atomic in BOTH directions: the
+// loser of the race must adopt the winner's file rather than overwrite it with
+// a second, wholly different passphrase, AND it must never observe a
+// half-written one. An O_EXCL ("wx") create alone only makes the create atomic,
+// not the create-then-write: the loser could open the winner's still-empty file
+// and parse it as a config with no passphrase. So we write a private temp file
+// first and link() it into place — under the final name the file either does
+// not exist or is complete.
+//
+// The passphrase is 32 hex chars rather than something memorable because nobody
+// is meant to type it: it is the broker's fallback key, and devices get their
+// own PSK at pairing time.
+export function bootstrap(path) {
+  const dir = dirname(path);
+  // Only the leaf is tightened: creating ~/.config itself 0700 would be a
+  // surprising side effect on a home directory we are only a guest in.
+  mkdirSync(dir, { recursive: true });
+  chmodSync(dir, 0o700);
+  const body = BOOTSTRAP_TOML.replace(
+    BOOTSTRAP_PASSPHRASE_PLACEHOLDER,
+    randomBytes(16).toString("hex"),
+  );
+
+  const tmp = join(dir, `.tokenmonitor.toml.${process.pid}.${randomBytes(6).toString("hex")}`);
+  try {
+    writeFileSync(tmp, body, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    try {
+      linkSync(tmp, path);
+    } catch (e) {
+      // Another process published first; its config is as good as ours.
+      if (e && e.code === "EEXIST") return readFileSync(path, "utf8");
+      throw e;
+    }
+  } finally {
+    // Runs on every path: after a successful link the temp name is a stale
+    // second link, and on failure it is a partial file nobody must inherit.
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* never created, or already gone */
+    }
+  }
+
+  // stdio MCP reserves stdout for JSON-RPC; notices go to stderr.
+  process.stderr.write(
+    `tokenmonitor-mcp: no config found, wrote a default one at ${path} (psk_passphrase generated)\n`,
+  );
+  return body;
 }
 
 // Default ordered list of model IDs exposed in /usage/antigravity.slots when
@@ -147,13 +255,25 @@ function mergeLegacyGemini(cfg, parsed) {
 export function load(path) {
   const explicit = !!path;
   let resolved = expandUser(path || DEFAULT_PATH);
+  let raw = null;
   if (!existsSync(resolved) && !explicit) {
     const legacy = expandUser(LEGACY_PATH);
-    if (existsSync(legacy)) resolved = legacy;
+    if (existsSync(legacy)) {
+      resolved = legacy;
+    } else {
+      // First run on this machine: neither the canonical file nor the legacy
+      // one exists. Write a working default instead of throwing — an MCP client
+      // that never sees the server reach "ready" simply drops the server from
+      // the session, which reads as "the plugin is broken" rather than "you
+      // have not configured it yet".
+      raw = bootstrap(resolved);
+    }
   }
-  if (!existsSync(resolved)) throw new Error(`read ${resolved}: file not found`);
+  if (raw === null) {
+    if (!existsSync(resolved)) throw new Error(`read ${resolved}: file not found`);
+    raw = readFileSync(resolved, "utf8");
+  }
 
-  const raw = readFileSync(resolved, "utf8");
   const parsed = TOML.parse(raw);
   const cfg = defaults();
   for (const k of ["server", "auth", "credentials", "codex", "antigravity", "usage", "spend", "pricing", "panel", "security", "logging", "serial", "ota"]) {

@@ -6,6 +6,9 @@ import base64
 import binascii
 import hashlib
 import os
+import secrets
+import sys
+import tempfile
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +26,107 @@ def devices_path() -> str:
 
 def firmware_path() -> str:
     return str(Path(FIRMWARE_DIR).expanduser())
+
+
+# The token BOOTSTRAP_TOML carries where the generated passphrase goes. Kept as
+# a distinct constant so the substitution can never silently no-op if the
+# template is reworded.
+_BOOTSTRAP_PASSPHRASE_PLACEHOLDER = "@@PSK_PASSPHRASE@@"
+
+# Minimal first-run config. Deliberately much shorter than the Go SampleTOML:
+# every key here is one a fresh install genuinely needs, and the three runtimes
+# (go / py / js) carry it verbatim, so a short template is a small drift
+# surface. Everything else falls back to the dataclass defaults.
+#
+# Keep byte-identical with config.BootstrapTOML (go) and BOOTSTRAP_TOML in
+# js/src/config.js.
+BOOTSTRAP_TOML = f"""# TokenMonitor broker configuration.
+# Created automatically on first run. Full documented reference:
+# mcp-marketplace/plugins/tokenmonitor/server/go/README.md
+
+[server]
+# 0.0.0.0 so the ESP32 can reach the broker over the LAN. Use 127.0.0.1 to
+# keep it host-local (the device then cannot poll it).
+bind = "0.0.0.0"
+port = 8765
+
+[auth]
+# Shared secret with the device; both sides SHA-256 it to derive the HMAC
+# key. Generated randomly at first run — the pairing flow mints a separate
+# per-device PSK, so you normally never have to type this one.
+psk_passphrase = "{_BOOTSTRAP_PASSPHRASE_PLACEHOLDER}"
+
+[credentials]
+oauth_path = "~/.claude/.credentials.json"
+
+[codex]
+# Shows "creds missing" until you log in with codex. Set false to hide it.
+enabled = true
+auth_path = "~/.codex/auth.json"
+
+[antigravity]
+# Shows "creds missing" until you log in with agy. Set false to hide it.
+enabled = true
+keyring_service = "gemini"
+
+[logging]
+level = "INFO"
+"""
+
+
+def bootstrap(target: Path) -> str:
+    """Write a first-run config at *target* and return its text.
+
+    The config dir is tightened to 0700 (it also holds the device registry, i.e.
+    the per-device PSKs) and the file is 0600 — it holds a shared secret.
+
+    Several tokenmonitor-mcp processes can start at once (leader election
+    happens later, on the port), so the publish has to be atomic in BOTH
+    directions: the loser of the race must adopt the winner's file rather than
+    overwrite it with a second, wholly different passphrase, AND it must never
+    observe a half-written one. An O_EXCL create alone only makes the create
+    atomic, not the create-then-write: the loser could open the winner's
+    still-empty file and parse it as a config with no passphrase. So we write a
+    private temp file first and os.link() it into place — under the final name
+    the file either does not exist or is complete.
+
+    The passphrase is 32 hex chars rather than something memorable because
+    nobody is meant to type it: it is the broker's fallback key, and devices get
+    their own PSK at pairing time.
+    """
+    # Only the leaf is tightened: creating ~/.config itself 0700 would be a
+    # surprising side effect on a home directory we are only a guest in.
+    target.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(target.parent, 0o700)
+    body = BOOTSTRAP_TOML.replace(_BOOTSTRAP_PASSPHRASE_PLACEHOLDER, secrets.token_hex(16))
+
+    # mkstemp creates 0600, which is the mode we want to publish. Explicit
+    # UTF-8: the template is not ASCII, and the file has to stay readable by the
+    # Go and JS runtimes (and by this one under any locale).
+    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".tokenmonitor.toml.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        try:
+            os.link(tmp, target)
+        except FileExistsError:
+            # Another process published first; its config is as good as ours.
+            return target.read_text(encoding="utf-8")
+    finally:
+        # Runs on every path: after a successful link the temp name is a stale
+        # second link, and on failure it is a partial file nobody must inherit.
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+    # stdio MCP reserves stdout for JSON-RPC; notices go to stderr.
+    print(
+        f"tokenmonitor-mcp: no config found, wrote a default one at {target} "
+        "(psk_passphrase generated)",
+        file=sys.stderr,
+    )
+    return body
 
 
 @dataclass
@@ -403,14 +507,30 @@ def load(path: str | None = None) -> Config:
     """Mirror of Go Load: explicit path errors; default falls back to service.toml."""
     explicit = bool(path)
     target = Path(path).expanduser() if path else Path(DEFAULT_PATH).expanduser()
-    if not target.is_file() and not explicit:
+    text: str | None = None
+    # exists(), not is_file(): Go and JS decide on the read errno / a bare
+    # existence check, so a path that exists but is not a regular file (someone
+    # mkdir'd a service.toml/) must fail loudly here too rather than be treated
+    # as absent and quietly bootstrapped past.
+    if not target.exists() and not explicit:
         legacy = Path(LEGACY_PATH).expanduser()
-        if legacy.is_file():
+        if legacy.exists():
             target = legacy
-    if not target.is_file():
-        raise FileNotFoundError(f"read {target}: file not found")
+        else:
+            # First run on this machine: neither the canonical file nor the
+            # legacy one exists. Write a working default instead of raising —
+            # an MCP client that never sees the server reach "ready" simply
+            # drops the server from the session, which reads as "the plugin is
+            # broken" rather than "you have not configured it yet".
+            text = bootstrap(target)
+    if text is None:
+        if not target.exists():
+            raise FileNotFoundError(f"read {target}: file not found")
+        # Explicit UTF-8: a config written by the Go or JS runtime (or by our own
+        # bootstrap) contains non-ASCII, and must not depend on the locale.
+        text = target.read_text(encoding="utf-8")
 
-    raw = tomllib.loads(target.read_text())
+    raw = tomllib.loads(text)
     cfg = Config()
     _section(raw, "server", cfg.server)
     _section(raw, "auth", cfg.auth)

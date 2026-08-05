@@ -21,7 +21,10 @@ tokenmonitor-mcp-js               # default: MCP stdio + leader-elected broker
 ```
 
 Requires Node ≥ 20. Config lives at
-`~/.config/tokenmonitor/tokenmonitor.toml`; the schema matches the Go impl.
+`~/.config/tokenmonitor/tokenmonitor.toml`; the schema matches the Go impl. You
+don't have to create it — the first start writes a working default there (0600,
+random `psk_passphrase`) rather than exiting, so a fresh install still reaches
+MCP "ready". An explicit `--config` path is never bootstrapped.
 
 ## Tests
 

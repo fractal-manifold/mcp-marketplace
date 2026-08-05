@@ -21,7 +21,10 @@ tokenmonitor-mcp-py               # default: MCP stdio + leader-elected broker
 ```
 
 Config lives at `~/.config/tokenmonitor/tokenmonitor.toml`; the schema
-matches the Go impl (see `../compat/`).
+matches the Go impl (see `../compat/`). You don't have to create it — the first
+start writes a working default there (0600, random `psk_passphrase`) rather than
+exiting, so a fresh install still reaches MCP "ready". An explicit `--config`
+path is never bootstrapped.
 
 ## Tests
 

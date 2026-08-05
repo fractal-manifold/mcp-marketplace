@@ -36,7 +36,18 @@ tokenmonitor-mcp --version
 
 ## Configure
 
-Create `~/.config/tokenmonitor/tokenmonitor.toml`:
+**You do not have to create the config by hand.** On its first start, if
+`~/.config/tokenmonitor/tokenmonitor.toml` is missing (and there is no legacy
+`service.toml`), the broker writes a working default there — dir `0700`, file
+`0600`, with a randomly generated `psk_passphrase` — and carries on starting.
+That is what keeps a fresh install reaching MCP "ready" instead of exiting, so
+the client doesn't drop the server from the session. Devices get their own PSK
+at pairing time, so the generated passphrase is only the fallback key.
+
+An explicit `--config <path>` is never bootstrapped: a missing file there is a
+typo, and starting with silently different settings would hide it.
+
+Edit the generated file to taste; the full reference is:
 
 ```toml
 [server]
