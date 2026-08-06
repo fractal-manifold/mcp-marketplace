@@ -13,6 +13,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -60,6 +61,8 @@ type Config struct {
 	Serial   Serial    `toml:"serial"`
 	OTA      OTAConfig `toml:"ota"`
 	pskBytes []byte
+	// salvaged names the sections dropped to make a broken file loadable.
+	salvaged []string
 }
 
 type Server struct {
@@ -507,17 +510,34 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read %s: %w", resolved, err)
 	}
 
-	cfg := defaults()
-	if err := toml.Unmarshal(raw, cfg); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", resolved, err)
+	cfg, parseErr := parseConfig(raw)
+	if parseErr != nil {
+		// An explicit --config is the operator's file: report the error and
+		// let them fix it rather than second-guessing what they meant.
+		if explicit {
+			return nil, fmt.Errorf("parse %s: %w", resolved, parseErr)
+		}
+		// Otherwise come up on whatever the file got right. Refusing to start
+		// helps nobody: the broker is how the device gets configured in the
+		// first place, so a typo in [panel] must not cost you the ability to
+		// set up a device. See salvageTOML for what "got right" means.
+		var kept []byte
+		kept, cfg = salvageTOML(raw)
+		cfg.salvaged = describeSalvage(raw, kept, parseErr)
+		// A rescued file may have lost [server] with the rest of a bad
+		// section. The code default binds loopback, which the device cannot
+		// reach — use the same bind a fresh bootstrap would have written, so
+		// "it came up" also means "you can provision against it".
+		//
+		// Unless the part we could not read was itself talking about bind. A
+		// user who wrote a bind we failed to parse has said something about
+		// their network boundary, and widening it to every interface on their
+		// behalf is not a rescue. Fail closed and let the health report tell
+		// them which section to fix.
+		if !definesKey(kept, "server", "bind") && !mentionsBind(raw, kept) {
+			cfg.Server.Bind = "0.0.0.0"
+		}
 	}
-
-	// Back-compat: a legacy tokenmonitor.toml uses [gemini] / gemini_tmp_path
-	// (pre-rename, before the Gemini CLI → Antigravity CLI migration). If the
-	// new [antigravity] section was not provided, fold the deprecated values
-	// forward so existing installs keep working. We detect "provided" by a
-	// non-zero deprecated section against the still-default new one.
-	mergeLegacyGemini(cfg, raw)
 
 	switch {
 	case cfg.Auth.Passphrase != "":
@@ -537,10 +557,303 @@ func Load(path string) (*Config, error) {
 		cfg.pskBytes = psk
 		cfg.Auth.PSKHex = strings.ToLower(cfg.Auth.PSKHex)
 	default:
-		return nil, errors.New("auth: either psk_passphrase or psk_hex is required")
+		// Neither key is set. For an explicit --config that stays an error:
+		// the operator wrote that file and may be managing it from somewhere
+		// else, so we do not add secrets to it behind their back.
+		if explicit {
+			return nil, errors.New("auth: either psk_passphrase or psk_hex is required")
+		}
+		// For the default config, exiting here reproduces exactly the failure
+		// Bootstrap exists to prevent — the process dies before answering
+		// `initialize` and the MCP client silently drops the server. Fall back
+		// to a generated key kept in a sidecar file instead. Note this branch
+		// is reached only when BOTH keys are absent or exactly empty; a
+		// malformed value is handled above and still fails loudly.
+		psk, err := fallbackPSK(filepath.Dir(resolved))
+		if err != nil {
+			return nil, fmt.Errorf("auth: no psk in %s and no usable fallback key: %w", resolved, err)
+		}
+		cfg.pskBytes = psk
 	}
 	cfg.Logging.Level = strings.ToUpper(cfg.Logging.Level)
 	return cfg, nil
+}
+
+// parseConfig turns TOML source into a validated Config. It does everything
+// Load does EXCEPT resolve the PSK, so it can be used as the predicate in
+// salvageTOML without minting a sidecar key on every trial parse.
+func parseConfig(src []byte) (*Config, error) {
+	cfg := defaults()
+	if err := toml.Unmarshal(src, cfg); err != nil {
+		return nil, err
+	}
+
+	// Back-compat: a legacy tokenmonitor.toml uses [gemini] / gemini_tmp_path
+	// (pre-rename, before the Gemini CLI → Antigravity CLI migration). If the
+	// new [antigravity] section was not provided, fold the deprecated values
+	// forward so existing installs keep working. We detect "provided" by a
+	// non-zero deprecated section against the still-default new one.
+	mergeLegacyGemini(cfg, src)
+
+	// Auth is format-checked here but not resolved: a section carrying a
+	// malformed key has to fail so salvageTOML drops it, and the caller then
+	// falls back to the sidecar.
+	//
+	// The checks follow the same precedence Load resolves by — passphrase
+	// first, hex only when there is no passphrase. A stale malformed psk_hex
+	// sitting under a perfectly good psk_passphrase is a value nobody reads;
+	// failing on it would drop the whole [auth] section, switch the broker to
+	// the sidecar key and desync every device that knows the real one.
+	switch {
+	case cfg.Auth.Passphrase != "":
+		if len(cfg.Auth.Passphrase) < 8 {
+			return nil, errors.New("auth.psk_passphrase must be at least 8 characters")
+		}
+	case cfg.Auth.PSKHex != "":
+		if len(cfg.Auth.PSKHex) != 64 {
+			return nil, errors.New("auth.psk_hex must be exactly 64 hex characters")
+		}
+		if _, err := hex.DecodeString(cfg.Auth.PSKHex); err != nil {
+			return nil, fmt.Errorf("auth.psk_hex is not valid hex: %w", err)
+		}
+	}
+	return cfg, nil
+}
+
+// salvageTOML rebuilds the largest run of top-level sections that still loads,
+// and returns both that source and the config it produced.
+//
+// The file is split at top-level table headers, so a section is the unit that
+// survives or dies as a whole — never an individual line. Dropping a lone line
+// would be worse than useless: lose a `[server]` header and every key under it
+// silently joins the PREVIOUS table, which is a config that parses and means
+// something the user never wrote.
+//
+// Sections are then re-accumulated in order, keeping each one only if the text
+// so far still parses AND validates. That covers both a syntax error and a
+// merely invalid value (a 4-character passphrase, a fractional
+// command_interval_s) with the same mechanism, and the survivors are re-parsed
+// as one document — so [[ota.keys]] arrays merge with normal TOML semantics
+// instead of some hand-rolled deep merge.
+//
+// A chunk is only considered at all when everything BEFORE it parses as TOML.
+// That test is what makes the split safe rather than merely plausible. A line
+// starting with `[` inside a multi-line string is not a header, and splitting
+// there would hand us a chunk like
+//
+//	[auth] # """
+//	psk_passphrase = "…"
+//
+// — string content that reads as a perfectly good section the user never
+// wrote, complete with a PSK. It cannot happen here: the text before such a
+// boundary ends inside an unterminated string, so it never parses, so the
+// boundary is never trusted. The cost is that a *syntax* error truncates the
+// salvage at that point (past it we no longer know where sections begin),
+// while a merely invalid value costs only its own section.
+func salvageTOML(src []byte) ([]byte, *Config) {
+	var kept, prefix []byte
+	cfg := defaults()
+	for _, chunk := range splitTOMLSections(src) {
+		// prefix is the raw text preceding this chunk — every earlier chunk,
+		// kept or dropped. If it doesn't parse we are not at a known lexical
+		// state, so this chunk's header is not known to be a header.
+		trusted := toml.Unmarshal(prefix, &struct{}{}) == nil
+		prefix = append(prefix, chunk...)
+		if !trusted {
+			continue
+		}
+		candidate := append(append([]byte{}, kept...), chunk...)
+		got, err := parseConfig(candidate)
+		if err != nil {
+			continue
+		}
+		kept, cfg = candidate, got
+	}
+	return kept, cfg
+}
+
+// splitTOMLSections cuts src before every line whose first non-blank character
+// is '[' (a table or array-of-tables header). The leading chunk holds any
+// root-level keys written before the first header.
+func splitTOMLSections(src []byte) [][]byte {
+	lines := strings.SplitAfter(string(src), "\n")
+	var out [][]byte
+	var cur []byte
+	for _, line := range lines {
+		if strings.HasPrefix(strings.TrimLeft(line, " \t"), "[") && len(cur) > 0 {
+			out = append(out, cur)
+			cur = nil
+		}
+		cur = append(cur, line...)
+	}
+	if len(cur) > 0 {
+		out = append(out, cur)
+	}
+	return out
+}
+
+// describeSalvage names what was lost, for the log line and the health report.
+//
+// Labels are counted, not set-tested: a header can legitimately repeat
+// ([[ota.keys]] is one entry per signing key), and matching by presence would
+// let a dropped second entry hide behind the first one that survived — the one
+// case where the salvage really would lose data silently.
+func describeSalvage(src, kept []byte, cause error) []string {
+	keptCount := map[string]int{}
+	for _, chunk := range splitTOMLSections(kept) {
+		keptCount[sectionLabel(chunk)]++
+	}
+	var dropped []string
+	for _, chunk := range splitTOMLSections(src) {
+		label := sectionLabel(chunk)
+		if keptCount[label] > 0 {
+			keptCount[label]--
+			continue
+		}
+		dropped = append(dropped, label)
+	}
+	if len(dropped) == 0 {
+		// The whole file failed as a unit (e.g. an unterminated string that
+		// swallows every later header).
+		dropped = []string{"<whole file>"}
+	}
+	return append(dropped, "cause: "+cause.Error())
+}
+
+// sectionLabel is a chunk's header line, or "<root>" for the leading keys.
+func sectionLabel(chunk []byte) string {
+	line := strings.TrimSpace(strings.SplitN(string(chunk), "\n", 2)[0])
+	if !strings.HasPrefix(line, "[") {
+		return "<root>"
+	}
+	return line
+}
+
+// bindAssignment matches a line that assigns the bind key. Deliberately
+// textual: this runs over source the TOML parser has already rejected, where
+// there is nothing to query. It is only ever used to decline to widen the
+// bind, so a false positive costs reachability (recoverable, and reported)
+// while a false negative would cost network exposure.
+var bindAssignment = regexp.MustCompile(`(?m)^[ \t]*bind[ \t]*=`)
+
+// mentionsBind reports whether the part of src the salvage could NOT keep
+// assigns a bind.
+func mentionsBind(src, kept []byte) bool {
+	keptCount := map[string]int{}
+	for _, chunk := range splitTOMLSections(kept) {
+		keptCount[sectionLabel(chunk)]++
+	}
+	for _, chunk := range splitTOMLSections(src) {
+		label := sectionLabel(chunk)
+		if keptCount[label] > 0 {
+			keptCount[label]--
+			continue
+		}
+		if bindAssignment.Match(chunk) {
+			return true
+		}
+	}
+	return false
+}
+
+// definesKey reports whether src actually sets the given key path, as opposed
+// to the value coming from defaults().
+func definesKey(src []byte, path ...string) bool {
+	var probe Config
+	md, err := toml.Decode(string(src), &probe)
+	if err != nil {
+		return false
+	}
+	return md.IsDefined(path...)
+}
+
+// Salvaged lists the config sections that had to be dropped to get a loadable
+// config, plus the parse error that caused it. Empty for a clean load.
+func (c *Config) Salvaged() []string { return c.salvaged }
+
+// Unusable returns a config built purely from defaults, with an ephemeral
+// random PSK, for the degraded start the MCP entrypoint performs when Load()
+// fails.
+//
+// It exists so a broken config can't take the MCP server down with it: exiting
+// makes the client drop the server and the user sees nothing at all, whereas a
+// live server can be asked what is wrong (tokenmonitor_health reports the load
+// error). The caller MUST NOT serve the device broker with this — the PSK is
+// invented and changes every start, so no device can authenticate against it.
+// It is only here to keep the cfg-dependent tools from working on nil.
+func Unusable() *Config {
+	cfg := defaults()
+	psk := make([]byte, 32)
+	if _, err := rand.Read(psk); err != nil {
+		// A CSPRNG failure is not survivable, but this key is never used to
+		// authenticate anything — a zero key is fine for a broker we are
+		// deliberately not starting.
+		psk = make([]byte, 32)
+	}
+	cfg.pskBytes = psk
+	return cfg
+}
+
+// FallbackPSKName is the sidecar holding the generated key used when the
+// config carries no psk_passphrase / psk_hex. It lives next to the config as
+// 64 lowercase hex chars.
+//
+// A sidecar rather than an edit to the TOML on purpose: patching a commented,
+// user-owned config by hand means re-implementing a TOML-aware source scanner
+// three times (quoted/dotted keys, inline tables, multi-line strings, a
+// `psk_hex` under some other table, CRLF…), and any external editor open on
+// the file would race the rewrite. A whole separate file has none of that, and
+// the config always wins when it does carry a key.
+const FallbackPSKName = "psk"
+
+// fallbackPSK returns the generated fallback key from dir, creating it on
+// first use. Publishing goes through publishAtomic, so concurrent starts
+// converge on one key: whoever loses the race adopts the winner's file rather
+// than continuing with a second key nobody else knows.
+func fallbackPSK(dir string) ([]byte, error) {
+	path := filepath.Join(dir, FallbackPSKName)
+
+	if raw, err := os.ReadFile(path); err == nil {
+		return decodeFallbackPSK(raw, path)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+
+	if err := os.MkdirAll(dir, 0o777); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return nil, err
+	}
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return nil, err
+	}
+	published, created, err := publishAtomic(path, []byte(hex.EncodeToString(key)+"\n"))
+	if err != nil {
+		return nil, err
+	}
+	if created {
+		// stdio MCP reserves stdout for JSON-RPC; notices go to stderr.
+		fmt.Fprintf(os.Stderr, "tokenmonitor-mcp: config has no psk_passphrase/psk_hex, generated a fallback key at %s\n", path)
+	}
+	return decodeFallbackPSK(published, path)
+}
+
+// decodeFallbackPSK parses the sidecar. A file that exists but does not hold a
+// 32-byte key is an error, never something to overwrite: the user may have put
+// a specific key there, and silently replacing it would desync every device
+// that already knows it.
+func decodeFallbackPSK(raw []byte, path string) ([]byte, error) {
+	text := strings.TrimSpace(string(raw))
+	if len(text) != 64 {
+		return nil, fmt.Errorf("%s must hold exactly 64 hex characters, has %d", path, len(text))
+	}
+	key, err := hex.DecodeString(text)
+	if err != nil {
+		return nil, fmt.Errorf("%s is not valid hex: %w", path, err)
+	}
+	return key, nil
 }
 
 // bootstrapPassphrasePlaceholder is the token BootstrapTOML carries where the
@@ -619,10 +932,36 @@ func Bootstrap(path string) ([]byte, error) {
 	}
 	body := []byte(strings.Replace(BootstrapTOML, bootstrapPassphrasePlaceholder, pass, 1))
 
-	// CreateTemp makes the file 0600, which is the mode we want to publish.
-	tmp, err := os.CreateTemp(dir, ".tokenmonitor.toml.*")
+	published, created, err := publishAtomic(path, body)
 	if err != nil {
 		return nil, err
+	}
+	if created {
+		// stdio MCP reserves stdout for JSON-RPC; notices go to stderr.
+		fmt.Fprintf(os.Stderr, "tokenmonitor-mcp: no config found, wrote a default one at %s (psk_passphrase generated)\n", path)
+	}
+	return published, nil
+}
+
+// publishAtomic writes body to path and returns the bytes that ended up
+// there, plus whether this caller is the one that created it.
+//
+// Several tokenmonitor-mcp processes can start at once (leader election
+// happens later, on the port), so the publish has to be atomic in BOTH
+// directions: the loser of the race must adopt the winner's file rather than
+// overwrite it with different content, AND it must never observe a
+// half-written one. An O_EXCL create alone only makes the create atomic, not
+// the create-then-write: the loser could open the winner's still-empty file
+// and use it. So write a private temp file first and link(2) it into place —
+// under the final name the file either does not exist or is complete.
+//
+// Mirrors publish_atomic() in py/src/tmon_mcp/config.py and publishAtomic()
+// in js/src/config.js.
+func publishAtomic(path string, body []byte) ([]byte, bool, error) {
+	// CreateTemp makes the file 0600, which is the mode we want to publish.
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmon-publish.*")
+	if err != nil {
+		return nil, false, err
 	}
 	// Runs on every path: after a successful link the temp name is a stale
 	// second link, and on failure it is a partial file nobody must inherit.
@@ -630,21 +969,19 @@ func Bootstrap(path string) ([]byte, error) {
 
 	if _, err := tmp.Write(body); err != nil {
 		tmp.Close()
-		return nil, err
+		return nil, false, err
 	}
 	if err := tmp.Close(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if err := os.Link(tmp.Name(), path); err != nil {
 		if errors.Is(err, os.ErrExist) {
-			// Another process published first; its config is as good as ours.
-			return os.ReadFile(path)
+			adopted, readErr := os.ReadFile(path)
+			return adopted, false, readErr
 		}
-		return nil, err
+		return nil, false, err
 	}
-	// stdio MCP reserves stdout for JSON-RPC; notices go to stderr.
-	fmt.Fprintf(os.Stderr, "tokenmonitor-mcp: no config found, wrote a default one at %s (psk_passphrase generated)\n", path)
-	return body, nil
+	return body, true, nil
 }
 
 // randomPassphrase returns 32 hex chars of CSPRNG output. Hex rather than

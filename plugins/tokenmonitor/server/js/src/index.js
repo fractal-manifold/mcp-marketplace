@@ -12,7 +12,7 @@ import * as ota from "./ota.js";
 import * as updatecheck from "./updatecheck.js";
 import * as usage from "./usage.js";
 import * as spend from "./spend.js";
-import { load as loadConfig, devicesPath } from "./config.js";
+import { load as loadConfig, devicesPath, unusableConfig } from "./config.js";
 import { Buffer as LogBuffer } from "./logbuf.js";
 import { State, Role } from "./state.js";
 import { Registry } from "./registry/store.js";
@@ -181,7 +181,29 @@ async function runDaemon(cfg, logs, logger) {
   return 0;
 }
 
-async function runMCP(cfg, logs, logger) {
+async function runMCP(cfg, logs, logger, configErr = null) {
+  if (configErr) {
+    // Degraded start: tools up so the user can be told what is wrong, but no
+    // broker. The config we are holding is invented (unusableConfig), so
+    // serving devices with it would answer every signed request with the wrong
+    // key — worse than not answering at all. It also must never win leader
+    // election and displace a healthy peer that CAN serve.
+    logger.error(`config: ${configErr.message}`);
+    logger.error(
+      "config: starting degraded — MCP tools only, broker NOT started. " +
+        "Fix the config and restart; run tokenmonitor_health for details.",
+    );
+    await mcpServe({
+      cfg,
+      state: new State(),
+      logs,
+      registry: openRegistry(logger),
+      version: VERSION,
+      configErr,
+    });
+    return 0;
+  }
+
   const state = new State();
   const cache = new auth.NonceCache(cfg.security.nonce_cache_ttl_seconds);
   const fwBuf = new LogBuffer(cfg.serial.lines || 2000);
@@ -276,11 +298,32 @@ async function main() {
   }
 
   let cfg;
-  try { cfg = loadConfig(flags.config || ""); }
-  catch (e) { process.stderr.write(`config: ${e.message}\n`); return 2; }
+  let configErr = null;
+  try {
+    cfg = loadConfig(flags.config || "");
+  } catch (e) {
+    // Every mode but stdio MCP has a human reading stderr, so a broken config
+    // stays fatal there. In MCP mode exiting is the worst possible response:
+    // the client never sees `initialize`, drops the server from the session,
+    // and the user is told nothing. Start degraded instead — tools up, broker
+    // down (see runMCP).
+    if (flags.once || flags.status || flags.daemon) {
+      process.stderr.write(`config: ${e.message}\n`);
+      return 2;
+    }
+    configErr = e;
+    cfg = unusableConfig();
+  }
 
   const logs = new LogBuffer(200);
   const logger = buildLogger(logs, cfg.logging.level);
+
+  // A partially-loaded config still serves, but the user has to be told which
+  // of their settings are not in effect — otherwise "it works" quietly means
+  // "it works, ignoring half of what you wrote".
+  if (cfg.salvaged && cfg.salvaged.length > 0) {
+    logger.warn(`config: loaded with ${cfg.salvaged.length - 1} section(s) ignored: ${cfg.salvaged.join("; ")}`);
+  }
 
   // Process-level guards. A throw escaping the http 'request' listener (or a
   // rejected promise inside a handler) would otherwise take the whole process
@@ -298,7 +341,7 @@ async function main() {
   if (flags.once) return runOnce(cfg);
   if (flags.status) return await runStatus(cfg);
   if (flags.daemon) return await runDaemon(cfg, logs, logger);
-  return await runMCP(cfg, logs, logger);
+  return await runMCP(cfg, logs, logger, configErr);
 }
 
 main().then((code) => process.exit(code ?? 0)).catch((e) => {

@@ -20,7 +20,7 @@ from . import ota
 from . import spend
 from . import usage
 from .broker.server import make_app
-from .config import devices_path, load
+from .config import devices_path, load, unusable_config
 from .leader import try_bind, run as leader_run
 from .logbuf import Buffer, LogbufHandler
 from .mcp.server import Deps as McpDeps, serve as mcp_serve
@@ -166,7 +166,29 @@ async def _run_daemon(cfg, logs: Buffer, logger: logging.Logger) -> int:
     return 0
 
 
-async def _run_mcp(cfg, logs: Buffer, logger: logging.Logger) -> int:
+async def _run_mcp(cfg, logs: Buffer, logger: logging.Logger, cfg_err: Exception | None = None) -> int:
+    if cfg_err is not None:
+        # Degraded start: tools up so the user can be told what is wrong, but
+        # no broker. The config we are holding is invented (unusable_config),
+        # so serving devices with it would answer every signed request with the
+        # wrong key — worse than not answering at all. It also must never win
+        # leader election and displace a healthy peer that CAN serve.
+        logger.error("config: %s", cfg_err)
+        logger.error(
+            "config: starting degraded — MCP tools only, broker NOT started. "
+            "Fix the config and restart; run tokenmonitor_health for details."
+        )
+        deps = McpDeps(
+            cfg=cfg,
+            state=State(),
+            logs=logs,
+            registry=_open_registry(logger),
+            version=__version__,
+            config_err=cfg_err,
+        )
+        await mcp_serve(deps)
+        return 0
+
     state = State()
     cache = auth.NonceCache(cfg.security.nonce_cache_ttl_seconds)
     fw_buf = Buffer(cfg.serial.lines or 2000)
@@ -264,14 +286,33 @@ def main() -> int:
         print(f"{RUNTIME} {__version__}", file=sys.stderr)
         return 0
 
+    cfg_err: Exception | None = None
     try:
         cfg = load(args.config or None)
     except Exception as e:
-        print(f"config: {e}", file=sys.stderr)
-        return 2
+        # Every mode but stdio MCP has a human reading stderr, so a broken
+        # config stays fatal there. In MCP mode exiting is the worst possible
+        # response: the client never sees `initialize`, drops the server from
+        # the session, and the user is told nothing. Start degraded instead —
+        # tools up, broker down (see _run_mcp).
+        if args.once or args.status or args.daemon:
+            print(f"config: {e}", file=sys.stderr)
+            return 2
+        cfg_err = e
+        cfg = unusable_config()
 
     logs = Buffer(200)
     logger = _build_logger(logs, cfg.logging.level)
+
+    # A partially-loaded config still serves, but the user has to be told which
+    # of their settings are not in effect — otherwise "it works" quietly means
+    # "it works, ignoring half of what you wrote".
+    if cfg.salvaged:
+        logger.warning(
+            "config: loaded with %d section(s) ignored: %s",
+            len(cfg.salvaged) - 1,
+            "; ".join(cfg.salvaged),
+        )
 
     if args.once:
         return _run_once(cfg)
@@ -279,7 +320,7 @@ def main() -> int:
         return _run_status(cfg)
     if args.daemon:
         return asyncio.run(_run_daemon(cfg, logs, logger))
-    return asyncio.run(_run_mcp(cfg, logs, logger))
+    return asyncio.run(_run_mcp(cfg, logs, logger, cfg_err))
 
 
 if __name__ == "__main__":

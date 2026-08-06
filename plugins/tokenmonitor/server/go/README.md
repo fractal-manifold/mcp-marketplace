@@ -47,6 +47,75 @@ at pairing time, so the generated passphrase is only the fallback key.
 An explicit `--config <path>` is never bootstrapped: a missing file there is a
 typo, and starting with silently different settings would hide it.
 
+The same reasoning covers a config that exists but carries **no** PSK — an
+absent `[auth]` section, or `psk_passphrase`/`psk_hex` written as `""`. Rather
+than exit (and be dropped by the client), the broker generates a fallback key
+and keeps it in a sidecar, `~/.config/tokenmonitor/psk` (64 hex chars, `0600`),
+which it reuses on every later start. Your config is never rewritten, and a
+`psk_passphrase`/`psk_hex` you *do* set always wins. A sidecar that exists but
+doesn't hold a 32-byte key is still fatal — you may have put a specific key
+there, so it is never overwritten. The fallback is skipped entirely for an
+explicit `--config`.
+
+### Partial config (salvage)
+
+A config the broker cannot fully parse — unparseable TOML, a passphrase under 8
+characters, a `psk_hex` that isn't 64 hex chars, a fractional
+`panel.command_interval_s` — does **not** stop it starting. The broker is how a
+device gets configured in the first place, so a typo in `[panel]` must not cost
+you the ability to set one up. It comes up on whatever the file got right:
+
+- The file is split at top-level `[section]` headers and re-accumulated in
+  order, keeping each section only if everything so far still parses **and**
+  validates. A section is the unit that survives or dies — never a single line,
+  because dropping a lone `[server]` header would silently move its keys into
+  the previous table, giving you a config that parses and means something you
+  never wrote.
+- Nothing is ever *misread*, only dropped. A section boundary counts only when
+  the text before it parses on its own, so a line starting with `[` inside a
+  multi-line string can never be mistaken for a header — otherwise a
+  `file = """` … `[auth]` … `"""` block would be read as a real `[auth]` with a
+  PSK you never set. The price is that a **syntax** error truncates the salvage
+  there (past it, section boundaries are no longer knowable), while a merely
+  invalid *value* costs only its own section.
+- Whatever survives is exactly the values you wrote. A dropped `[auth]` falls
+  back to the `psk` sidecar as above — and since a `psk_passphrase` always wins
+  over `psk_hex`, a stale malformed `psk_hex` under a valid passphrase is
+  ignored rather than fatal to the section.
+- If the rescue loses `[server]`, the bind becomes `0.0.0.0` (what a fresh
+  bootstrap writes) rather than the loopback code default — "it came up" has to
+  also mean "your device can reach it". **Unless** the part that was dropped
+  assigned a `bind` itself: you said something about your network boundary that
+  we failed to parse, so it fails closed on loopback rather than widening it for
+  you.
+- **Your file is never edited**, only ignored in part. The dropped sections and
+  the parse error are logged at startup and reported by `tokenmonitor_health` as
+  a *failing* `config` check, so a partial load can't pass for a clean one.
+
+An explicit `--config <path>` is never salvaged: that file is the operator's,
+and running on half of it would hide the mistake behind a broker that works but
+isn't doing what they wrote.
+
+### Degraded start
+
+When the config can't be **read** at all — the path is a directory, permissions
+deny it — there is nothing to salvage, and the stdio MCP server still doesn't
+die. It starts **degraded**: the tools come up so you can ask what is wrong
+(`tokenmonitor_health` reports the load error as a failing `config` check), and
+the broker is deliberately **not** started, because the config it would serve
+with is invented. Exiting instead would mean the client never sees `initialize`,
+drops the server from the session, and shows the user nothing at all.
+
+Degraded start applies to stdio MCP mode only. `--daemon`, `--once` and
+`--status` still exit 2 on an unreadable config: they have a human reading
+stderr, and a supervisor should see a service fail rather than come up
+half-working.
+
+`sh server/test-startup.sh` (or `make test-startup`) is the cross-runtime matrix
+that holds all of this: every runtime × every broken-config shape, asserting the
+server answers `initialize`, keeps stdout pure JSON-RPC, and repairs nothing it
+shouldn't.
+
 Edit the generated file to taste; the full reference is:
 
 ```toml

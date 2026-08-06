@@ -36,6 +36,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -87,10 +88,18 @@ func main() {
 		return
 	}
 
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "config: %v\n", err)
-		os.Exit(2)
+	cfg, cfgErr := config.Load(*configPath)
+	if cfgErr != nil {
+		// Every mode but stdio MCP has a human reading stderr, so a broken
+		// config stays fatal there. In MCP mode exiting is the worst possible
+		// response: the client never sees `initialize`, drops the server from
+		// the session, and the user is told nothing. Start degraded instead —
+		// tools up, broker down (see runMCP).
+		if *onceMode || *statusMode || *logsMode || *daemonMode {
+			fmt.Fprintf(os.Stderr, "config: %v\n", cfgErr)
+			os.Exit(2)
+		}
+		cfg = config.Unusable()
 	}
 
 	// All log output goes to stderr (stdio MCP reserves stdout for
@@ -98,6 +107,13 @@ func main() {
 	// tokenmonitor_recent_logs tool has something to return.
 	logs := logbuf.New(200)
 	logger := log.New(io.MultiWriter(os.Stderr, logs), "tokenmonitor-mcp ", log.LstdFlags|log.Lmicroseconds)
+
+	// A partially-loaded config still serves, but the user has to be told which
+	// of their settings are not in effect — otherwise "it works" quietly means
+	// "it works, ignoring half of what you wrote".
+	if s := cfg.Salvaged(); len(s) > 0 {
+		logger.Printf("config: loaded with %d section(s) ignored: %s", len(s)-1, strings.Join(s, "; "))
+	}
 
 	switch {
 	case *onceMode:
@@ -109,7 +125,7 @@ func main() {
 	case *daemonMode:
 		os.Exit(runDaemon(cfg, logger, logs))
 	default:
-		os.Exit(runMCP(cfg, logger, logs))
+		os.Exit(runMCP(cfg, cfgErr, logger, logs))
 	}
 }
 
@@ -300,7 +316,7 @@ func startPanelGenerators(ctx context.Context, cfg *config.Config, reg *registry
 // server in parallel. Either returning is treated as a normal shutdown
 // signal for the whole process — Claude Code expects an MCP server to
 // exit cleanly when its stdio peer closes.
-func runMCP(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int {
+func runMCP(cfg *config.Config, cfgErr error, logger *log.Logger, logs *logbuf.Buffer) int {
 	st := state.New()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -320,16 +336,30 @@ func runMCP(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int {
 		defer wg.Done()
 		defer cancel()
 		mcpSrv := mcp.NewServer(mcp.Deps{
-			Cfg:      cfg,
-			State:    st,
-			Logs:     logs,
-			Registry: openRegistry(logger),
-			Version:  Version,
+			Cfg:       cfg,
+			State:     st,
+			Logs:      logs,
+			Registry:  openRegistry(logger),
+			Version:   Version,
+			ConfigErr: cfgErr,
 		})
 		if err := mcpserver.ServeStdio(mcpSrv); err != nil && !errors.Is(err, context.Canceled) {
 			logger.Printf("mcp stdio: %v", err)
 		}
 	}()
+
+	if cfgErr != nil {
+		// Degraded start: tools up so the user can be told what is wrong, but
+		// no broker. The config we are holding is invented (config.Unusable),
+		// so serving devices with it would answer every signed request with
+		// the wrong key — worse than not answering at all. It also must never
+		// win leader election and displace a healthy peer that CAN serve.
+		logger.Printf("config: %v", cfgErr)
+		logger.Printf("config: starting degraded — MCP tools only, broker NOT started. " +
+			"Fix the config and restart; run tokenmonitor_health for details.")
+		wg.Wait()
+		return 0
+	}
 
 	wg.Add(1)
 	go func() {

@@ -56,6 +56,10 @@ class Deps:
     logs: Buffer
     registry: Registry | None
     version: str
+    # Set when the config failed to load and the process is running degraded:
+    # the tools are up (so the user can be told what is wrong) but cfg is
+    # invented and no broker is serving. Reported by tokenmonitor_health.
+    config_err: Exception | None = None
 
 
 def _broker_addr(cfg: Config) -> str:
@@ -322,6 +326,28 @@ async def _check_updates(deps: Deps, args: dict) -> dict:
 
 async def _health(deps: Deps) -> dict:
     checks = []
+    # First, because when the config failed everything below is reporting on an
+    # invented config and a broker that was never started — this check is the
+    # explanation for all of it.
+    if deps.config_err is not None:
+        checks.append({
+            "name": "config",
+            "pass": False,
+            "detail": f"{deps.config_err} — running degraded: MCP tools only, no broker. "
+                      "Fix the config and restart.",
+        })
+    elif deps.cfg.salvaged:
+        # Serving, but not with everything the user wrote. Failing the check is
+        # the point: it is the only way they find out.
+        checks.append({
+            "name": "config",
+            "pass": False,
+            "detail": "loaded with sections ignored (the rest of the file is in effect): "
+                      + "; ".join(deps.cfg.salvaged),
+        })
+    else:
+        checks.append({"name": "config", "pass": True, "detail": "loaded"})
+
     try:
         c = creds.load(deps.cfg.oauth_path_abs())
         if c.is_expired(int(time.time() * 1000)):

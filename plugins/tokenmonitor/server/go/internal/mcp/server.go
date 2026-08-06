@@ -53,6 +53,11 @@ type Deps struct {
 	Logs     *logbuf.Buffer
 	Registry *registry.Registry
 	Version  string
+	// ConfigErr is set when the config failed to load and the process is
+	// running degraded: the tools are up (so the user can be told what is
+	// wrong) but Cfg is invented and no broker is serving. Reported by
+	// tokenmonitor_health.
+	ConfigErr error
 }
 
 // NewServer wires the four tools onto a fresh MCP server. Caller is
@@ -333,6 +338,22 @@ type healthCheck struct {
 func handleHealth(d Deps) server.ToolHandlerFunc {
 	return func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		var checks []healthCheck
+
+		// 0. config. First, because when it failed everything below is
+		//    reporting on an invented config and a broker that was never
+		//    started — this check is the explanation for all of it.
+		switch s := d.Cfg.Salvaged(); {
+		case d.ConfigErr != nil:
+			checks = append(checks, healthCheck{"config", false,
+				d.ConfigErr.Error() + " — running degraded: MCP tools only, no broker. Fix the config and restart."})
+		case len(s) > 0:
+			// Serving, but not with everything the user wrote. Failing the
+			// check is the point: it is the only way they find out.
+			checks = append(checks, healthCheck{"config", false,
+				"loaded with sections ignored (the rest of the file is in effect): " + strings.Join(s, "; ")})
+		default:
+			checks = append(checks, healthCheck{"config", true, "loaded"})
+		}
 
 		// 1. credentials file.
 		c, err := creds.Load(d.Cfg.OAuthPath())

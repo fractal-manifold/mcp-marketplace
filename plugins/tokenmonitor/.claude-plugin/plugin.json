@@ -1,6 +1,6 @@
 {
   "name": "tokenmonitor",
-  "version": "0.11.3",
+  "version": "0.11.4",
   "description": "Registers tokenmonitor-mcp — the local broker for the TokenMonitor ESP32 device. Provides 17 diagnostic and control tools (status/health/logs, device registry + provisioning, WiFi changes, USB serial provisioning, config + firmware OTA staging, revert and update checks) and four on-device skills (/tokenmonitor:configure for first-time pairing, /tokenmonitor:settings to remotely change any runtime setting the on-device Settings panel exposes, /tokenmonitor:theme as a shortcut for Day/Night/Auto theme switching, /tokenmonitor:firmware to push an OTA build). Runs alongside Claude Code with leader-elected coexistence so multiple sessions and an existing systemd daemon don't fight over the broker port. Self-contained: bundles the MCP server under server/ and resolves its runtime (Node, Python or Go) on first launch into a per-user cache — no separate go install / pipx / npm step. On a host with no language toolchain it downloads a verified prebuilt Go binary for your platform instead of compiling.",
   "author": {
     "name": "fractal-manifold",

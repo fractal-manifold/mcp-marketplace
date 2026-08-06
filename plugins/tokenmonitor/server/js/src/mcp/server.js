@@ -227,6 +227,26 @@ async function checkUpdatesTool(deps, args) {
 
 async function healthTool(deps) {
   const checks = [];
+  // First, because when the config failed everything below is reporting on an
+  // invented config and a broker that was never started — this check is the
+  // explanation for all of it.
+  if (deps.configErr) {
+    checks.push({
+      name: "config",
+      pass: false,
+      detail: `${deps.configErr.message} — running degraded: MCP tools only, no broker. Fix the config and restart.`,
+    });
+  } else if (deps.cfg.salvaged && deps.cfg.salvaged.length > 0) {
+    // Serving, but not with everything the user wrote. Failing the check is the
+    // point: it is the only way they find out.
+    checks.push({
+      name: "config",
+      pass: false,
+      detail: `loaded with sections ignored (the rest of the file is in effect): ${deps.cfg.salvaged.join("; ")}`,
+    });
+  } else {
+    checks.push({ name: "config", pass: true, detail: "loaded" });
+  }
   try {
     const c = creds.load(deps.cfg.oauthPathAbs());
     if (c.isExpired(Date.now())) checks.push({ name: "credentials", pass: false, detail: `token expired at ${c.expiresAtISO()}` });
