@@ -215,24 +215,31 @@ func TestPanel_ExplicitPerDeviceFileWins(t *testing.T) {
 	}
 }
 
-// TestPanel_ServesCompatGolden round-trips a shared contract golden byte-exact
+// TestPanel_ServesCompatGolden round-trips shared contract goldens byte-exact
 // (skips in a standalone marketplace checkout where compat/ is absent).
+//
+// grid_rows.json is the one that matters for the dumb-pipe promise: its `tiles`
+// holds arrays rather than tile objects, and the broker must still not care.
 func TestPanel_ServesCompatGolden(t *testing.T) {
-	golden := findCompatPanelGolden(t, "session_line.json")
-	want, err := os.ReadFile(golden)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ts, reg := newPanelServer(t, func(c *config.Config) { c.Panel.File = config.PanelPaths{"default": golden} })
-	psk := registerPanelDevice(t, reg)
-	resp := signedPanelRequest(t, ts, psk, panelTestID, false)
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-	got, _ := io.ReadAll(resp.Body)
-	if string(got) != string(want) {
-		t.Fatalf("golden byte mismatch")
+	for _, name := range []string{"session_line.json", "grid_rows.json"} {
+		t.Run(name, func(t *testing.T) {
+			golden := findCompatPanelGolden(t, name)
+			want, err := os.ReadFile(golden)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ts, reg := newPanelServer(t, func(c *config.Config) { c.Panel.File = config.PanelPaths{"default": golden} })
+			psk := registerPanelDevice(t, reg)
+			resp := signedPanelRequest(t, ts, psk, panelTestID, false)
+			defer resp.Body.Close()
+			if resp.StatusCode != 200 {
+				t.Fatalf("status = %d, want 200", resp.StatusCode)
+			}
+			got, _ := io.ReadAll(resp.Body)
+			if string(got) != string(want) {
+				t.Fatalf("golden byte mismatch")
+			}
+		})
 	}
 }
 

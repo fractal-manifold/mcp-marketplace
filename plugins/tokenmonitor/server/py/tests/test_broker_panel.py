@@ -149,8 +149,11 @@ def _compat_golden(name: str) -> str | None:
     return None
 
 
-async def test_serves_compat_golden(tmp_path):
-    golden = _compat_golden("session_line.json")
+# grid_rows.json is the one that matters for the dumb-pipe promise: its `tiles`
+# holds arrays rather than tile objects, and the broker must still not care.
+@pytest.mark.parametrize("name", ["session_line.json", "grid_rows.json"])
+async def test_serves_compat_golden(tmp_path, name):
+    golden = _compat_golden(name)
     if golden is None:
         pytest.skip("compat/panel/golden not found (standalone checkout)")
     want = Path(golden).read_bytes()

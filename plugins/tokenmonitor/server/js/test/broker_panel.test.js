@@ -206,20 +206,24 @@ test("explicit [panel.file].<id> wins over dir and default", async () => {
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
 
-test("serves compat golden byte-exact", async () => {
-  const here = dirname(fileURLToPath(import.meta.url));
-  let golden = null;
-  let dir = here;
-  for (let i = 0; i < 9; i++) {
-    const cand = join(dir, "compat", "panel", "golden", "session_line.json");
-    if (existsSync(cand)) { golden = cand; break; }
-    const parent = dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  if (!golden) { return; } // standalone checkout: compat/ absent
-  const want = readFileSync(golden, "utf8");
-  const res = await run({ file: golden });
-  assert.equal(res.statusCode, 200);
-  assert.equal(res.body, want);
-});
+// grid_rows.json is the one that matters for the dumb-pipe promise: its `tiles`
+// holds arrays rather than tile objects, and the broker must still not care.
+for (const name of ["session_line.json", "grid_rows.json"]) {
+  test(`serves compat golden byte-exact (${name})`, async () => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    let golden = null;
+    let dir = here;
+    for (let i = 0; i < 9; i++) {
+      const cand = join(dir, "compat", "panel", "golden", name);
+      if (existsSync(cand)) { golden = cand; break; }
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    if (!golden) { return; } // standalone checkout: compat/ absent
+    const want = readFileSync(golden, "utf8");
+    const res = await run({ file: golden });
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body, want);
+  });
+}
