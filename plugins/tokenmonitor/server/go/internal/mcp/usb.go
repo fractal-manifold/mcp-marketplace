@@ -134,7 +134,7 @@ func handleUSBScan(d Deps) server.ToolHandlerFunc {
 		ports, err := usbprov.Enumerate()
 		if err != nil {
 			if errors.Is(err, usbprov.ErrEnumerateUnsupported) {
-				return mcp.NewToolResultError("USB scan is not supported on this OS yet (Linux is the reference path; macOS/Windows enumeration is deferred). Use SoftAP + LAN provisioning instead."), nil
+				return mcp.NewToolResultError("USB scan is not supported on this OS yet (Linux and macOS are supported; Windows enumeration is deferred). Use SoftAP + LAN provisioning instead."), nil
 			}
 			return mcp.NewToolResultErrorFromErr("usb enumerate", err), nil
 		}

@@ -73,7 +73,7 @@ export async function handleUSBScan(deps, args) {
     if (e instanceof EnumerateUnsupportedError) {
       return {
         error:
-          "USB scan is not supported on this OS yet (Linux is the reference path; macOS/Windows enumeration is deferred). Use SoftAP + LAN provisioning instead.",
+          "USB scan is not supported on this OS yet (Linux and macOS are supported; Windows enumeration is deferred). Use SoftAP + LAN provisioning instead.",
       };
     }
     return { error: `usb enumerate: ${e.message}` };
@@ -150,7 +150,7 @@ export async function handleUSBProvision(deps, args) {
       if (e instanceof EnumerateUnsupportedError) {
         return {
           error:
-            "USB provisioning is not supported on this OS yet (Linux is the reference path). Use SoftAP + LAN provisioning instead.",
+            "USB provisioning is not supported on this OS yet (Linux and macOS are supported; Windows is deferred). Use SoftAP + LAN provisioning instead.",
         };
       }
       return { error: `usb enumerate: ${e.message}` };

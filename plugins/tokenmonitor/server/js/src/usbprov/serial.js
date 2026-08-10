@@ -208,7 +208,13 @@ export class Handle {
 // auto-reset). The flock is taken BEFORE the device is opened, closing the race
 // where two cooperating runtimes both open the port in the leader-election gap.
 export async function openExclusive(path) {
-  if (process.platform !== "linux") throw new OpenUnsupportedError();
+  // POSIX only. Linux + macOS share the whole implementation below: the flock
+  // (fs-ext) and the serialport `lock:true` open both work on darwin, and
+  // lockDir() falls back to /tmp/tokenmonitor-<euid> when /run/user is absent
+  // (as it is on macOS). Windows has no flock/exclusive-open analogue here yet.
+  if (process.platform !== "linux" && process.platform !== "darwin") {
+    throw new OpenUnsupportedError();
+  }
   const canonical = canonicalPort(path);
   // Lock BEFORE opening the device.
   const lockFd = acquirePortLockFd(canonical);

@@ -99,7 +99,7 @@ the authoritative schemas):
 | `tokenmonitor_provision`      | Send the initial config to a device in BOOT_NEEDS_CONFIG. |
 | `tokenmonitor_check_updates`  | Poll the public OTA releases repo and stage a pending OTA per matching, out-of-date device. |
 | `tokenmonitor_set_wifi`       | Stage a WiFi change for a registered device. Needs `pass` unless the device has reported that it already remembers the SSID; refuses a remembered **open** network, which the device never auto-joins. |
-| `tokenmonitor_usb_scan`       | Enumerate TokenMonitor devices on the serial bus, with a match tier per port. **Linux only** — macOS/Windows enumeration is not implemented. |
+| `tokenmonitor_usb_scan`       | Enumerate TokenMonitor devices on the serial bus, with a match tier per port. **Linux + macOS** (sysfs / `ioreg`); Windows enumeration is not yet implemented. |
 | `tokenmonitor_usb_provision`  | Provision or reconfigure a device over the USB cable: WiFi, broker URL and PSK in one payload, independent of the LAN. |
 
 ## Coexistence with `service-go`

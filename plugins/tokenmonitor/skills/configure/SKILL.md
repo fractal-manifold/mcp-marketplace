@@ -49,13 +49,14 @@ USB for a brand-new device (one step instead of two), LAN for a device already
 showing "Waiting for setup", and USB for a "change the WiFi / it's on a
 different network" request.
 
-**USB works on Linux only, today.** Port enumeration is implemented for Linux
-and returns "not supported" everywhere else — all three runtimes do the same
-thing, so switching runtime does not help. On macOS or Windows,
-`tokenmonitor_usb_scan` answers:
+**USB works on Linux and macOS today; Windows is still deferred.** Linux
+enumerates via sysfs; macOS via `ioreg` (IORegistry → `/dev/cu.*` callout
+nodes). Both open the port exclusively (flock + TIOCEXCL). All three runtimes
+(go/py/js) implement the same two platforms, so switching runtime does not
+change what is supported. On Windows, `tokenmonitor_usb_scan` answers:
 
-> USB scan is not supported on this OS yet (Linux is the reference path;
-> macOS/Windows enumeration is deferred). Use SoftAP + LAN provisioning instead.
+> USB scan is not supported on this OS yet (Linux and macOS are supported;
+> Windows enumeration is deferred). Use SoftAP + LAN provisioning instead.
 
 Take that at face value and use a LAN path — do not go looking for a cable
 problem. WSL2 is a separate matter: it is a Hyper-V VM that receives no USB

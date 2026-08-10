@@ -1,13 +1,16 @@
 """Serial-port enumeration and iSerial helpers.
 
-Port of tokenmonitor-mcp/internal/usbprov/enum.go + enum_linux.go. Linux is
-the reference path (sysfs, dependency-free); macOS/Windows raise the
-unsupported error like Go rather than silently finding nothing.
+Port of tokenmonitor-mcp/internal/usbprov/enum.go + enum_linux.go + enum_darwin.go.
+Linux is the reference path (sysfs, dependency-free); macOS is enumerated via
+``ioreg`` (IORegistry → /dev/cu.* callout nodes); Windows still raises the
+unsupported error rather than silently finding nothing.
 """
 
 from __future__ import annotations
 
 import os
+import plistlib
+import subprocess
 import sys
 from dataclasses import dataclass
 
@@ -63,7 +66,9 @@ def enumerate() -> list[Port]:
     are layered on top by the scan, never here. Never opens a port."""
     if sys.platform.startswith("linux"):
         return _enumerate_sysfs("/sys/class/tty", "/dev")
-    # macOS/Windows enumeration is deferred, matching the Go stubs.
+    if sys.platform == "darwin":
+        return _enumerate_ioreg()
+    # Windows enumeration is still deferred, matching the Go stub.
     raise EnumerateUnsupported(
         "usbprov: serial enumeration not implemented on this OS yet"
     )
@@ -134,3 +139,88 @@ def _read_attr(d: str, attr: str) -> str | None:
             return f.read().strip()
     except OSError:
         return None
+
+
+# --- macOS enumeration (ioreg) ---------------------------------------------
+# macOS has no sysfs. The IORegistry is the source of truth: each USB serial
+# device hangs an IOSerialBSDClient node exposing "IOCalloutDevice" (/dev/cu.*),
+# while the USB idVendor/idProduct/iSerial live on an ANCESTOR IOUSBHostDevice
+# node. We read the IOUSBHostDevice subtree as an XML plist (``ioreg -a``) and
+# inherit vid/pid/serial down to each callout node — the same shape sysfs gives
+# on Linux. Mirrors go/internal/usbprov/enum_darwin.go and the JS enum.js.
+
+
+def _enumerate_ioreg() -> list[Port]:
+    """List macOS USB serial ports via ``ioreg``. An empty tree yields []. A
+    broken ioreg invocation (missing binary, timeout, non-zero exit, malformed
+    plist) raises a plain RuntimeError — NOT EnumerateUnsupported, which the MCP
+    handler would translate into the misleading "macOS is supported, only
+    Windows is deferred" message and swallow the real diagnostic."""
+    try:
+        out = subprocess.run(
+            ["ioreg", "-a", "-r", "-l", "-c", "IOUSBHostDevice"],
+            capture_output=True,
+            timeout=5,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as e:
+        raise RuntimeError(f"usbprov: ioreg failed: {e}") from e
+    if not out or not out.strip():
+        return []  # no IOUSBHostDevice present
+    try:
+        root = plistlib.loads(out)
+    except Exception as e:  # noqa: BLE001 - malformed plist is a hard failure
+        raise RuntimeError(f"usbprov: parse ioreg plist: {e}") from e
+    return _enumerate_from_plist(root)
+
+
+def _enumerate_from_plist(root) -> list[Port]:
+    """Testable core: walk the IORegistry plist tree, inheriting the nearest
+    ancestor's USB vid/pid/iSerial down to every node carrying an
+    IOCalloutDevice, and emit one Port per callout (de-duplicated by path)."""
+    ports: list[Port] = []
+    seen: set[str] = set()
+
+    def visit(node, vid, pid, serial):
+        if not isinstance(node, dict):
+            return
+        v = node.get("idVendor")
+        if isinstance(v, int):
+            vid = v
+        p = node.get("idProduct")
+        if isinstance(p, int):
+            pid = p
+        s = node.get("kUSBSerialNumberString")
+        if not isinstance(s, str) or not s:
+            s = node.get("USB Serial Number")
+        if isinstance(s, str) and s:
+            serial = s
+        callout = node.get("IOCalloutDevice")
+        if (
+            isinstance(callout, str)
+            and callout
+            and callout not in seen
+            and isinstance(vid, int)
+            and isinstance(pid, int)
+            and 0 <= vid <= 0xFFFF
+            and 0 <= pid <= 0xFFFF
+        ):
+            seen.add(callout)
+            ports.append(
+                Port(
+                    path=callout,
+                    vid=vid,
+                    pid=pid,
+                    serial=serial or "",
+                    serial_norm=normalize_serial(serial or ""),
+                )
+            )
+        kids = node.get("IORegistryEntryChildren")
+        if isinstance(kids, list):
+            for k in kids:
+                visit(k, vid, pid, serial)
+
+    roots = root if isinstance(root, list) else [root]
+    for r in roots:
+        visit(r, None, None, "")
+    return ports

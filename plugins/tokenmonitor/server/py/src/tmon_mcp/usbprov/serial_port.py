@@ -4,8 +4,9 @@ Port of tokenmonitor-mcp/internal/usbprov/serial.go + serial_linux.go. The
 lock-file identity is byte-identical to Go's (this is the cross-runtime
 contract): SHA-256(canonical_path_utf8) rendered full-64-lowercase-hex, filename
 `serial-<hex>.lock`, in `/run/user/<euid>/tokenmonitor/` when `/run/user/<euid>`
-exists else `/tmp/tokenmonitor-<euid>/` (0700). Linux only; other platforms
-raise OpenUnsupported like Go.
+exists else `/tmp/tokenmonitor-<euid>/` (0700). POSIX (Linux + macOS); macOS
+reuses the same raw fcntl/termios path (BSD-correct TIOCEXCL/TIOCM_* values come
+from Python's termios). Windows raises OpenUnsupported like Go.
 
 See compat/PROVISION_WIRE.md §6 "OS-exclusive serial open".
 """
@@ -23,8 +24,13 @@ from dataclasses import dataclass
 from typing import Callable
 
 _IS_LINUX = sys.platform.startswith("linux")
+_IS_DARWIN = sys.platform == "darwin"
+# POSIX open path (Linux + macOS): raw fcntl/termios, flock, TIOCEXCL. macOS
+# Python's termios exposes the BSD-correct TIOCEXCL/TIOCMBIC/TIOCM_* values, so
+# the implementation below is shared verbatim. Windows has no equivalent yet.
+_IS_POSIX = _IS_LINUX or _IS_DARWIN
 
-if _IS_LINUX:
+if _IS_POSIX:
     import fcntl
     import termios
 
@@ -139,7 +145,7 @@ def acquire_port_lock(canonical: str) -> Callable[[], None]:
     and termios, i.e. the firmware-log tailer. Same lock OpenExclusive uses.
     Raises PortBusy (retryable) if held. Returns a release callable to run on
     every exit path."""
-    if not _IS_LINUX:
+    if not _IS_POSIX:
         raise OpenUnsupported("usbprov: port lock is not supported on this platform")
     lock = _acquire_lock_in(_lock_dir(), canonical)
     return lock.release
@@ -260,7 +266,7 @@ def open_exclusive(path: str) -> Handle:
     raw mode with DTR/RTS cleared. The flock is taken on a separate lock-file
     BEFORE the device is opened, closing the race where two cooperating runtimes
     both open the port in the leader-election gap. Raises PortBusy if held."""
-    if not _IS_LINUX:
+    if not _IS_POSIX:
         raise OpenUnsupported("usbprov: exclusive serial open is not supported on this platform")
     canonical = canonical_port(path)
     lock = _acquire_lock_in(_lock_dir(), canonical)

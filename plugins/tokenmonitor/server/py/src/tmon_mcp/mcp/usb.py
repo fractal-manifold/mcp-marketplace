@@ -72,8 +72,8 @@ async def handle_usb_scan(deps, args: dict) -> dict:
         ports = usbprov.enumerate()
     except usbprov.EnumerateUnsupported:
         return {
-            "error": "USB scan is not supported on this OS yet (Linux is the reference path; "
-            "macOS/Windows enumeration is deferred). Use SoftAP + LAN provisioning instead."
+            "error": "USB scan is not supported on this OS yet (Linux and macOS are supported; "
+            "Windows enumeration is deferred). Use SoftAP + LAN provisioning instead."
         }
     except Exception as e:  # noqa: BLE001
         return {"error": f"usb enumerate: {e}"}

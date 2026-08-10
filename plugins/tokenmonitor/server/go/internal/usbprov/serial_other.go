@@ -1,11 +1,11 @@
-//go:build !linux
+//go:build !linux && !darwin
 
 package usbprov
 
-// openExclusive is unimplemented off Linux (macOS/Windows are deferred, matching
-// the enumerate stubs). The lock/termios plumbing is Unix-ioctl-specific and
-// will be ported alongside per-OS enumeration.
+// openExclusive is unimplemented off POSIX (Linux + macOS are handled by
+// serial_posix.go; Windows is still deferred, matching the enumerate stub). The
+// lock/termios plumbing is Unix-ioctl-specific.
 func openExclusive(string) (*Handle, error) { return nil, ErrOpenUnsupported }
 
-// AcquirePortLock is unimplemented off Linux (see openExclusive).
+// AcquirePortLock is unimplemented off POSIX (see openExclusive).
 func AcquirePortLock(string) (func() error, error) { return nil, ErrOpenUnsupported }
