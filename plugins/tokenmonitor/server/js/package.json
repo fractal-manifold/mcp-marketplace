@@ -1,7 +1,8 @@
 {
   "name": "tokenmonitor-mcp-js",
-  "version": "0.12.0",
+  "version": "1.0.0",
   "description": "Node.js implementation of tokenmonitor-mcp: HTTP credentials broker + MCP server for the TokenMonitor ESP32",
+  "license": "MIT",
   "type": "module",
   "engines": { "node": ">=20" },
   "bin": { "tokenmonitor-mcp-js": "src/index.js" },

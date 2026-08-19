@@ -1,6 +1,6 @@
 {
   "name": "tokenmonitor",
-  "version": "0.12.0",
+  "version": "1.0.0",
   "description": "Registers tokenmonitor-mcp, the local broker and control plane for TokenMonitor devices.",
   "author": {
     "name": "fractal-manifold",
@@ -8,7 +8,7 @@
   },
   "homepage": "https://github.com/fractal-manifold/tokenmonitor",
   "repository": "https://github.com/fractal-manifold/mcp-marketplace",
-  "license": "Apache-2.0",
+  "license": "MIT",
   "keywords": [
     "mcp",
     "tokenmonitor",
