@@ -16,6 +16,13 @@ export class State {
     this._role = Role.UNKNOWN;
     this._roleSince = Math.floor(Date.now() / 1000);
     this._lastAt = 0;
+    // Millisecond twin of _lastAt, kept because the mDNS idle watchdog
+    // compares against a 30 s threshold on a 30 s tick: truncating to whole
+    // seconds can move the crossing a whole tick earlier, not a second. Go
+    // keeps a time.Time and Python a float, so this is what makes the three
+    // runtimes decide alike. Stays 0 until the first request — the publisher
+    // relies on falsy-zero to fall back to its own start time.
+    this._lastAtMs = 0;
     this._lastRemote = "";
     this._lastStatus = 0;
     this._count = 0;
@@ -31,10 +38,20 @@ export class State {
     this._roleSince = Math.floor(Date.now() / 1000);
   }
   recordRequest(remote, status, when) {
-    this._lastAt = when ?? Math.floor(Date.now() / 1000);
+    // One clock read: two fields sampled from different nows could place
+    // _lastAtMs before _lastAt across a second boundary.
+    const nowMs = Date.now();
+    this._lastAt = when ?? Math.floor(nowMs / 1000);
+    this._lastAtMs = when != null ? when * 1000 : nowMs;
     this._lastRemote = remote || "";
     this._lastStatus = status;
     this._count += 1;
+  }
+  // lastRequestAt reports when a device last hit the broker, as epoch
+  // milliseconds (0 if never). The mDNS publisher reads it to decide whether
+  // its advertisement has gone unheard and should be re-announced.
+  lastRequestAt() {
+    return this._lastAtMs;
   }
   // setUpdate records the latest broker self-version-check result. The
   // update-check poller pokes this; the broker /sync handler and the MCP

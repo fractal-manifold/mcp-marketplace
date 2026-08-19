@@ -128,7 +128,9 @@ async def _run_daemon(cfg, logs: Buffer, logger: logging.Logger) -> int:
     mdns_pub: MdnsPublisher | None = None
     if registry is not None:
         try:
-            mdns_pub = await MdnsPublisher.start(cfg.server.bind, cfg.server.port, registry)
+            mdns_pub = await MdnsPublisher.start(
+                cfg.server.bind, cfg.server.port, registry,
+                state.last_request_at_epoch)
         except Exception as e:  # noqa: BLE001
             logger.warning("mdns: %s (broker discovery disabled)", e)
     # Pull-OTA poller (inert unless [ota] is configured). This process is the
@@ -219,7 +221,9 @@ async def _run_mcp(cfg, logs: Buffer, logger: logging.Logger, cfg_err: Exception
         mdns_pub: MdnsPublisher | None = None
         if registry is not None:
             try:
-                mdns_pub = await MdnsPublisher.start(cfg.server.bind, cfg.server.port, registry)
+                mdns_pub = await MdnsPublisher.start(
+                    cfg.server.bind, cfg.server.port, registry,
+                    state.last_request_at_epoch)
             except Exception as e:  # noqa: BLE001
                 logger.warning("mdns: %s (broker discovery disabled)", e)
         # Pull-OTA poller, scoped to leadership: it shares the same `stop`

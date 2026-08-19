@@ -144,7 +144,8 @@ async function runDaemon(cfg, logs, logger) {
   logger.info(`broker: serving on ${cfg.server.bind}:${cfg.server.port}`);
   let mdnsPub = null;
   if (registry) {
-    try { mdnsPub = await MdnsPublisher.start(cfg.server.bind, cfg.server.port, registry, logger); }
+    try { mdnsPub = await MdnsPublisher.start(cfg.server.bind, cfg.server.port, registry, logger,
+        () => state.lastRequestAt()); }
     catch (e) { logger.warn(`mdns: ${e.message} (broker discovery disabled)`); }
   }
   // Pull-OTA poller (inert unless [ota] is configured). This process is the
@@ -249,7 +250,8 @@ async function runMCP(cfg, logs, logger, configErr = null) {
     // the LAN.
     let mdnsPub = null;
     if (registry) {
-      try { mdnsPub = await MdnsPublisher.start(cfg.server.bind, cfg.server.port, registry, logger); }
+      try { mdnsPub = await MdnsPublisher.start(cfg.server.bind, cfg.server.port, registry, logger,
+        () => state.lastRequestAt()); }
       catch (e) { logger.warn(`mdns: ${e.message} (broker discovery disabled)`); }
     }
     // Pull-OTA poller, scoped to leadership: it shares the leader's abort

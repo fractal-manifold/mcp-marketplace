@@ -58,6 +58,15 @@ func New() *State {
 	return &State{role: RoleUnknown, roleSince: time.Now()}
 }
 
+// LastRequestAt reports when a device last hit the broker, zero if never.
+// The mDNS publisher reads it to decide whether its advertisement has gone
+// unheard and should be re-announced.
+func (s *State) LastRequestAt() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastRequestAt
+}
+
 // SetRole records a role transition. No-op if the role didn't change.
 func (s *State) SetRole(r Role) {
 	s.mu.Lock()

@@ -95,6 +95,15 @@ class State:
             self._last_status = status
             self._count += 1
 
+    def last_request_at_epoch(self) -> float:
+        """When a device last hit the broker (epoch seconds), 0.0 if never.
+
+        The mDNS publisher reads it to decide whether its advertisement has
+        gone unheard and should be re-announced.
+        """
+        with self._lock:
+            return self._last_at
+
     def set_update(self, info: UpdateInfo) -> None:
         """Record the latest broker self-version-check result. The update-check
         poller pokes this concurrently; the broker /sync handler and the MCP

@@ -180,7 +180,7 @@ func runDaemon(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int 
 	lease := usbprov.NewLeaseManager(serialCtrl, 0)
 
 	reg := openRegistry(logger)
-	mdnsPub := startMDNS(ctx, cfg, reg, logger)
+	mdnsPub := startMDNS(ctx, cfg, reg, st, logger)
 	defer mdnsPub.Close()
 	// Custom-panel generators: leader-scoped (daemon mode is always the
 	// leader). No-op when [panel.command] is unconfigured.
@@ -203,11 +203,15 @@ func runDaemon(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int 
 // *mdns.Publisher even on failure so the caller can defer Close
 // unconditionally. Loopback binds and registry-less setups both yield
 // the no-op publisher.
-func startMDNS(ctx context.Context, cfg *config.Config, reg *registry.Registry, logger *log.Logger) *mdns.Publisher {
+//
+// Both call sites are leader-scoped by construction — only the process that
+// owns the bound port should be answering "I'm the broker" on the LAN — so
+// the idle watchdog inside never fires on a follower that serves nothing.
+func startMDNS(ctx context.Context, cfg *config.Config, reg *registry.Registry, st *state.State, logger *log.Logger) *mdns.Publisher {
 	if reg == nil {
 		return &mdns.Publisher{}
 	}
-	p, err := mdns.Start(ctx, cfg.Server.Bind, cfg.Server.Port, reg, logger)
+	p, err := mdns.Start(ctx, cfg.Server.Bind, cfg.Server.Port, reg, st.LastRequestAt, logger)
 	if err != nil {
 		logger.Printf("mdns: %v (broker discovery disabled)", err)
 		return &mdns.Publisher{}
@@ -379,7 +383,7 @@ func runMCP(cfg *config.Config, cfgErr error, logger *log.Logger, logs *logbuf.B
 			// mDNS publication is scoped to the leader: only the
 			// process that actually owns the bound port should be
 			// answering "I'm the broker" on the LAN.
-			mdnsPub := startMDNS(c, cfg, reg, logger)
+			mdnsPub := startMDNS(c, cfg, reg, st, logger)
 			defer mdnsPub.Close()
 			// Custom-panel generators, scoped to the leader's lifecycle
 			// so exactly one process spawns them; torn down (SIGTERM →

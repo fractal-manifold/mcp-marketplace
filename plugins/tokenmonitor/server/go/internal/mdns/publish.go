@@ -99,14 +99,124 @@ type devIDLister interface {
 // its multicast sockets at Register time, so both go stale otherwise.
 // Construct via Start; stop with Close (or by cancelling the context
 // passed to Start).
+// mdnsServer is the sliver of *zeroconf.Server the publisher actually uses.
+// It exists so tick() can be driven in a test without opening multicast
+// sockets; production always holds a real *zeroconf.Server.
+type mdnsServer interface {
+	Shutdown()
+	SetText(text []string)
+}
+
+// registerService is the seam the tests replace. It must never hand back a
+// typed nil: a (*zeroconf.Server)(nil) parked in the interface would make
+// `srv == nil` false, and that comparison is the only thing that retries a
+// failed republish (on failure tick() also advances lastIfp, so the
+// address-changed term will not fire again).
+var registerService = func(instance, service, domain string, port int,
+	text []string, ifaces []net.Interface) (mdnsServer, error) {
+	srv, err := zeroconf.Register(instance, service, domain, port, text, ifaces)
+	if err != nil {
+		return nil, err
+	}
+	return srv, nil
+}
+
 type Publisher struct {
-	server   *zeroconf.Server
+	server   mdnsServer
 	mu       sync.Mutex
 	lastTxt  string
 	lastIfp  string // fingerprint of the advertised interface addresses
 	instance string
 	port     int
 	closed   bool
+
+	// Idle-liveness watchdog. If no device has hit us for idleThreshold we
+	// re-announce, on the theory that our own advertisement is what went
+	// stale — an interface that flapped, a zeroconf server that wedged, an
+	// announcement lost in a lossy multicast domain. Bounded by a doubling
+	// backoff so a device that is simply switched off does not have us
+	// multicasting every 30 s forever.
+	lastReq        func() time.Time // when a device last hit the broker
+	startedAt      time.Time        // stands in for lastReq before the first hit
+	lastSeenReq    time.Time        // lastReq as of the previous check
+	idleAttempts   int
+	lastReannounce time.Time
+}
+
+// Idle-liveness constants. The threshold matches the refresh tick, so an idle
+// broker re-announces on the first tick that notices. The backoff mirrors the
+// device's own discovery backoff (see
+// firmware/components/core/src/tmon_discovery.c) — same shape, so the two
+// sides of this recovery are read the same way.
+const (
+	idleThreshold = 30 * time.Second
+	reannounceMin = 30 * time.Second
+	reannounceMax = 5 * time.Minute
+)
+
+// reannounceGap is the wait after `attempts` idle re-announcements: the floor
+// for the first, doubling to the ceiling thereafter.
+func reannounceGap(attempts int) time.Duration {
+	gap := reannounceMin
+	for i := 1; i < attempts; i++ {
+		if gap >= reannounceMax/2 {
+			return reannounceMax
+		}
+		gap *= 2
+	}
+	return gap
+}
+
+// shouldReannounce is the pure decision behind the watchdog. `lastReq` must
+// already be normalised by the caller (the broker's start time stands in
+// before any device has ever hit us).
+//
+// devs == 0 means no device is registered here, so there is nobody our
+// advertisement could help and no reason to put packets on the LAN.
+func shouldReannounce(now, lastReq, lastReannounce time.Time, attempts, devs int) bool {
+	if devs == 0 {
+		return false
+	}
+	if now.Sub(lastReq) < idleThreshold {
+		return false
+	}
+	if lastReannounce.IsZero() {
+		return true
+	}
+	return now.Sub(lastReannounce) >= reannounceGap(attempts)
+}
+
+// takeIdleReannounce answers "is an idle re-announce due right now?" and, when
+// it is, consumes it: the caller must go on to republish. Returns how long we
+// have been idle, for the log line. Any request seen since the previous call
+// resets the backoff to the floor, however old that request is by now.
+func (p *Publisher) takeIdleReannounce(now time.Time, devs int) (bool, time.Duration) {
+	if p.lastReq == nil {
+		return false, 0
+	}
+	lastReq := p.lastReq()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if lastReq.IsZero() {
+		lastReq = p.startedAt
+	}
+	// Reset on a request we had not seen before, not on "the request we can
+	// see is recent". The loop ticks at the same 30 s as the threshold, so a
+	// request landing just after a tick is already 30 s old by the next one:
+	// keying the reset on freshness would miss it to scheduling jitter and
+	// leave the backoff out at five minutes.
+	if !lastReq.Equal(p.lastSeenReq) {
+		p.lastSeenReq = lastReq
+		p.idleAttempts = 0
+		p.lastReannounce = time.Time{}
+	}
+	if !shouldReannounce(now, lastReq, p.lastReannounce, p.idleAttempts, devs) {
+		return false, 0
+	}
+	p.idleAttempts++
+	p.lastReannounce = now
+	return true, now.Sub(lastReq)
 }
 
 // ifaceFingerprint condenses the advertised interfaces + their addresses
@@ -183,7 +293,10 @@ func buildTXT(devs []string) []string {
 // suppressed by design). Errors during initial Register are returned;
 // later refresh failures are logged, not propagated, since the broker
 // keeps serving regardless.
-func Start(ctx context.Context, bind string, port int, lister devIDLister, logger *log.Logger) (*Publisher, error) {
+//
+// lastReq reports when a device last hit the broker; it drives the idle
+// re-announce watchdog and may be nil to disable it.
+func Start(ctx context.Context, bind string, port int, lister devIDLister, lastReq func() time.Time, logger *log.Logger) (*Publisher, error) {
 	if isLoopback(bind) {
 		if logger != nil {
 			logger.Printf("mdns: bind=%s is loopback, skipping broker advertisement", bind)
@@ -207,7 +320,7 @@ func Start(ctx context.Context, bind string, port int, lister devIDLister, logge
 
 	instance := "tmon-broker-" + hostShort()
 	ifaces := physicalMulticastIfaces()
-	srv, err := zeroconf.Register(instance, ServiceType, "local.", port, txt, ifaces)
+	srv, err := registerService(instance, ServiceType, "local.", port, txt, ifaces)
 	if err != nil {
 		return nil, fmt.Errorf("mdns register: %w", err)
 	}
@@ -221,11 +334,13 @@ func Start(ctx context.Context, bind string, port int, lister devIDLister, logge
 	}
 
 	p := &Publisher{
-		server:   srv,
-		lastTxt:  strings.Join(txt, ";"),
-		lastIfp:  ifaceFingerprint(ifaces),
-		instance: instance,
-		port:     port,
+		server:    srv,
+		lastTxt:   strings.Join(txt, ";"),
+		lastIfp:   ifaceFingerprint(ifaces),
+		instance:  instance,
+		port:      port,
+		lastReq:   lastReq,
+		startedAt: time.Now(),
 	}
 
 	go p.refreshLoop(ctx, lister, logger)
@@ -235,6 +350,7 @@ func Start(ctx context.Context, bind string, port int, lister devIDLister, logge
 // refreshLoop polls the registry every 30s and pushes an updated TXT if
 // the device list changed. Cheap (a single readdir) and bounded — we
 // don't watch the filesystem to avoid bringing in inotify just for this.
+// The same tick runs the idle-liveness watchdog (takeIdleReannounce).
 func (p *Publisher) refreshLoop(ctx context.Context, lister devIDLister, logger *log.Logger) {
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
@@ -245,80 +361,106 @@ func (p *Publisher) refreshLoop(ctx context.Context, lister devIDLister, logger 
 			return
 		case <-t.C:
 		}
-		devs, err := lister.ListDeviceIDs()
-		if err != nil {
-			if logger != nil {
-				logger.Printf("mdns: refresh device list: %v", err)
-			}
-			continue
+		if !p.tick(lister, logger) {
+			return
 		}
-		txt := buildTXT(devs)
-		joined := strings.Join(txt, ";")
+	}
+}
 
-		// Interface addresses changed (DHCP renew, network switch): the
-		// registered A records and the multicast sockets are both stale —
-		// re-register from scratch. This is what lets a device rediscover
-		// the broker after the host moves LANs. A nil server (previous
-		// re-register failed, or initial addrs vanished) retries here too.
-		ifaces := physicalMulticastIfaces()
-		ifp := ifaceFingerprint(ifaces)
+// tick runs one refresh pass, extracted from the loop so a test can drive it
+// without opening multicast sockets. Each of the three causes folded into
+// needRepub below must independently produce a republish; an `|| idle`
+// quietly dropped from that expression is invisible to a test that only
+// exercises takeIdleReannounce.
+//
+// Returns false when the publisher has been closed and the loop should stop.
+func (p *Publisher) tick(lister devIDLister, logger *log.Logger) bool {
+	devs, err := lister.ListDeviceIDs()
+	if err != nil {
+		if logger != nil {
+			logger.Printf("mdns: refresh device list: %v", err)
+		}
+		return true
+	}
+	txt := buildTXT(devs)
+	joined := strings.Join(txt, ";")
+
+	// Interface addresses changed (DHCP renew, network switch): the
+	// registered A records and the multicast sockets are both stale —
+	// re-register from scratch. This is what lets a device rediscover
+	// the broker after the host moves LANs. A nil server (previous
+	// re-register failed, or initial addrs vanished) retries here too.
+	ifaces := physicalMulticastIfaces()
+	ifp := ifaceFingerprint(ifaces)
+	// Liveness: nobody has talked to us in a while, so re-announce in
+	// case it is our own advertisement that went stale. Consumed here
+	// (not inside the branch below) so the backoff advances exactly once
+	// per tick whatever the republish does.
+	idle, idleFor := p.takeIdleReannounce(time.Now(), len(devs))
+	if idle && logger != nil {
+		logger.Printf("mdns: no device traffic for %ds, re-announcing", int(idleFor.Seconds()))
+	}
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return false
+	}
+	srv := p.server
+	needRepub := ifp != p.lastIfp || srv == nil || idle
+	p.mu.Unlock()
+
+	if needRepub {
+		if srv != nil {
+			srv.Shutdown()
+		}
+		newSrv, err := registerService(p.instance, ServiceType, "local.", p.port, txt, ifaces)
 		p.mu.Lock()
 		if p.closed {
 			p.mu.Unlock()
-			return
+			if newSrv != nil {
+				newSrv.Shutdown()
+			}
+			return false
 		}
-		srv := p.server
-		needRepub := ifp != p.lastIfp || srv == nil
-		p.mu.Unlock()
-
-		if needRepub {
-			if srv != nil {
-				srv.Shutdown()
-			}
-			newSrv, err := zeroconf.Register(p.instance, ServiceType, "local.", p.port, txt, ifaces)
-			p.mu.Lock()
-			if p.closed {
-				p.mu.Unlock()
-				if newSrv != nil {
-					newSrv.Shutdown()
-				}
-				return
-			}
-			if err != nil {
-				// server == nil keeps needRepub true next tick.
-				p.server = nil
-				p.lastIfp = ifp
-				p.mu.Unlock()
-				if logger != nil {
-					logger.Printf("mdns: republish: %v", err)
-				}
-				continue
-			}
-			p.server = newSrv
+		if err != nil {
+			// server == nil keeps needRepub true next tick.
+			p.server = nil
 			p.lastIfp = ifp
-			p.lastTxt = joined
 			p.mu.Unlock()
 			if logger != nil {
-				logger.Printf("mdns: addresses changed, republished %s.%s.local. port=%d devs=%d",
-					p.instance, ServiceType, p.port, len(devs))
+				logger.Printf("mdns: republish: %v", err)
 			}
-			continue
+			return true
 		}
-
-		p.mu.Lock()
-		changed := joined != p.lastTxt
-		if changed {
-			p.lastTxt = joined
-		}
-		srv = p.server
+		p.server = newSrv
+		p.lastIfp = ifp
+		p.lastTxt = joined
 		p.mu.Unlock()
-		if changed && srv != nil {
-			srv.SetText(txt)
-			if logger != nil {
-				logger.Printf("mdns: TXT updated, devs=%d", len(devs))
+		if logger != nil {
+			why := "addresses changed"
+			if idle {
+				why = "idle"
 			}
+			logger.Printf("mdns: %s, republished %s.%s.local. port=%d devs=%d",
+				why, p.instance, ServiceType, p.port, len(devs))
+		}
+		return true
+	}
+
+	p.mu.Lock()
+	changed := joined != p.lastTxt
+	if changed {
+		p.lastTxt = joined
+	}
+	srv = p.server
+	p.mu.Unlock()
+	if changed && srv != nil {
+		srv.SetText(txt)
+		if logger != nil {
+			logger.Printf("mdns: TXT updated, devs=%d", len(devs))
 		}
 	}
+	return true
 }
 
 // Close releases the zeroconf server (idempotent). Safe to call after

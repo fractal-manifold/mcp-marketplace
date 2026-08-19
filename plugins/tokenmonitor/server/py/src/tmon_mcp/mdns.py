@@ -17,7 +17,8 @@ import hashlib
 import ipaddress
 import logging
 import socket
-from typing import Protocol
+import time
+from typing import Callable, Protocol
 
 from zeroconf import IPVersion, ServiceInfo
 from zeroconf.asyncio import AsyncZeroconf
@@ -27,6 +28,47 @@ log = logging.getLogger("tmon_mcp.mdns")
 SERVICE_TYPE = "_tmon-broker._tcp.local."
 RUNTIME = "python"
 _REFRESH_SECONDS = 30
+
+# Idle-liveness watchdog. If no device has hit the broker for _IDLE_SECONDS we
+# re-announce, on the theory that our own advertisement is what went stale — an
+# interface that flapped, a zeroconf stack that wedged, an announcement lost in
+# a lossy multicast domain. Bounded by a doubling backoff so a device that is
+# simply switched off does not have us multicasting every 30 s forever. The
+# backoff mirrors the device's own discovery backoff (see
+# firmware/components/core/src/tmon_discovery.c) — same shape, so the two sides
+# of this recovery read the same way. Wire-compatible with the Go and JS
+# publishers.
+_IDLE_SECONDS = 30
+_REANNOUNCE_MIN_S = 30
+_REANNOUNCE_MAX_S = 300
+
+
+def _reannounce_gap(attempts: int) -> float:
+    """Wait after ``attempts`` idle re-announcements: the floor for the first,
+    doubling to the ceiling thereafter."""
+    gap = float(_REANNOUNCE_MIN_S)
+    for _ in range(1, attempts):
+        if gap >= _REANNOUNCE_MAX_S / 2:
+            return float(_REANNOUNCE_MAX_S)
+        gap *= 2
+    return gap
+
+
+def _should_reannounce(now: float, last_req: float, last_reannounce: float,
+                       attempts: int, devs: int) -> bool:
+    """Pure decision behind the watchdog. ``last_req`` must already be
+    normalised by the caller (the broker's start time stands in before any
+    device has ever hit us); ``last_reannounce`` of 0.0 means "never".
+
+    ``devs`` of 0 means no device is registered here, so there is nobody our
+    advertisement could help and no reason to put packets on the LAN."""
+    if devs == 0:
+        return False
+    if now - last_req < _IDLE_SECONDS:
+        return False
+    if last_reannounce == 0.0:
+        return True
+    return now - last_reannounce >= _reannounce_gap(attempts)
 _MAX_TXT = 255  # single DNS RR string length limit
 
 # Interface name prefixes the WiFi device cannot reach: container
@@ -151,6 +193,38 @@ class Publisher:
         self._bind: str = ""
         self._port: int = 0
         self._instance: str = ""
+        # Idle-liveness watchdog state; see _take_idle_reannounce.
+        self._last_req: Callable[[], float] | None = None
+        self._started_at: float = 0.0
+        self._last_seen_req: float = 0.0   # _last_req as of the previous check
+        self._idle_attempts: int = 0
+        self._last_reannounce: float = 0.0
+
+    def _take_idle_reannounce(self, now: float, devs: int) -> tuple[bool, float]:
+        """Is an idle re-announce due right now? When it is, consume it: the
+        caller must go on to republish. Returns how long we have been idle,
+        for the log line. Any request seen since the previous call resets the
+        backoff to the floor, however old that request is by now."""
+        if self._last_req is None:
+            return False, 0.0
+        last_req = self._last_req()
+        if not last_req:
+            last_req = self._started_at
+        # Reset on a request we had not seen before, not on "the request we
+        # can see is recent". The loop ticks at the same 30 s as the
+        # threshold, so a request landing just after a tick is already 30 s
+        # old by the next one: keying the reset on freshness would miss it to
+        # scheduling jitter and leave the backoff out at five minutes.
+        if last_req != self._last_seen_req:
+            self._last_seen_req = last_req
+            self._idle_attempts = 0
+            self._last_reannounce = 0.0
+        if not _should_reannounce(now, last_req, self._last_reannounce,
+                                  self._idle_attempts, devs):
+            return False, 0.0
+        self._idle_attempts += 1
+        self._last_reannounce = now
+        return True, now - last_req
 
     async def _open(self, addresses: list[bytes] | None, ip_version: IPVersion,
                     txt: dict[bytes, bytes]) -> None:
@@ -197,7 +271,11 @@ class Publisher:
         bind: str,
         port: int,
         lister: DeviceIDLister,
+        last_req: "Callable[[], float] | None" = None,
     ) -> "Publisher":
+        """``last_req`` reports when a device last hit the broker (epoch
+        seconds, 0.0 for never); it drives the idle re-announce watchdog and
+        may be None to disable it."""
         if _is_loopback(bind):
             log.info("mdns: bind=%s is loopback, skipping broker advertisement", bind)
             return cls()
@@ -215,6 +293,8 @@ class Publisher:
         self._bind = bind
         self._port = port
         self._instance = f"tmon-broker-{_host_short()}"
+        self._last_req = last_req
+        self._started_at = time.time()
         addresses, ip_version = _advertised_addresses(bind)
         await self._open(addresses, ip_version, txt)
         log.info(
@@ -227,52 +307,77 @@ class Publisher:
         self._task = asyncio.create_task(self._refresh_loop(lister))
         return self
 
+    async def _tick(self, lister: DeviceIDLister) -> bool:
+        """One refresh tick, extracted from the loop so a test can drive it.
+
+        Each of the three causes below must independently produce a
+        republish; an ``or idle`` quietly dropped from the condition is
+        invisible to a test that only exercises _take_idle_reannounce.
+
+        Returns False when the advertisement is gone for good and the refresh
+        loop should stop — the loop used to express that as a bare ``return``
+        from inside itself, and extracting the body would otherwise have
+        turned it into "skip this tick".
+        """
+        try:
+            devs = lister.list_device_ids()
+        except Exception as e:  # noqa: BLE001
+            log.warning("mdns: refresh device list: %s", e)
+            return True
+        txt = _build_txt(devs)
+
+        # Interface addresses changed (DHCP renew, network
+        # switch): the pinned A records and the multicast
+        # sockets are both stale — tear the whole advertisement
+        # down and republish fresh. This is what lets a device
+        # rediscover the broker after the host moves LANs. A
+        # ``None`` zc (previous republish failed) retries here.
+        # Liveness: nobody has talked to us in a while, so
+        # re-announce in case it is our own advertisement that went
+        # stale. Consumed here so the backoff advances exactly once
+        # per tick whatever the republish does.
+        idle, idle_for = self._take_idle_reannounce(time.time(), len(devs))
+        if idle:
+            log.info("mdns: no device traffic for %ds, re-announcing",
+                     int(idle_for))
+        addresses, ip_version = _advertised_addresses(self._bind)
+        if addresses != self._last_addrs or self._zc is None or idle:
+            log.info("mdns: %s, republishing",
+                     "idle" if idle else "addresses changed")
+            await self._teardown_zc()
+            try:
+                await self._open(addresses, ip_version, txt)
+            except Exception as e:  # noqa: BLE001
+                # Leave _last_* unset so the next tick retries.
+                self._last_addrs = None
+                self._last_txt = None
+                log.warning("mdns: republish: %s", e)
+                return True
+            log.info("mdns: republished, devs=%d", len(devs))
+            return True
+
+        if txt == self._last_txt:
+            return True
+        self._last_txt = txt
+        info = self._info
+        zc = self._zc
+        if info is None or zc is None:
+            return False
+        info.properties = txt
+        try:
+            await zc.async_update_service(info)
+        except Exception as e:  # noqa: BLE001
+            log.warning("mdns: update service: %s", e)
+            return True
+        log.info("mdns: TXT updated, devs=%d", len(devs))
+        return True
+
     async def _refresh_loop(self, lister: DeviceIDLister) -> None:
         try:
             while True:
                 await asyncio.sleep(_REFRESH_SECONDS)
-                try:
-                    devs = lister.list_device_ids()
-                except Exception as e:  # noqa: BLE001
-                    log.warning("mdns: refresh device list: %s", e)
-                    continue
-                txt = _build_txt(devs)
-
-                # Interface addresses changed (DHCP renew, network
-                # switch): the pinned A records and the multicast
-                # sockets are both stale — tear the whole advertisement
-                # down and republish fresh. This is what lets a device
-                # rediscover the broker after the host moves LANs. A
-                # ``None`` zc (previous republish failed) retries here.
-                addresses, ip_version = _advertised_addresses(self._bind)
-                if addresses != self._last_addrs or self._zc is None:
-                    log.info("mdns: addresses changed, republishing")
-                    await self._teardown_zc()
-                    try:
-                        await self._open(addresses, ip_version, txt)
-                    except Exception as e:  # noqa: BLE001
-                        # Leave _last_* unset so the next tick retries.
-                        self._last_addrs = None
-                        self._last_txt = None
-                        log.warning("mdns: republish: %s", e)
-                        continue
-                    log.info("mdns: republished, devs=%d", len(devs))
-                    continue
-
-                if txt == self._last_txt:
-                    continue
-                self._last_txt = txt
-                info = self._info
-                zc = self._zc
-                if info is None or zc is None:
+                if not await self._tick(lister):
                     return
-                info.properties = txt
-                try:
-                    await zc.async_update_service(info)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("mdns: update service: %s", e)
-                    continue
-                log.info("mdns: TXT updated, devs=%d", len(devs))
         except asyncio.CancelledError:
             return
 
