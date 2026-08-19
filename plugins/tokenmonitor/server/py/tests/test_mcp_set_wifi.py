@@ -5,6 +5,7 @@ picked."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from tmon_mcp.config import Config
@@ -135,3 +136,22 @@ def test_empty_reported_list_survives_reload(tmp_path: Path):
     assert dev.active.wifi_known == [], 'an empty reported list must not read back as "never reported"'
     res = _call(reg, device_id=DEV, ssid="Office")
     assert "needs_password=true" in res["error"]
+
+
+def test_ssid_is_json_quoted_not_repr(tmp_path: Path):
+    """The SSID goes into these messages as a JSON string literal.
+
+    compat/mcp-errors.md publishes them as byte-for-byte identical across
+    go/py/js. repr() quotes with 'single' quotes and escapes non-ASCII; Go's %q
+    emits Go escapes (BEL as a backslash-a, VT as backslash-v) where JSON emits
+    the u0007 / u000b forms. All three now use JSON quoting, and this pins the
+    exact bytes on the only kind of input where they can differ.
+    """
+    nasty = "caf\u00e9" + chr(7) + chr(11) + '"x\\y'
+    want = '"caf\u00e9\\u0007\\u000b\\"x\\\\y"'
+    assert json.dumps(nasty, ensure_ascii=False) == want
+    assert repr(nasty) != want, "repr and JSON agree here — pick a nastier SSID"
+
+    reg = _registry(tmp_path, [{"ssid": "HomeNet", "verified": True}])
+    out = _call(reg, device_id=DEV, ssid=nasty)
+    assert want in (out.get("error") or ""), out

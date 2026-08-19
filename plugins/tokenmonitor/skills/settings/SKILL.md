@@ -1,25 +1,30 @@
 ---
 name: settings
-description: tokenmonitor plugin — remotely change any on-device setting the Settings panel exposes (city, day / night brightness, alert volume, providers and their modes, auto-rotation, theme, virtual pet, custom panel, broker URL, passphrase) on a TokenMonitor device. Equivalent to long-pressing the mascot on the dashboard and editing a row, but driven from Claude Code via the control plane. Use this when the user says "set the wall monitor city to Madrid", "lower the night brightness", "mute the alerts", "disable Codex on device X", "rotate providers every 60 s", "change/rename/hide the pet", "rotate the broker passphrase", "change the broker URL", "enable/disable the custom (swipe-up) panel", "change what the panel shows", or any similar reconfiguration of an already-provisioned device.
+description: tokenmonitor plugin — remotely change any on-device setting the Settings panel exposes (city, day / night brightness, alert volume, providers and their modes, auto-rotation, theme, virtual pet, custom panel, broker URL, passphrase) on a TokenMonitor device. Equivalent to tapping the gear on the dashboard and editing a row, but driven from Claude Code via the control plane. Use this when the user says "set the wall monitor city to Madrid", "lower the night brightness", "mute the alerts", "disable Codex on device X", "rotate providers every 60 s", "change/rename/hide the pet", "rotate the broker passphrase", "change the broker URL", "enable/disable the custom (swipe-up) panel", "change what the panel shows", or any similar reconfiguration of an already-provisioned device.
 ---
 
 # /tokenmonitor:settings
 
 Push a runtime configuration change to an already-provisioned TokenMonitor
 device. The change is queued through the control plane and applied on the
-device's next 60 s poll, under the candidate/promote safety net — a bad config
-rolls back automatically.
+device's next poll, under the candidate/promote safety net — a bad config
+rolls back automatically. The poll runs every **10 s**, not 60.
 
-This is the remote equivalent of the on-device Settings panel (long-press the
-mascot). For *first-time* provisioning use [[configure]]; [[theme]] is a thin
-wrapper around the `theme_mode` field here.
+This is the remote equivalent of the on-device Settings panel (tap the gear on
+the dashboard — there is no long-press gesture; the mascot it used to live on
+is not on that screen any more). For *first-time* provisioning use
+[[configure]]; [[theme]] is a thin wrapper around the `theme_mode` field here.
 
 ## Out of scope
 
-- **WiFi SSID and password are NOT remotely changeable**, by design: a wrong
-  WiFi push would brick the device, since it loses connectivity *before* it can
-  roll back. The user must use the on-device Settings panel or factory-reset
-  and re-run `/tokenmonitor:configure`.
+- **WiFi is not changed with THIS tool** — but it *is* remotely changeable.
+  Use **`tokenmonitor_set_wifi`**, which exists in all three broker runtimes
+  and which the device applies with a remembered-network fallback. Do not tell
+  the user WiFi can only be changed on the device or by factory reset; that was
+  true once and is not true now. The care that rule was protecting is real
+  though: a WiFi push the device cannot join costs connectivity *before* it can
+  roll back, which is why `set_wifi` prefers a network the device already
+  remembers and asks for a password only when it must.
 - **First-time provisioning** (device shows "Waiting for setup") → [[configure]].
   This skill needs a device already in the broker's registry.
 
@@ -43,10 +48,13 @@ schema does **not** state: every numeric field is an **integer** on the wire
 `city` is capped at **64 bytes** (the firmware clips it UTF-8-aware rather than
 rejecting, so an over-long name is silently shortened).
 
-The device's Settings screen groups these into five sections, so the user may
-reference "the Display section" or "the Audio settings":
+The device's Settings screen groups these into **six** sections, so the user may
+reference "the Display section" or "the Audio settings". Note the first one is
+**Content**, not "Providers", and the custom panel lives there rather than
+under Display — what a Content row decides is whether a *page exists at all*,
+where Display only changes how the existing pages are drawn:
 
-- **Providers** — `provider_mode_{claude,codex,antigravity}` (fine-grained:
+- **Content** — `provider_mode_{claude,codex,antigravity}` (fine-grained:
   auto / disabled / subscription / api_key) or the legacy coarse booleans
   `provider_{claude,codex,antigravity}`. "Disable Codex" →
   `provider_mode_codex=disabled`; "show Claude as API spend" →
@@ -56,8 +64,9 @@ reference "the Display section" or "the Audio settings":
   `auto` keeps the provider **enabled** and lets the broker pick the data
   source/mode; a provider with no login shows "--", it is *not* disabled.
   `disabled` is the only mode that hides a provider.
+  …and `panel_enabled`, which sits here with the providers for the reason above.
 - **Display** — `autorotate_enabled`, `autorotate_interval_s`, `theme_mode`,
-  `br_day`, `br_night`, `panel_enabled`. For `theme_mode`, normalise first
+  `br_day`, `br_night`. For `theme_mode`, normalise first
   (`dark`→`night`, `light`→`day`, `automatic`/`sunset`/`sunrise`→`auto`); ask
   if still ambiguous.
 - **Virtual pet** — `pet_enabled`, `pet_species` (int enum in the schema; map
@@ -164,19 +173,22 @@ the user "already set to <value>" and stop.
 
 ### 6. Tell the user what happens next
 
-> Queued <fields> on device <device_id>. The device polls every ~60 s; it will
+> Queued <fields> on device <device_id>. The device polls every ~10 s; it will
 > pick the change up, probe it against its own broker, and either promote
-> (~90 s end to end) or roll back automatically if it can't confirm three
+> (~40 s end to end) or roll back automatically if it can't confirm three
 > healthy fetches within 5 minutes.
 
-Changes touching `broker_url`, `psk_hex`, `theme_mode`, providers or autorotate
-settings need a **reboot** — mention the screen will blank briefly. The "live"
-fields `br_day`, `br_night`, `vol` and `city` apply **without** a reboot, on
-the next ambient / backlight tick.
+**Almost nothing needs a reboot.** Only a change to `broker_url`, `psk_hex` or
+WiFi reboots the device (it has to re-establish the very channel it is being
+reconfigured through), plus a promote that arms an OTA. `theme_mode`,
+providers, autorotate, `br_day`, `br_night`, `vol`, `city` and the pet fields
+all apply **live** — do not warn the user about a blank screen for those.
 
 To verify, the user can watch `pending_changes` drain via
-`tokenmonitor_list_devices`, or `tokenmonitor_recent_logs` for
-`rebooting to apply promoted config`.
+`tokenmonitor_list_devices`, or read the device's own log with
+`tokenmonitor_device_logs` (the ring the firmware uploads).
+`tokenmonitor_recent_logs` is the *broker's* log, a different thing, and it
+will not show the device's promote lines.
 
 ## Common errors
 
@@ -190,8 +202,17 @@ To verify, the user can watch `pending_changes` drain via
   must configure `~/.config/tokenmonitor/devices/` and restart
   `tokenmonitor-mcp`.
 - **`pending_changes` never drains** — usually the candidate fails to probe
-  (wrong `broker_url` or `psk_hex`). Check `tokenmonitor_recent_logs` for
-  `candidate probe failed`; the device rolls back after 5 minutes.
+  (wrong `broker_url` or `psk_hex`). Check `tokenmonitor_device_logs` for
+  `candidate probe transport failure` — that is the string the firmware
+  actually emits; there is no "candidate probe failed" line to grep for. The
+  device rolls back after 5 minutes.
+- **A display setting is queued, promotes, and the device ignores it** — the
+  device owns `br_day`, `br_night`, `vol`, `autorotate_*`, `theme_mode`,
+  `panel_enabled` and the pet fields, and it vetoes a broker push while it has
+  an un-acknowledged local change of its own. That veto lifts by itself after
+  ~10 minutes of the device failing to report, so this is transient; check
+  `tokenmonitor_device_logs` for `settings report status=` to see why its own
+  report is not landing.
 - **City accepted but weather/location is wrong** — the device log shows
   `geocoding: no results for '<city>'` and `ambient: location: ~40,-4
   (build-time default)`. Re-run the geocoding pre-check and push the

@@ -27,10 +27,12 @@ Set the on-device theme mode. Thin wrapper around
    If the response's `pending_changes` does not include `theme_mode`, the
    device is already on that mode — say so and stop.
 
-4. **Tell the user**: the device polls `/device/<id>/sync` every ~60 s, stores
-   the blob as a candidate and reboots to apply it — roughly 90 s end to end.
-   `tokenmonitor_recent_logs` shows the `rebooting to apply promoted config`
-   line if they want to watch.
+4. **Tell the user**: the device polls `/device/<id>/sync` every ~10 s, stores
+   the blob as a candidate, probes it, and applies the theme **live** — no
+   reboot, roughly 40 s end to end. (Only `broker_url`, `psk_hex` and WiFi
+   changes reboot the device; a theme is not one of them.) If they want to
+   watch, `tokenmonitor_device_logs` carries the device's own log — note that
+   is a different tool from `tokenmonitor_recent_logs`, which is the broker's.
 
 ## Mode semantics
 

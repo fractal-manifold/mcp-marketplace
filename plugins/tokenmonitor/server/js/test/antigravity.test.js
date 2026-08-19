@@ -48,7 +48,9 @@ creds_path = "~/.gemini/oauth_creds.json"
     assert.deepEqual(cfg.antigravityModels(), DEFAULT_ANTIGRAVITY_MODELS);
     assert.deepEqual(DEFAULT_ANTIGRAVITY_MODELS, ["gemini-3.5-flash", "gemini-3.1-pro"]);
     // Default conversation path is the agy trajectory store.
-    assert.equal(cfg.antigravityConvPathAbs().endsWith("/.gemini/antigravity/conversations"), true);
+    // "-cli" matters: ~/.gemini/antigravity is the IDE state dir and holds no
+    // conversations, so the shorter path reports zero spend forever.
+    assert.equal(cfg.antigravityConvPathAbs().endsWith("/.gemini/antigravity-cli/conversations"), true);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

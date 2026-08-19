@@ -252,9 +252,11 @@ function defaults() {
       claude_projects_path: "~/.claude/projects",
       claude_stats_cache_path: "~/.claude/stats-cache.json",
       codex_sessions_path: "~/.codex/sessions",
-      // Antigravity CLI conversation trajectory store. The legacy
-      // gemini_tmp_path key is merged into this in load() for back-compat.
-      antigravity_conversations_path: "~/.gemini/antigravity/conversations",
+      // Antigravity CLI conversation trajectory store. Note the "-cli":
+      // ~/.gemini/antigravity also exists (the IDE's state dir) and holds no
+      // conversations, so the shorter path silently yields zero spend. The
+      // legacy gemini_tmp_path key is merged into this in load() for back-compat.
+      antigravity_conversations_path: "~/.gemini/antigravity-cli/conversations",
     },
     // Model price table used to turn tokens into USD. Source of truth is
     // LiteLLM's machine-readable table (same data ccusage uses); cached on

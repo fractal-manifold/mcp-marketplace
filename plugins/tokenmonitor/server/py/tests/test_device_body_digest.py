@@ -50,9 +50,14 @@ def _next_nonce() -> str:
     return f"{_nonce_counter:032x}"
 
 
-def _signed_post(app, endpoint: str, body: bytes, *, digest: str | None = "auto"):
+def _signed_post(app, endpoint: str, body: bytes, *, digest: str | None = "auto",
+                 content_length: bool = True):
     """digest='auto' → correct v3 signing; None → legacy v2 (no header);
-    any other string → sent verbatim as X-Tmon-Body-Sha256 and signed v3."""
+    any other string → sent verbatim as X-Tmon-Body-Sha256 and signed v3.
+
+    content_length=False omits the header, i.e. a chunked request whose size a
+    handler cannot know before reading — the path a size cap has to enforce
+    while streaming rather than by trusting a number."""
     path = f"/device/{DEVICE_ID}/{endpoint}"
     ts = str(int(time.time()))
     nonce = _next_nonce()
@@ -61,8 +66,9 @@ def _signed_post(app, endpoint: str, body: bytes, *, digest: str | None = "auto"
         "X-Tmon-Nonce": nonce,
         "X-Tmon-Device": DEVICE_ID,
         "X-Tmon-Config-Version": "1",
-        "Content-Length": str(len(body)),
     }
+    if content_length:
+        headers["Content-Length"] = str(len(body))
     if digest is None:
         headers["X-Tmon-Signature"] = auth.compute_signature(
             PSK, "POST", path, ts, nonce, DEVICE_ID, "1",

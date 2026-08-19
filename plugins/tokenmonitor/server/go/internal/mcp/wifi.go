@@ -25,6 +25,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -34,6 +35,19 @@ import (
 
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/registry"
 )
+
+// jsonQ quotes an SSID for an error message as a JSON string literal.
+//
+// NOT %q. compat/mcp-errors.md publishes these strings as byte-for-byte
+// identical across the three runtimes, and Python/JS quote with json.dumps /
+// JSON.stringify. Go's %q emits *Go* escapes, which differ for exactly the
+// bytes an adversarial SSID would carry: BEL is `\a` in Go but `\u0007` in
+// JSON, vertical tab `\v` vs `\u000b`, and U+2028 is escaped by neither the
+// same way. json.Marshal on a string cannot fail, so the error is dropped.
+func jsonQ(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
 
 // 802.11 limits. The device enforces these too (tmon_wifi_store.h); checking
 // here turns a silent device-side rejection into an immediate error.
@@ -132,14 +146,14 @@ func handleSetWiFi(d Deps) server.ToolHandlerFunc {
 				// the second is old firmware and the fix is different.
 				if dev.Active.WiFiKnown == nil {
 					return mcp.NewToolResultError(fmt.Sprintf(
-						"this device has not reported its remembered networks, so I cannot tell whether it knows %q. That report needs firmware with wifi_known support. Supply `pass` to switch to it regardless.", ssid)), nil
+						"this device has not reported its remembered networks, so I cannot tell whether it knows %s. That report needs firmware with wifi_known support. Supply `pass` to switch to it regardless.", jsonQ(ssid))), nil
 				}
 				return mcp.NewToolResultError(fmt.Sprintf(
-					"needs_password=true: the device does not remember %q, so it needs the passphrase. Ask the user for it and call again with `pass`. Networks it does remember: %s",
-					ssid, knownNetworkNames(known))), nil
+					"needs_password=true: the device does not remember %s, so it needs the passphrase. Ask the user for it and call again with `pass`. Networks it does remember: %s",
+					jsonQ(ssid), knownNetworkNames(known))), nil
 			case match.Open:
 				return mcp.NewToolResultError(fmt.Sprintf(
-					"%q is remembered but is an OPEN network, and the device never auto-joins open networks — an SSID alone is trivially impersonated. Switch to it with the USB cable (tokenmonitor_usb_provision) or on the device's own screen.", ssid)), nil
+					"%s is remembered but is an OPEN network, and the device never auto-joins open networks — an SSID alone is trivially impersonated. Switch to it with the USB cable (tokenmonitor_usb_provision) or on the device's own screen.", jsonQ(ssid))), nil
 			}
 		}
 
@@ -152,7 +166,7 @@ func handleSetWiFi(d Deps) server.ToolHandlerFunc {
 			// SetPending drops a pending identical to active. Reached when
 			// the device is already being sent to this network.
 			return mcp.NewToolResultText(fmt.Sprintf(
-				"No change staged: %s is already set to switch to %q.", deviceID, ssid)), nil
+				"No change staged: %s is already set to switch to %s.", deviceID, jsonQ(ssid))), nil
 		}
 
 		how := "using the password it already remembers"
@@ -160,7 +174,7 @@ func handleSetWiFi(d Deps) server.ToolHandlerFunc {
 			how = "using the password you supplied"
 		}
 		return mcp.NewToolResultText(fmt.Sprintf(
-			"Staged config v%d for %s: switch to WiFi %q, %s. The device applies it on its next sync (~10 s) and reboots onto the new network. If it does not come up there, it falls back through its remembered networks on boot.",
-			updated.Pending.Version, deviceID, ssid, how)), nil
+			"Staged config v%d for %s: switch to WiFi %s, %s. The device applies it on its next sync (~10 s) and reboots onto the new network. If it does not come up there, it falls back through its remembered networks on boot.",
+			updated.Pending.Version, deviceID, jsonQ(ssid), how)), nil
 	}
 }

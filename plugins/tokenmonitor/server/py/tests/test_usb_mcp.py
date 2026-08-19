@@ -55,6 +55,26 @@ def test_broker_url_without_psk_or_device_id_error():
     assert err and "device_id" in err
 
 
+def test_no_registry_refuses_to_mint_psk():
+    # A minted PSK can only be kept if there is a registry to persist it in.
+    # Without one it would be pushed to the device and immediately lost, leaving
+    # the device signing with a key nobody on the host has. Parity with Go's
+    # TestBuildUSBPayload_NoRegistryRefusesToMintPSK.
+    _, psk, gen, _, err = usb.build_usb_payload(
+        _Deps(), {"broker_url": "http://10.0.0.5:8787"}, "123456", "02c4777c"
+    )
+    assert err, "minting a PSK with no registry must be refused"
+    # Byte-for-byte, not a substring: compat/mcp-errors.md publishes this string
+    # as the cross-runtime contract, and a substring match would let the three
+    # runtimes drift apart in the parenthetical that explains the refusal.
+    assert err == (
+        "setting broker_url over USB without a device registry needs an "
+        "explicit psk_hex (a generated PSK cannot be persisted here and would "
+        "orphan the device)"
+    ), err
+    assert not gen and not psk
+
+
 def test_psk_minted_when_new_device(tmp_path):
     reg = Registry(str(tmp_path / "devices"))
     p, psk, gen, reused, err = usb.build_usb_payload(

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema",
   "$comment": "Authoritative MCP tool definitions for tokenmonitor-mcp. Every impl (Go, Python, JS) must register tools with these exact name/description/inputSchema triples. The Python and JS servers load this file at runtime; the Go server hardcodes equivalent mcp.NewTool registrations in internal/mcp/{server,devices,discovery,ota,wifi,usb}.go and must be kept in sync by hand.",
-  "version": 12,
+  "version": 13,
   "tools": [
     {
       "name": "tokenmonitor_status",
@@ -228,7 +228,7 @@
               "night",
               "auto"
             ],
-            "description": "Theme mode applied on the device: 'day' (light palette), 'night' (dark palette) or 'auto' (follows sunrise/sunset). The change takes effect on the reboot that follows promotion."
+            "description": "Theme mode applied on the device: 'day' (light palette), 'night' (dark palette) or 'auto' (follows sunrise/sunset). Applied LIVE when the candidate is promoted — no reboot. Fields that DO reboot the device: broker_url, psk_hex, the WiFi pair, and arming a firmware update."
           },
           "pet_enabled": {
             "type": "boolean",

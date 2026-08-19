@@ -811,6 +811,15 @@ function parseOtaFail(h) {
   return { version, installs, state };
 }
 
+// Bounds a device settings report. The report is a small flat object plus
+// `wifi_known` (8 entries of ~42 bytes plus an SSID), but an SSID is 32
+// arbitrary octets and cJSON escapes control bytes as \u00XX — six bytes each —
+// so the honest worst case is ~2.2 KB. 4 KiB clears it. The previous 512 wedged
+// real devices: past ~7 remembered networks every report was rejected, and the
+// firmware dirty flag, which only clears on a 2xx, then vetoed every
+// broker-pushed display setting forever. Raising it repairs deployed firmware.
+export const MAX_SETTINGS_BODY_BYTES = 4 << 10;
+
 // handleDeviceSettings ingests a device-reported display-settings update and
 // mirrors it into the registry (compat/SETTINGS_REPORT.md). The device owns
 // these fields, so this converges the broker's stored config to the device's
@@ -833,16 +842,16 @@ function handleDeviceSettings({ cfg, cache, state, registry, logger, deviceID },
   }
   const signedPath = `/device/${deviceID}/settings`;
   const cl = Number.parseInt(req.headers["content-length"] || "", 10);
-  if (Number.isFinite(cl) && cl > 512) return finishErr(400, "bad settings body");
+  if (Number.isFinite(cl) && cl > MAX_SETTINGS_BODY_BYTES) return finishErr(413, "settings body too large");
 
   const chunks = [];
   let total = 0;
   let aborted = false;
   req.on("data", (c) => {
     total += c.length;
-    // Streamed body over the 512-byte cap → 400 (matching the Go MaxBytesReader
-    // path), then tear down the read side; the response is already written.
-    if (total > 512) { if (!aborted) { aborted = true; finishErr(400, "bad settings body"); } req.destroy(); return; }
+    // Streamed body over the cap → 413 (matching the Go MaxBytesReader path),
+    // then tear down the read side; the response is already written.
+    if (total > MAX_SETTINGS_BODY_BYTES) { if (!aborted) { aborted = true; finishErr(413, "settings body too large"); } req.destroy(); return; }
     chunks.push(c);
   });
   req.on("error", () => { if (!aborted) { aborted = true; try { finishErr(400, "bad settings body"); } catch {} } });

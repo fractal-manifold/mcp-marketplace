@@ -1298,6 +1298,17 @@ type settingsReportBody struct {
 // to grow the registry file without limit, and neither deserves storage.
 const maxReportedNetworks = 8
 
+// maxSettingsBodyBytes bounds a device settings report. The report is a small
+// flat object plus `wifi_known` (maxReportedNetworks entries of ~42 bytes plus
+// an SSID), but an SSID is 32 arbitrary octets and cJSON escapes control bytes
+// as \u00XX — six bytes each — so the honest worst case is ~2.2 KB, not the
+// ~800 B a naive count suggests. 4 KiB (the serial-lease magnitude) clears it
+// with room to spare. The previous 512 wedged real devices: once ~7 networks
+// were remembered every report was rejected, and the firmware's dirty flag,
+// which only clears on a 2xx, stayed set forever and vetoed every broker-pushed
+// display setting. Raising it here repairs already-deployed firmware.
+const maxSettingsBodyBytes = 4 << 10
+
 // handleDeviceSettings ingests a device-reported display-settings update and
 // mirrors it into the registry (compat/SETTINGS_REPORT.md). The device owns
 // these fields, so this converges the broker's stored config to the device's
@@ -1336,9 +1347,18 @@ func handleDeviceSettings(cfg *config.Config, cache *auth.NonceCache, logger *lo
 	// covers sha256(body) via X-Tmon-Body-Sha256, so verification needs
 	// the raw bytes. Reading before auth is safe — the cap bounds memory
 	// and nothing is parsed or stored until the signature checks out.
-	r.Body = http.MaxBytesReader(w, r.Body, 512)
+	r.Body = http.MaxBytesReader(w, r.Body, maxSettingsBodyBytes)
 	raw, rerr := io.ReadAll(r.Body)
-	if rerr != nil { // includes the 512-byte cap being exceeded
+	if rerr != nil {
+		// Distinguish "too big" from "malformed": the device downgrades its
+		// own budget on 413 and keeps a shorter wifi_known, whereas a 400
+		// means the bytes themselves were unreadable. Matches the 413 the
+		// lease / panel / log caps already answer with.
+		var tooLarge *http.MaxBytesError
+		if errors.As(rerr, &tooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, "settings body too large")
+			return
+		}
 		writeError(w, http.StatusBadRequest, "bad settings body")
 		return
 	}

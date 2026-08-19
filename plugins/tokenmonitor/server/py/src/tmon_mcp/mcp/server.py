@@ -820,21 +820,27 @@ def _set_wifi(deps: Deps, args: dict) -> dict:
                 match = n
                 break
         if match is None:
+            # json.dumps(ssid, ensure_ascii=False) and NOT {ssid!r}: repr()
+            # quotes with 'single' quotes and escapes non-ASCII, while Go's %q
+            # and JS's JSON.stringify both emit "double" quotes and keep
+            # printable Unicode. compat/mcp-errors.md publishes these strings
+            # as byte-for-byte identical across the three runtimes.
+            #
             # Distinguish "the device told us its networks and this is not
             # one" from "the device never told us anything", because the
             # second is old firmware and the fix is different.
             if known is None:
                 return {"error": (
                     f"this device has not reported its remembered networks, so I cannot tell "
-                    f"whether it knows {ssid!r}. That report needs firmware with wifi_known "
+                    f"whether it knows {json.dumps(ssid, ensure_ascii=False)}. That report needs firmware with wifi_known "
                     f"support. Supply `pass` to switch to it regardless.")}
             return {"error": (
-                f"needs_password=true: the device does not remember {ssid!r}, so it needs the "
+                f"needs_password=true: the device does not remember {json.dumps(ssid, ensure_ascii=False)}, so it needs the "
                 f"passphrase. Ask the user for it and call again with `pass`. Networks it does "
                 f"remember: {_known_network_names(known)}")}
         if match.get("open"):
             return {"error": (
-                f"{ssid!r} is remembered but is an OPEN network, and the device never auto-joins "
+                f"{json.dumps(ssid, ensure_ascii=False)} is remembered but is an OPEN network, and the device never auto-joins "
                 f"open networks — an SSID alone is trivially impersonated. Switch to it with the "
                 f"USB cable (tokenmonitor_usb_provision) or on the device's own screen.")}
 
@@ -844,12 +850,12 @@ def _set_wifi(deps: Deps, args: dict) -> dict:
     if updated.pending is None:
         # set_pending drops a pending identical to active. Reached when the
         # device is already being sent to this network.
-        return {"text": f"No change staged: {device_id} is already set to switch to {ssid!r}."}
+        return {"text": f"No change staged: {device_id} is already set to switch to {json.dumps(ssid, ensure_ascii=False)}."}
 
     how = "using the password you supplied" if passphrase else "using the password it already remembers"
     return {"text": (
         f"Staged config v{updated.pending.payload.version} for {device_id}: switch to WiFi "
-        f"{ssid!r}, {how}. The device applies it on its next sync (~10 s) and reboots onto the "
+        f"{json.dumps(ssid, ensure_ascii=False)}, {how}. The device applies it on its next sync (~10 s) and reboots onto the "
         f"new network. If it does not come up there, it falls back through its remembered "
         f"networks on boot.")}
 

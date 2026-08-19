@@ -481,4 +481,4 @@ does not implement TLS. **Do not expose port 8765 to the public internet.**
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

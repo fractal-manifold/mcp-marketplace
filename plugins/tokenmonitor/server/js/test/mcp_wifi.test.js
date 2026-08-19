@@ -123,3 +123,21 @@ test("an empty reported list survives a reload and still asks for the password",
   const res = call(r, { device_id: DEV, ssid: "Office" });
   assert.match(res.error, /needs_password=true/);
 });
+
+
+// The SSID goes into these messages as a JSON string literal.
+// compat/mcp-errors.md publishes them as byte-for-byte identical across
+// go/py/js. Go's %q emits Go escapes (BEL as a backslash-a, VT as
+// backslash-v) where JSON emits the u0007 / u000b forms, and Python's repr()
+// uses single quotes and escapes non-ASCII. All three now use JSON quoting;
+// this pins the exact bytes on the only kind of input where they can differ.
+test("the SSID is quoted as a JSON string literal", (t) => {
+  const nasty = "caf\u00e9" + String.fromCharCode(7) + String.fromCharCode(11) + '"x\\y';
+  const want = '"caf\u00e9\\u0007\\u000b\\"x\\\\y"';
+  assert.equal(JSON.stringify(nasty), want);
+
+  const r = mkRegistry(t, [{ ssid: "HomeNet", verified: true, open: false }]);
+  const res = call(r, { device_id: DEV, ssid: nasty });
+  assert.ok(res.error, "an unknown network must not be staged silently");
+  assert.ok(res.error.includes(want), `expected ${want} in: ${res.error}`);
+});

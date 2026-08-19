@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -235,5 +236,37 @@ func TestSetWiFi_EmptyReportedListSurvivesReload(t *testing.T) {
 	msg := resultText(t, res)
 	if !strings.Contains(msg, "needs_password=true") {
 		t.Errorf("a device that remembers nothing needs the password, got: %s", msg)
+	}
+}
+
+// The SSID is interpolated into these messages as a JSON string literal, not
+// via %q. compat/mcp-errors.md publishes the strings as byte-for-byte identical
+// across go/py/js, and the other two quote with json.dumps / JSON.stringify.
+// Go's %q escapes differently for exactly the bytes an adversarial SSID would
+// carry: BEL prints as a Go \a escape but as \u0007 in JSON, and vertical tab
+// as \v vs \u000b. So a %q here silently breaks the contract for the only
+// inputs that make it observable. The literal below is what all three runtimes
+// must produce.
+func TestSetWiFi_SSIDIsQuotedAsJSONNotGo(t *testing.T) {
+	// non-ASCII, BEL, VT, an embedded quote and a backslash
+	const nasty = "caf\u00e9\a\v\"x\\y"
+	const want = "\"caf\u00e9\\u0007\\u000b\\\"x\\\\y\""
+
+	if got := jsonQ(nasty); got != want {
+		t.Fatalf("jsonQ = %s, want %s", got, want)
+	}
+	if goQ := fmt.Sprintf("%q", nasty); goQ == want {
+		t.Fatal("Go quoting and JSON quoting agree on this input — pick a " +
+			"nastier one, the test no longer proves anything")
+	}
+
+	// And it must actually reach the user-visible message.
+	r := wifiTestRegistry(t, []registry.KnownNetwork{{SSID: "HomeNet", Verified: true}})
+	res := callSetWiFi(t, r, map[string]any{"device_id": wifiTestID, "ssid": nasty})
+	if !res.IsError {
+		t.Fatal("an unknown network must not be staged silently")
+	}
+	if msg := resultText(t, res); !strings.Contains(msg, want) {
+		t.Errorf("message must carry the JSON-quoted SSID %s, got: %s", want, msg)
 	}
 }

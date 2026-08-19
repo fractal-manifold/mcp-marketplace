@@ -1,6 +1,6 @@
 ---
 name: firmware
-description: tokenmonitor plugin — push a new firmware build to a registered TokenMonitor device via OTA. Builds the .bin locally with `idf.py build`, then asks the broker to stage it as a pending update. The device downloads it, verifies its SHA-256, switches the boot slot and reboots; if the new image doesn't reach a healthy broker poll the bootloader rolls back automatically. Use when the user says "OTA the device", "push new firmware", "actualizar el firmware remoto", "publish 0.5.0 to the wall monitor", or after a `tmon_version.h` bump.
+description: tokenmonitor plugin — push a new firmware build to a registered TokenMonitor device via OTA. Builds the .bin locally with `make build-prod`, then asks the broker to stage it as a pending update. The device downloads it, verifies its SHA-256, switches the boot slot and reboots; if the new image doesn't reach a healthy broker poll the bootloader rolls back automatically. Use when the user says "OTA the device", "push new firmware", "actualizar el firmware remoto", "publish 0.5.0 to the wall monitor", or after a `tmon_version.h` bump.
 ---
 
 # /tokenmonitor:firmware
@@ -36,18 +36,30 @@ encrypted pending blob, so there is no extra channel to set up.
 
 `tokenmonitor_list_devices` — pick the `device_id` and note its
 `active_broker_url` (the staged `firmware_url` will be
-`<active_broker_url>/firmware/tokenmonitor-<version>.bin`). If `active_version`
-already equals the version they want to push, ask before continuing: the device
-will detect the match and no-op.
+`<active_broker_url>/firmware/tokenmonitor-<version>.bin`).
+
+**`active_version` is NOT the firmware version.** It is a `uint32` counter for
+the *config payload* generation, and comparing it against a semver like
+`0.11.4` is meaningless. The device's running firmware version is reported
+separately — read that field, or the device's own log, before deciding whether
+a push is a no-op.
 
 ### 2. Build
 
 ```
-cd firmware
-idf.py build
+make build-prod
 ```
 
-The artifact lands at `firmware/build/tokenmonitor.bin` (≈1.8 MB). The build
+Use this rather than `idf.py build` in the shared tree: `build-prod` builds
+into `firmware/build/prod/` against its own `sdkconfig.sb`, so a Secure Boot
+build can never leak its options into the sdkconfig everything else shares.
+It sets `TMON_SECURE_BOOT=1` for you and therefore needs
+`firmware/secrets/secure_boot_signing_key.pem` — and, on a flash-encrypted
+target, the FE key too, unless you pass `TMON_FLASH_ENC=0`.
+
+The artifact lands at `firmware/build/prod/tokenmonitor.bin` (**≈2.1 MB**, not
+1.8 — the figure matters because it is what the device has to pull over the
+air). The build
 embeds `CONFIG_APP_PROJECT_VER` into the `esp_app_desc_t` header — the device
 uses that string as the dedupe key and refuses to install the same version
 twice. If the build fails, **do not** publish a stale .bin; surface the error.
@@ -141,9 +153,12 @@ wakes early in the next boot, downloads and hashes the .bin, calls
 first successful broker round-trip, committing the slot. Publish to committed
 is usually **60–120 s**.
 
-Stream with `tokenmonitor_recent_logs limit=100` (or
-`tokenmonitor_firmware_logs limit=200` if a USB cable is plugged in) and look
-for, in order:
+Stream with `tokenmonitor_device_logs limit="100"` (the device's own uploaded
+ring — `tokenmonitor_recent_logs` is the *broker's* log and will not carry
+these lines), or `tokenmonitor_firmware_logs limit="200"` if a USB cable is
+plugged in. **Pass `limit` as a string**: the Go runtime reads it as a string
+and silently ignores a number, so `limit=100` gets you the default page size
+with no error. Look for, in order:
 
 - `cfg_sync candidate stored, version=N` — pending blob received.
 - `cfg_sync promoted candidate ... OTA armed: version=<ver>` — keys written.
@@ -164,9 +179,10 @@ the device keeps running the prior image. If the new image boots but
 call), the bootloader auto-reverts on the next reset.
 
 If the user says "I pushed the update but it still shows the old version",
-check `tmon_ota_tries` in `tokenmonitor_recent_logs` and `active_version` in
-`tokenmonitor_list_devices`. `tries` at 3 on the old version means the SHA or
-URL was wrong — re-publish.
+check `tmon_ota_tries` in `tokenmonitor_device_logs` and the reported firmware
+version in `tokenmonitor_list_devices` (**not** `active_version`, which is the
+config-payload counter). `tries` at 3 on the old version means the SHA or URL
+was wrong — re-publish.
 
 ## External hosting variant
 
@@ -195,11 +211,16 @@ If the target device has Secure Boot v2 burned in eFuse (see
 `firmware/components/ota/SECURE_BOOT.md`), the `.bin` MUST be image-signed:
 
 ```
-cd firmware
-TMON_SECURE_BOOT=1 idf.py build
+make build-prod
 ```
 
-This needs `firmware/secrets/secure_boot_signing_key.pem`. An unsigned .bin is
+That is the same command as step 2 — `build-prod` is already the Secure Boot
+build, in its own `build/prod/` tree with its own `sdkconfig.sb`. Do not run
+`TMON_SECURE_BOOT=1 idf.py build` in the shared tree: it writes Secure Boot
+options into the sdkconfig every other build reads.
+
+It needs `firmware/secrets/secure_boot_signing_key.pem`, plus the flash-
+encryption key on an FE target (or `TMON_FLASH_ENC=0` to skip that). An unsigned .bin is
 rejected on-device (`ESP_ERR_OTA_VALIDATE_FAILED`) and retried 3 times before
 giving up, keeping the prior firmware. The broker doesn't know whether the bin
 is image-signed — that check is entirely device-side, so

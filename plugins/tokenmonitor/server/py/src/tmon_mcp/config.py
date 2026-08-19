@@ -295,9 +295,12 @@ class Spend:
     claude_stats_cache_path: str = "~/.claude/stats-cache.json"
     codex_sessions_path: str = "~/.codex/sessions"
     # antigravity_conversations_path is the Antigravity CLI's per-conversation
-    # SQLite trajectory store. gemini_tmp_path is the DEPRECATED pre-rename key,
-    # merged into it in load() so a legacy tokenmonitor.toml keeps working.
-    antigravity_conversations_path: str = "~/.gemini/antigravity/conversations"
+    # SQLite trajectory store. Note the "-cli": ~/.gemini/antigravity also
+    # exists (the IDE's state dir) and holds no conversations, so the shorter
+    # path silently yields zero spend. gemini_tmp_path is the DEPRECATED
+    # pre-rename key, merged into it in load() so a legacy tokenmonitor.toml
+    # keeps working.
+    antigravity_conversations_path: str = "~/.gemini/antigravity-cli/conversations"
     gemini_tmp_path: str = ""
 
 

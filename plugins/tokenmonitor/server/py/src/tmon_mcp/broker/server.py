@@ -211,6 +211,15 @@ async def _not_found_or_405(req: web.Request) -> web.Response:
 # TTL — tiny; the cap just stops a malformed peer streaming.
 _MAX_LEASE_BODY_BYTES = 4 << 10
 
+# Bounds a device settings report. The report is a small flat object plus
+# `wifi_known` (8 entries of ~42 bytes plus an SSID), but an SSID is 32
+# arbitrary octets and cJSON escapes control bytes as \u00XX — six bytes each —
+# so the honest worst case is ~2.2 KB. 4 KiB clears it. The previous 512 wedged
+# real devices: past ~7 remembered networks every report was rejected, and the
+# firmware dirty flag, which only clears on a 2xx, then vetoed every
+# broker-pushed display setting forever. Raising it repairs deployed firmware.
+_MAX_SETTINGS_BODY_BYTES = 4 << 10
+
 
 def _is_loopback_peer(req: web.Request) -> bool:
     """Whether the real TCP peer is a loopback IP. Uses the transport peername
@@ -1195,12 +1204,23 @@ async def _handle_device_settings(req: web.Request) -> web.Response:
         log.warning("registry lookup %s: %s", device_id, e)
         return _error(500, "registry error")
 
-    # Body FIRST (size-bounded), then body-aware auth.
-    if req.content_length is not None and req.content_length > 512:
+    # Body FIRST (size-bounded), then body-aware auth — the v3 signature covers
+    # sha256(body). Cap the read at _MAX_SETTINGS_BODY_BYTES *streaming*, the
+    # same shape as the lease handler above and as Go's http.MaxBytesReader:
+    # req.read() would buffer a chunked body with no Content-Length all the way
+    # up to aiohttp's own 1 MiB limit, and then raise its own text/plain 413
+    # instead of this endpoint's JSON error.
+    if req.content_length is not None and req.content_length > _MAX_SETTINGS_BODY_BYTES:
+        return _error(413, "settings body too large")
+    buf = bytearray()
+    try:
+        async for chunk in req.content.iter_chunked(4096):
+            buf += chunk
+            if len(buf) > _MAX_SETTINGS_BODY_BYTES:
+                return _error(413, "settings body too large")
+    except Exception:  # noqa: BLE001
         return _error(400, "bad settings body")
-    raw = await req.read()
-    if len(raw) > 512:
-        return _error(400, "bad settings body")
+    raw = bytes(buf)
 
     signed_path = req.path
     try:

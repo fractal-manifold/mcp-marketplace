@@ -168,7 +168,7 @@ func NewServer(d Deps) *server.MCPServer {
 			mcp.WithBoolean("autorotate_enabled", mcp.Description("Cycle through enabled providers on the dashboard.")),
 			mcp.WithNumber("autorotate_interval_s", mcp.Description("Seconds between provider cycles, 1..300.")),
 			mcp.WithString("theme_mode",
-				mcp.Description("Theme mode applied on the device: 'day' (light palette), 'night' (dark palette) or 'auto' (follows sunrise/sunset). The change takes effect on the reboot that follows promotion."),
+				mcp.Description("Theme mode applied on the device: 'day' (light palette), 'night' (dark palette) or 'auto' (follows sunrise/sunset). Applied LIVE when the candidate is promoted — no reboot. Fields that DO reboot the device: broker_url, psk_hex, the WiFi pair, and arming a firmware update."),
 				mcp.Enum("day", "night", "auto"),
 			),
 			mcp.WithBoolean("pet_enabled", mcp.Description("Show the on-device virtual pet (default true). The pet is device-owned, like the display settings; the user can also toggle it on the device.")),

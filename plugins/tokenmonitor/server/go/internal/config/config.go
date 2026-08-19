@@ -394,7 +394,9 @@ func (c *Config) ClaudeStatsCachePath() string { return expandUser(c.Spend.Claud
 func (c *Config) CodexSessionsPath() string    { return expandUser(c.Spend.CodexSessionsPath) }
 
 // AntigravityConvPath is the per-conversation SQLite trajectory store the
-// Antigravity CLI writes (~/.gemini/antigravity/conversations). It
+// Antigravity CLI writes: ~/.gemini/antigravity-cli/conversations. Note the
+// "-cli" — ~/.gemini/antigravity also exists (it is the IDE's state dir) and
+// holds no conversations, so the shorter path silently yields zero spend. It
 // replaces the dead Gemini-CLI chat-log path; the legacy gemini_tmp_path is
 // merged into it in Load() for back-compat.
 func (c *Config) AntigravityConvPath() string { return expandUser(c.Spend.AntigravityConvPath) }
@@ -1059,7 +1061,7 @@ func defaults() *Config {
 			ClaudeProjectsPath:   "~/.claude/projects",
 			ClaudeStatsCachePath: "~/.claude/stats-cache.json",
 			CodexSessionsPath:    "~/.codex/sessions",
-			AntigravityConvPath:  "~/.gemini/antigravity/conversations",
+			AntigravityConvPath:  "~/.gemini/antigravity-cli/conversations",
 		},
 		Pricing: Pricing{
 			URL:       "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",

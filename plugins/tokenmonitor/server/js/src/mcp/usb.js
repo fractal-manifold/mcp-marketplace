@@ -253,6 +253,16 @@ export function buildUSBPayload(deps, args, code, expectID) {
       pskHex = existing;
       pskReused = true;
     } else {
+      // Registry-less (legacy global-PSK) mode cannot persist a minted
+      // per-device PSK — it would be lost the instant this call returns and
+      // orphan the device (it signs with a key nobody has). Require an
+      // explicit psk_hex there instead of silently generating one.
+      if (!deps.registry) {
+        return {
+          error:
+            "setting broker_url over USB without a device registry needs an explicit psk_hex (a generated PSK cannot be persisted here and would orphan the device)",
+        };
+      }
       pskHex = randomBytes(32).toString("hex");
       pskGenerated = true;
     }

@@ -49,6 +49,23 @@ test("broker_url with no psk_hex and no device_id → error (High finding)", asy
   assert.match(r.error, /setting broker_url over USB needs device_id/);
 });
 
+test("broker_url + device_id but no registry → refuses to mint an orphan PSK", () => {
+  // A minted PSK can only be kept if there is a registry to persist it in.
+  // Without one it would be pushed to the device and immediately lost, leaving
+  // the device signing with a key nobody on the host has. Parity with Go's
+  // TestBuildUSBPayload_NoRegistryRefusesToMintPSK.
+  const r = buildUSBPayload(mkDeps(), { broker_url: "http://10.0.0.5:8787" }, "123456", "02c4777c");
+  // Byte-for-byte, not a substring: compat/mcp-errors.md publishes this string
+  // as the cross-runtime contract, and a substring match would let the three
+  // runtimes drift apart in the parenthetical that explains the refusal.
+  assert.equal(
+    r.error,
+    "setting broker_url over USB without a device registry needs an explicit psk_hex " +
+      "(a generated PSK cannot be persisted here and would orphan the device)",
+  );
+  assert.ok(!r.pskGenerated, "no PSK may be minted without somewhere to keep it");
+});
+
 test("malformed psk_hex → error", async () => {
   const r = await handleUSBProvision(mkDeps(), { pairing_code: "123456", port: "/dev/ttyACM0", psk_hex: "abc" });
   assert.match(r.error, /psk_hex must be 64 hex chars/);

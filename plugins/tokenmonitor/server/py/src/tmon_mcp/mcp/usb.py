@@ -331,6 +331,20 @@ def build_usb_payload(
         if existing:
             psk_hex, psk_reused = existing, True
         else:
+            # Registry-less (legacy global-PSK) mode cannot persist a minted
+            # per-device PSK — it would be lost the instant this call returns
+            # and orphan the device (it signs with a key nobody has). Require
+            # an explicit psk_hex there instead of silently generating one.
+            if deps.registry is None:
+                return (
+                    {},
+                    "",
+                    False,
+                    False,
+                    "setting broker_url over USB without a device registry needs an "
+                    "explicit psk_hex (a generated PSK cannot be persisted here and "
+                    "would orphan the device)",
+                )
             psk_hex, psk_generated = secrets.token_hex(32), True
 
     # A broker_url with no PSK to sign with is a dead config: it can only be

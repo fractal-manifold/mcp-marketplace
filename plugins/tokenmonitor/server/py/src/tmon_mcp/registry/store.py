@@ -478,7 +478,9 @@ class Registry:
             self._fd: int | None = None
 
         def __enter__(self) -> "Registry._FileLock":
-            self._fd = os.open(str(self._path), os.O_CREAT | os.O_RDWR, 0o644)
+            # 0o600, matching Go and JS: the lock file is empty, but it sits
+            # beside the PSK-bearing TOMLs and the whole store is owner-only.
+            self._fd = os.open(str(self._path), os.O_CREAT | os.O_RDWR, 0o600)
             fcntl.flock(self._fd, fcntl.LOCK_EX)
             return self
 
