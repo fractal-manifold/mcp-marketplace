@@ -40,6 +40,66 @@ export const SCHEMA_VERSION = 3;
 const DEVICE_ID_RE = /^[0-9a-f]{8}$/;
 export function validDeviceID(id) { return DEVICE_ID_RE.test(id); }
 
+const IPV4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+
+// remoteIPv4 extracts the IPv4 literal from a socket peer address — "ip",
+// "ip:port", or an IPv6 form we deliberately do not accept — returning "" for
+// anything else. Node hands us a bare address in socket.remoteAddress, but an
+// IPv4-mapped one ("::ffff:192.168.1.5") is common on a dual-stack listener,
+// so that shape is unwrapped too.
+export function remoteIPv4(remoteAddr) {
+  if (!remoteAddr) return "";
+  let host = String(remoteAddr);
+  if (host.startsWith("[")) host = host.slice(1).split("]")[0];
+  else if ((host.match(/:/g) || []).length === 1) host = host.split(":")[0];
+  if (host.toLowerCase().startsWith("::ffff:")) host = host.slice(7);
+  const m = IPV4_RE.exec(host);
+  if (!m) return "";
+  for (let i = 1; i <= 4; i++) {
+    const o = Number(m[i]);
+    if (!Number.isInteger(o) || o < 0 || o > 255) return "";
+  }
+  // Loopback is not a device on the LAN, and recording it would replace the
+  // address a later OTA wants to match its own interfaces against.
+  if (Number(m[1]) === 127) return "";
+  return host;
+}
+
+// localIPv4Port normalises a socket-local address to "<ipv4>:<port>",
+// returning "" for anything unusable. An IPv4-mapped address
+// ("::ffff:192.168.1.28", what a dual-stack listener reports) is unwrapped so a
+// broker bound to "::" records the same string as one bound to "0.0.0.0" — the
+// device compares this origin by exact string match, so the two must not
+// disagree. Loopback and the unspecified address return "": both are real local
+// addresses, but neither is what a device on the LAN dialled, and recording one
+// would hand out a firmware_url pointing back at the device itself.
+export function localIPv4Port(addr) {
+  if (!addr) return "";
+  let host = String(addr);
+  let port = "";
+  if (host.startsWith("[")) {
+    const close = host.indexOf("]");
+    if (close < 0) return "";
+    port = host.slice(close + 1).startsWith(":") ? host.slice(close + 2) : "";
+    host = host.slice(1, close);
+  } else if ((host.match(/:/g) || []).length === 1) {
+    [host, port] = host.split(":");
+  } else {
+    return "";
+  }
+  if (!port || !/^[0-9]+$/.test(port)) return "";
+  if (host.toLowerCase().startsWith("::ffff:")) host = host.slice(7);
+  const m = IPV4_RE.exec(host);
+  if (!m) return "";
+  for (let i = 1; i <= 4; i++) {
+    const o = Number(m[i]);
+    if (!Number.isInteger(o) || o < 0 || o > 255) return "";
+  }
+  if (Number(m[1]) === 127) return "";
+  if (host === "0.0.0.0") return "";
+  return `${host}:${port}`;
+}
+
 export class RegistryError extends Error {}
 export class NotFound extends RegistryError {}
 
@@ -112,7 +172,7 @@ export class Registry {
         this._loadLocked(id);
         throw new RegistryError(`registry: device ${id} already exists`);
       } catch (e) { if (!(e instanceof NotFound)) throw e; }
-      const dev = { schemaVersion: SCHEMA_VERSION, deviceID: id, serialNumber: "", hwSku: "", channel: normalizeChannel(active.channel), blockedFirmwareVersion: "", active: { payload: active, lastSeen: null }, pending: null };
+      const dev = { schemaVersion: SCHEMA_VERSION, deviceID: id, serialNumber: "", hwSku: "", channel: normalizeChannel(active.channel), blockedFirmwareVersion: "", active: { payload: active, lastSeen: null, lastIP: "", lastLocalAddr: "" }, pending: null };
       delete active.channel; // channel is device-level, not part of the config payload
       this._saveLocked(dev);
       return dev;
@@ -153,6 +213,8 @@ export class Registry {
       // and has no reason to re-report them just because the broker record
       // was replaced.
       dev.active = { payload: active, lastSeen: prev ? prev.lastSeen : null,
+                     lastIP: prev ? (prev.lastIP || "") : "",
+                     lastLocalAddr: prev ? (prev.lastLocalAddr || "") : "",
                      wifiKnown: prev ? (prev.wifiKnown ?? null) : null };
       dev.pending = null;
       this._saveLocked(dev);
@@ -235,6 +297,8 @@ export class Registry {
       dev.active = {
         payload: promotedPayload,
         lastSeen: new Date(),
+        lastIP: dev.active.lastIP || "",
+        lastLocalAddr: dev.active.lastLocalAddr || "",
         // Observed state survives a config promote untouched — the device
         // reports it on its own cadence and a promote knows nothing about it.
         // Without this the list would be wiped on every promote and set_wifi
@@ -247,12 +311,38 @@ export class Registry {
     });
   }
 
-  touch(id) {
+  // touch records freshness and the source address the request came from.
+  //
+  // lastIP exists so the broker can answer "which of MY addresses is on the
+  // device's network" when staging an OTA: a host with WiFi and Ethernet on
+  // different subnets would otherwise hand out a firmware_url the device
+  // cannot reach, and — worse — one the firmware treats as a foreign origin,
+  // so it withholds the HMAC headers and the download 401s.
+  //
+  // remoteAddr is "host:port" or a bare host; anything that is not a usable
+  // IPv4 literal leaves the recorded address alone rather than clearing it, so
+  // a request arriving over IPv6 or loopback does not erase the LAN address a
+  // later OTA wants to match against.
+  //
+  // localAddr is OUR side of the same connection, "<ipv4>:<port>" — what the
+  // device dialled, taken from the socket and never from the Host header. It is
+  // the only address known to match the device's NVS svc_url, which the
+  // firmware compares OTA origins against by exact strcmp: hand it a
+  // firmware_url on any other address of ours and it withholds the HMAC
+  // headers, so /firmware/ 401s and — unlike the manifest gate — the version
+  // gets poisoned on-device after three tries. Same rule as remoteAddr: an
+  // unusable value leaves the last good one in place, because a stale broker
+  // origin still beats guessing among this host's interfaces.
+  touch(id, remoteAddr = "", localAddr = "") {
     if (!validDeviceID(id)) return;
+    const ip = remoteIPv4(remoteAddr);
+    const local = localIPv4Port(localAddr);
     this._withLock(id, () => {
       let dev;
       try { dev = this._loadLocked(id); } catch (e) { if (e instanceof NotFound) return; throw e; }
       dev.active.lastSeen = new Date();
+      if (ip) dev.active.lastIP = ip;
+      if (local) dev.active.lastLocalAddr = local;
       this._saveLocked(dev);
     });
   }
@@ -323,14 +413,30 @@ export class Registry {
     });
   }
 
-  // bumpMinSV is monotonic — never lowers the floor.
-  bumpMinSV(id, sv) {
+  // recordMinSV mirrors the anti-rollback floor the device reports in
+  // X-Tmon-Min-Sv. It FOLLOWS the device, including downwards.
+  //
+  // It used to be monotonic here, on the reasoning that a spoofed-high value
+  // could only lock a device out of downgrades. That stopped being true once
+  // the broker began refusing to stage a manifest whose floor sits below the
+  // device's (predictDeviceGate): a mirror that is stale-high now blocks
+  // legitimate updates too, and the operator sees a refusal citing a floor the
+  // device does not actually have.
+  //
+  // Following the device is safe. tmon_min_sv is the device's own state and the
+  // device enforces it regardless of what it told us; the header is unsigned
+  // metadata by contract (compat/SECURITY.md), so a lie here cannot make the
+  // device install anything it would otherwise refuse — it can only make the
+  // broker offer something the device then rejects, which is the pre-existing
+  // behaviour for every unsigned header. Monotonicity is still enforced where
+  // it belongs: mergePayload refuses to LOWER the floor via a pushed config.
+  recordMinSV(id, sv) {
     if (!validDeviceID(id)) return;
     this._withLock(id, () => {
       let dev;
       try { dev = this._loadLocked(id); } catch (e) { if (e instanceof NotFound) return; throw e; }
       const cur = Number(dev.active.payload.min_secure_version || 0);
-      if (sv <= cur) return;
+      if (Number(sv) === cur) return;
       dev.active.payload.min_secure_version = Number(sv);
       this._saveLocked(dev);
     });
@@ -570,6 +676,8 @@ function deviceToTOML(dev) {
   if (dev.blockedFirmwareVersion) doc.blocked_firmware_version = dev.blockedFirmwareVersion;
   const a = payloadToTomlObj(dev.active.payload);
   if (dev.active.lastSeen) a.last_seen = dev.active.lastSeen;
+  if (dev.active.lastIP) a.last_ip = dev.active.lastIP;
+  if (dev.active.lastLocalAddr) a.last_local_addr = dev.active.lastLocalAddr;
   // != null, not truthiness on length: an empty list means the device reported
   // remembering NO networks, a different answer from never having reported at
   // all — and every load() re-reads this file, so collapsing them here would
@@ -595,6 +703,8 @@ function deviceFromTOML(text) {
   const active = {
     payload: tomlObjToPayload(d.active),
     lastSeen: d.active?.last_seen ? new Date(d.active.last_seen) : null,
+    lastIP: String(d.active?.last_ip || ""),
+    lastLocalAddr: String(d.active?.last_local_addr || ""),
     // Device-OBSERVED state, not configuration: the networks the device
     // remembers, by NAME only. null means the device never reported (firmware
     // predating the field) — distinct from [] meaning "I remember none".

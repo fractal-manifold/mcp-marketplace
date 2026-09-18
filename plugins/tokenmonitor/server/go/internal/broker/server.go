@@ -9,6 +9,7 @@
 package broker
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -81,18 +82,136 @@ func (v firmwareLogsView) Tail(n int) []string { return v.buf.Tail(n) }
 func (v firmwareLogsView) Len() int            { return v.buf.Len() }
 func (v firmwareLogsView) Connected() bool     { return v.connected() }
 
+// RespSigHeader carries the broker's proof that it holds the device's PSK.
+// See auth.ComputeResponseSignature and compat/HMAC_CANONICAL.md.
+const RespSigHeader = "X-Tmon-Resp-Signature"
+
+// respSigCtx is everything the response canonical input needs besides the
+// status and the body, captured from the request at the moment auth succeeded.
+type respSigCtx struct {
+	psk    []byte
+	device string
+	nonce  string
+	host   string
+	path   string
+}
+
 // statusRecorder lets us learn the response code chosen by the handler
 // so we can record it on the shared *state.State. Every code path in
 // this package calls WriteHeader explicitly, so the default of 200 is
 // only used in the unlikely "wrote a body without WriteHeader" case.
+//
+// It doubles as the response signer. While `sign` is nil it is a pure
+// pass-through — which is what /firmware/ (a ranged, streamed multi-megabyte
+// download) and every pre-auth error path stay on. A handler that has just
+// authenticated a device calls armResponseSignature, and from then on the body
+// is buffered so the tag can cover it, then flushed by finish().
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
+
+	sign      *respSigCtx
+	buf       bytes.Buffer
+	buffering bool
+	finished  bool
 }
 
 func (r *statusRecorder) WriteHeader(s int) {
 	r.status = s
+	if r.buffering {
+		return // held back until finish() can add the signature header
+	}
 	r.ResponseWriter.WriteHeader(s)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if r.buffering {
+		return r.buf.Write(b)
+	}
+	return r.ResponseWriter.Write(b)
+}
+
+// armResponseSignature tells the recorder to sign whatever the handler writes
+// from here on. Must be called BEFORE the first Write/WriteHeader — after
+// auth succeeded and with the PSK that actually satisfied it (which may be the
+// pending one during a key rotation; the device holds that same key or the
+// signature it just sent would not have verified).
+//
+// A no-op when `w` is not a *statusRecorder (unit tests calling handlers with
+// a bare httptest.ResponseRecorder) or when psk is empty (the legacy
+// global-PSK path, where there is no per-device pairing to prove).
+func armResponseSignature(w http.ResponseWriter, psk []byte, r *http.Request, path string) {
+	rec, ok := w.(*statusRecorder)
+	if !ok || len(psk) == 0 || rec.finished {
+		return
+	}
+	host := auth.ResponseSigHost(r)
+	if host == "" {
+		// No local address to bind to. Signing an empty host would make every
+		// address canonicalise alike and switch the relay binding off, so emit
+		// no tag at all: the device treats a missing tag as "an older broker",
+		// which is survivable, where a forgeable one is not.
+		return
+	}
+	rec.sign = &respSigCtx{
+		psk:    psk,
+		device: r.Header.Get("X-Tmon-Device"),
+		nonce:  r.Header.Get("X-Tmon-Nonce"),
+		host:   host,
+		path:   path,
+	}
+	rec.buffering = true
+}
+
+// pskAt returns psks[i] when that index exists and is non-empty. VerifyMulti's
+// PSKIndex always points at a real entry on success; the bounds check is here
+// so a future caller passing a shorter slice degrades to "do not sign" rather
+// than panicking mid-response.
+func pskAt(psks [][]byte, i int) []byte {
+	if i < 0 || i >= len(psks) {
+		return nil
+	}
+	return psks[i]
+}
+
+// finishOrAbort is the deferred half of the signing wrapper. On a normal
+// return it flushes the buffered response; on a panic it throws the buffer
+// away and re-panics so net/http's own recovery closes the connection as it
+// always did.
+//
+// Without the panic arm, a handler that blew up mid-response would have its
+// partial (usually empty) body signed and sent as a well-formed 200 — the
+// device would parse "" and carry on, which turns a crash into something that
+// looks like a valid answer from a broker that proved its identity.
+func finishOrAbort(rec *statusRecorder) {
+	if p := recover(); p != nil {
+		rec.finished = true // discard the buffer; sign nothing
+		panic(p)
+	}
+	rec.finish()
+}
+
+// finish flushes a buffered response, adding the signature header. Safe to
+// call on an unarmed recorder (nothing was buffered) and safe to call twice.
+func (r *statusRecorder) finish() {
+	if r.finished {
+		return
+	}
+	r.finished = true
+	if !r.buffering {
+		return
+	}
+	r.buffering = false
+	body := r.buf.Bytes()
+	sig := auth.ComputeResponseSignature(r.sign.psk, r.sign.device, r.sign.nonce,
+		r.sign.host, r.sign.path, r.status, auth.BodySHA256Hex(body))
+	r.Header().Set(RespSigHeader, sig)
+	// Content-Length may have been set from the handler's own count; it still
+	// matches, since buffering does not alter the bytes.
+	r.ResponseWriter.WriteHeader(r.status)
+	if len(body) > 0 {
+		_, _ = r.ResponseWriter.Write(body)
+	}
 }
 
 // Unwrap exposes the wrapped ResponseWriter so http.ResponseController can
@@ -117,6 +236,7 @@ func NewMux(cfg *config.Config, cache *auth.NonceCache, st *state.State, logger 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/credentials", func(w http.ResponseWriter, r *http.Request) {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		defer finishOrAbort(rec)
 		handleCredentials(cfg, cache, logger, reg, rec, r)
 		if st != nil {
 			st.RecordRequest(r.RemoteAddr, rec.status, time.Now())
@@ -124,6 +244,7 @@ func NewMux(cfg *config.Config, cache *auth.NonceCache, st *state.State, logger 
 	})
 	mux.HandleFunc("/credentials/codex", func(w http.ResponseWriter, r *http.Request) {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		defer finishOrAbort(rec)
 		handleCodexCredentials(cfg, cache, logger, reg, rec, r)
 		if st != nil {
 			st.RecordRequest(r.RemoteAddr, rec.status, time.Now())
@@ -138,6 +259,7 @@ func NewMux(cfg *config.Config, cache *auth.NonceCache, st *state.State, logger 
 	// the path after auth. lease is nil when no serial device is configured.
 	serialLease := func(w http.ResponseWriter, r *http.Request) {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		defer finishOrAbort(rec)
 		handleSerialLease(cfg, cache, logger, lease, rec, r)
 		if st != nil {
 			st.RecordRequest(r.RemoteAddr, rec.status, time.Now())
@@ -148,6 +270,7 @@ func NewMux(cfg *config.Config, cache *auth.NonceCache, st *state.State, logger 
 	mux.HandleFunc(usbprov.LeaseReleasePath, serialLease)
 	mux.HandleFunc("/device/", func(w http.ResponseWriter, r *http.Request) {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		defer finishOrAbort(rec)
 		// /device/{id}/sync (GET, control plane) vs /device/{id}/logs
 		// (POST, diagnostic upload) vs /device/{id}/settings (POST,
 		// device-reported display settings). All authenticate the same way.
@@ -166,6 +289,7 @@ func NewMux(cfg *config.Config, cache *auth.NonceCache, st *state.State, logger 
 	})
 	mux.HandleFunc("/usage/", func(w http.ResponseWriter, r *http.Request) {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		defer finishOrAbort(rec)
 		handleUsage(cfg, cache, logger, reg, usageCache, rec, r)
 		if st != nil {
 			st.RecordRequest(r.RemoteAddr, rec.status, time.Now())
@@ -173,6 +297,7 @@ func NewMux(cfg *config.Config, cache *auth.NonceCache, st *state.State, logger 
 	})
 	mux.HandleFunc("/spend/", func(w http.ResponseWriter, r *http.Request) {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		defer finishOrAbort(rec)
 		handleSpend(cfg, cache, logger, reg, spendCache, rec, r)
 		if st != nil {
 			st.RecordRequest(r.RemoteAddr, rec.status, time.Now())
@@ -180,6 +305,7 @@ func NewMux(cfg *config.Config, cache *auth.NonceCache, st *state.State, logger 
 	})
 	mux.HandleFunc("/firmware/", func(w http.ResponseWriter, r *http.Request) {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		defer finishOrAbort(rec)
 		handleFirmware(cfg, cache, logger, reg, rec, r)
 		if st != nil {
 			st.RecordRequest(r.RemoteAddr, rec.status, time.Now())
@@ -292,7 +418,22 @@ func handleFirmware(cfg *config.Config, cache *auth.NonceCache, logger *log.Logg
 		time.Duration(cfg.Security.MaxTimestampSkewSeconds)*time.Second,
 		time.Now(),
 	); verr != nil {
-		logger.Printf("auth rejected /firmware/%s from %s: %v", name, r.RemoteAddr, verr)
+		if r.Header.Get("X-Tmon-Signature") == "" {
+			// No signature at all is not a bad key — it is the device
+			// deliberately withholding the headers because this URL's origin
+			// is not the one it proved as its broker (tmon_ota.c compares the
+			// firmware_url origin against NVS svc_url with strcmp). Naming it
+			// separately matters because the two failures need opposite fixes,
+			// and this one poisons the version on-device after three tries.
+			logger.Printf("auth rejected /firmware/%s from %s: unsigned request — "+
+				"the device withholds HMAC headers when the firmware_url origin "+
+				"differs from the broker address it proved; we answered on %s. "+
+				"Re-stage with a firmware_url on that origin (publish_firmware "+
+				"picks it automatically once the device has polled /sync)",
+				name, r.RemoteAddr, auth.ResponseSigHost(r))
+		} else {
+			logger.Printf("auth rejected /firmware/%s from %s: %v", name, r.RemoteAddr, verr)
+		}
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -517,9 +658,12 @@ func verifyCredentialRequest(cfg *config.Config, cache *auth.NonceCache, logger 
 		if _, perr := reg.MaybePromote(deviceID, obs, res.PSKIndex == 1); perr != nil {
 			logger.Printf("registry promote %s: %v", deviceID, perr)
 		}
-		if terr := reg.Touch(deviceID); terr != nil {
+		if terr := reg.Touch(deviceID, r.RemoteAddr, auth.ResponseSigHost(r)); terr != nil {
 			logger.Printf("registry touch %s: %v", deviceID, terr)
 		}
+		// Prove to the device that we hold its PSK — with the same key that
+		// just satisfied its request, so a rotation signs with the pending one.
+		armResponseSignature(w, pskAt([][]byte{active, pending}, res.PSKIndex), r, path)
 		return true
 	}
 
@@ -761,9 +905,19 @@ func pendingPayloadJSON(p registry.ConfigPayload) ([]byte, error) {
 	wire := map[string]any{
 		"version": p.Version,
 	}
-	if p.BrokerURL != "" {
-		wire["broker_url"] = p.BrokerURL
-	}
+	// broker_url is deliberately NOT emitted. The broker's address is no
+	// longer configuration the control plane owns: the device locates it by
+	// mDNS on its own subnet and adopts it only after the response signature
+	// proves the pairing (compat/mdns.md). Echoing the registry's value here
+	// used to overwrite a freshly-discovered address with the one recorded at
+	// registration time — and, because the firmware treats a broker_url change
+	// as channel identity, reboot the device onto an address that had already
+	// stopped working. The registry field survives as a last-known-address
+	// record; nothing authoritative reads it.
+	//
+	// Deployed firmware tolerates the absence: promote_candidate guards on
+	// presence and probe_candidate documents the fallback explicitly
+	// ("either may be absent on a partial update — keep the active value").
 	if p.PSKHex != "" {
 		wire["psk_hex"] = p.PSKHex
 	}
@@ -948,9 +1102,13 @@ func handleDeviceSync(cfg *config.Config, cache *auth.NonceCache, logger *log.Lo
 	if _, perr := reg.MaybePromote(deviceID, observed, res.PSKIndex == 1); perr != nil {
 		logger.Printf("registry promote %s: %v", deviceID, perr)
 	}
-	if terr := reg.Touch(deviceID); terr != nil {
+	if terr := reg.Touch(deviceID, r.RemoteAddr, auth.ResponseSigHost(r)); terr != nil {
 		logger.Printf("registry touch %s: %v", deviceID, terr)
 	}
+	// Prove we hold the PSK. /sync is the endpoint the device uses to decide
+	// whether a discovered address really is its broker, so this tag is the
+	// adoption gate — see compat/mdns.md.
+	armResponseSignature(w, pskAt([][]byte{active, pending}, res.PSKIndex), r, signedPath)
 	// Schema v2: capture the device's reported factory serial + SKU
 	// when present. These headers are NOT bound to the HMAC (see
 	// CLAUDE.md "Things NOT to assume" — the X-Tmon-Sku is metadata of
@@ -962,12 +1120,12 @@ func handleDeviceSync(cfg *config.Config, cache *auth.NonceCache, logger *log.Lo
 			logger.Printf("registry set-serial %s: %v", deviceID, serr)
 		}
 	}
-	// Mirror the device's anti-rollback floor. BumpMinSV is monotonic
-	// in the registry; a spoofed-high value can only lock the device
-	// out of downgrade attacks, not enable one.
+	// Mirror the device's anti-rollback floor, following it in both
+	// directions — see RecordMinSV for why this is observed state rather than
+	// a high-water mark now that staging decisions depend on it.
 	if msv := r.Header.Get("X-Tmon-Min-Sv"); msv != "" {
 		if sv, err := strconv.ParseUint(msv, 10, 32); err == nil {
-			if berr := reg.BumpMinSV(deviceID, uint32(sv)); berr != nil {
+			if berr := reg.RecordMinSV(deviceID, uint32(sv)); berr != nil {
 				logger.Printf("registry bump-min-sv %s: %v", deviceID, berr)
 			}
 		}
@@ -1242,7 +1400,7 @@ func handleDeviceLogs(cfg *config.Config, cache *auth.NonceCache, logger *log.Lo
 	}
 
 	signedPath := r.URL.Path
-	if _, verr := auth.VerifyMultiBody(
+	res, verr := auth.VerifyMultiBody(
 		[][]byte{active, pending},
 		"POST", signedPath,
 		r.Header.Get("X-Tmon-Timestamp"),
@@ -1255,11 +1413,13 @@ func handleDeviceLogs(cfg *config.Config, cache *auth.NonceCache, logger *log.Lo
 		cache,
 		time.Duration(cfg.Security.MaxTimestampSkewSeconds)*time.Second,
 		time.Now(),
-	); verr != nil {
+	)
+	if verr != nil {
 		logger.Printf("auth rejected /device/%s/logs from %s: %v", deviceID, r.RemoteAddr, verr)
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
+	armResponseSignature(w, pskAt([][]byte{active, pending}, res.PSKIndex), r, signedPath)
 
 	lines := devlog.StampLines(string(raw), time.Now())
 	if aerr := devlog.Append(devlog.DirFor(reg.Dir()), deviceID, lines); aerr != nil {
@@ -1364,7 +1524,7 @@ func handleDeviceSettings(cfg *config.Config, cache *auth.NonceCache, logger *lo
 	}
 
 	signedPath := r.URL.Path
-	if _, verr := auth.VerifyMultiBody(
+	res, verr := auth.VerifyMultiBody(
 		[][]byte{active, pending},
 		"POST", signedPath,
 		r.Header.Get("X-Tmon-Timestamp"),
@@ -1377,11 +1537,13 @@ func handleDeviceSettings(cfg *config.Config, cache *auth.NonceCache, logger *lo
 		cache,
 		time.Duration(cfg.Security.MaxTimestampSkewSeconds)*time.Second,
 		time.Now(),
-	); verr != nil {
+	)
+	if verr != nil {
 		logger.Printf("auth rejected /device/%s/settings from %s: %v", deviceID, r.RemoteAddr, verr)
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
+	armResponseSignature(w, pskAt([][]byte{active, pending}, res.PSKIndex), r, signedPath)
 	// Canonical body handling shared with the Python/JS brokers: an empty
 	// (or whitespace-only) body is a no-op; anything present must be a single
 	// JSON object with no trailing data; null / arrays / scalars are rejected.

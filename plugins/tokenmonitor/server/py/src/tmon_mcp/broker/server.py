@@ -40,6 +40,77 @@ def _error(status: int, msg: str) -> web.Response:
     return web.json_response({"error": msg}, status=status)
 
 
+# --- response signature (the broker's half of the pairing proof) ------------
+#
+# The device now finds this broker by mDNS rather than by a configured
+# address, so it needs a way to tell us apart from anything else on the LAN
+# advertising the same (public) device_id. Every per-device-authenticated
+# response carries an HMAC over the request's own nonce, the path, the status
+# and the body, keyed with the device's PSK. Mirrors armResponseSignature /
+# statusRecorder.finish in the Go broker; see compat/HMAC_CANONICAL.md.
+#
+# Deliberately NOT emitted on: pre-auth errors (we have no PSK to sign with
+# and must not turn an unauthenticated probe into an oracle), the legacy
+# global-PSK path (there is no per-device pairing to prove), and /firmware/
+# (a ranged multi-megabyte FileResponse — the OTA image carries its own
+# Ed25519 signature).
+
+_RESPSIG_KEY = "tmon_resp_sig"
+
+
+def _arm_response_signature(req: web.Request, psk: bytes | None, path: str) -> None:
+    """Sign this request's response with `psk` — the key that just satisfied
+    its auth, which during a rotation is the pending one (the device holds it
+    too, or its request would not have verified)."""
+    if not psk:
+        return
+    host = auth.response_sig_host(req)
+    if not host:
+        # No local address to bind to. Signing an empty host would make every
+        # address canonicalise alike and switch the relay binding off, so emit
+        # no tag at all: the device reads a missing tag as "an older broker",
+        # which is survivable, where a forgeable one is not.
+        return
+    req[_RESPSIG_KEY] = {
+        "psk": psk,
+        "device": req.headers.get("X-Tmon-Device", ""),
+        "nonce": req.headers.get("X-Tmon-Nonce", ""),
+        "host": host,
+        "path": path,
+    }
+
+
+def _psk_at(psks: list[bytes | None], i: int) -> bytes | None:
+    """psks[i] when that index exists. verify_multi's psk_index always points
+    at a real entry on success; the bounds check is so a future caller passing
+    a shorter list degrades to "do not sign" rather than raising mid-response."""
+    if i < 0 or i >= len(psks):
+        return None
+    return psks[i]
+
+
+@web.middleware
+async def _response_signature_middleware(req: web.Request, handler):
+    resp = await handler(req)
+    ctx = req.get(_RESPSIG_KEY)
+    if not ctx:
+        return resp
+    # Only a fully-buffered response can be signed: the tag covers the body.
+    # A StreamResponse/FileResponse has no `body` and is never armed anyway.
+    body = getattr(resp, "body", None)
+    if body is None:
+        body = b""
+    elif not isinstance(body, bytes):
+        # aiohttp Payload (e.g. a file). Nothing arms one today; refusing to
+        # guess its bytes beats emitting a tag that cannot verify.
+        return resp
+    resp.headers[auth.RESPONSE_SIG_HEADER] = auth.compute_response_signature(
+        ctx["psk"], ctx["device"], ctx["nonce"], ctx["host"], ctx["path"],
+        resp.status, auth.body_sha256_hex(body),
+    )
+    return resp
+
+
 def _snapshot_body(snap: Any) -> dict:
     """asdict(snap) but with `degraded` emitted only when true — so the wire
     matches Go (omitempty) and JS (property set only when true). Harmless for
@@ -100,7 +171,7 @@ def make_app(
     spend_cache: spend.Cache | None = None,
     lease: "usbprov.LeaseManager | None" = None,
 ) -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[_response_signature_middleware])
     app["cfg"] = cfg
     app["cache"] = cache
     app["state"] = state
@@ -490,7 +561,22 @@ async def _handle_firmware(req: web.Request) -> web.Response:
             cfg.security.max_timestamp_skew_seconds,
         )
     except auth.AuthError as e:
-        log.info("auth rejected /firmware/%s from %s: %s", name, req.remote, e)
+        if not req.headers.get("X-Tmon-Signature", ""):
+            # No signature at all is not a bad key — it is the device
+            # deliberately withholding the headers because this URL's origin is
+            # not the one it proved as its broker (tmon_ota.c compares the
+            # firmware_url origin against NVS svc_url with strcmp). Naming it
+            # separately matters because the two failures need opposite fixes,
+            # and this one poisons the version on-device after three tries.
+            log.info(
+                "auth rejected /firmware/%s from %s: unsigned request — the device "
+                "withholds HMAC headers when the firmware_url origin differs from "
+                "the broker address it proved; we answered on %s. Re-stage with a "
+                "firmware_url on that origin (publish_firmware picks it "
+                "automatically once the device has polled /sync)",
+                name, req.remote, auth.response_sig_host(req))
+        else:
+            log.info("auth rejected /firmware/%s from %s: %s", name, req.remote, e)
         return _error(401, "unauthorized")
 
     if not full.is_file():
@@ -551,9 +637,11 @@ async def _handle_credentials(req: web.Request) -> web.Response:
             except Exception as e:
                 log.warning("registry promote %s: %s", device_id, e)
             try:
-                registry.touch(device_id)
+                registry.touch(device_id, req.remote or "", auth.response_sig_host(req))
             except Exception as e:
                 log.warning("registry touch %s: %s", device_id, e)
+            _arm_response_signature(
+                req, _psk_at([active, pending], res.psk_index), "/credentials")
         else:
             try:
                 auth.verify(
@@ -639,9 +727,10 @@ async def _verify_for_path(req: web.Request, path: str) -> tuple[bool, web.Respo
         except Exception as e:
             log.warning("registry promote %s: %s", device_id, e)
         try:
-            registry.touch(device_id)
+            registry.touch(device_id, req.remote or "", auth.response_sig_host(req))
         except Exception as e:
             log.warning("registry touch %s: %s", device_id, e)
+        _arm_response_signature(req, _psk_at([active, pending], res.psk_index), path)
         return True, None
 
     try:
@@ -937,7 +1026,7 @@ async def _handle_device_panel(req: web.Request) -> web.Response:
         return _error(500, "registry error")
 
     try:
-        auth.verify_multi(
+        res = auth.verify_multi(
             [active, pending],
             "GET", req.path,
             req.headers.get("X-Tmon-Timestamp", ""),
@@ -951,6 +1040,7 @@ async def _handle_device_panel(req: web.Request) -> web.Response:
     except auth.AuthError as e:
         log.info("auth rejected /device/%s/panel from %s: %s", device_id, req.remote, e)
         return _error(401, "unauthorized")
+    _arm_response_signature(req, _psk_at([active, pending], res.psk_index), req.path)
 
     path = _resolve_panel_path(cfg, device_id)
     if not path:
@@ -1011,9 +1101,10 @@ async def _handle_device_sync(req: web.Request) -> web.Response:
         except Exception as e:
             log.warning("registry promote %s: %s", device_id, e)
         try:
-            registry.touch(device_id)
+            registry.touch(device_id, req.remote or "", auth.response_sig_host(req))
         except Exception as e:
             log.warning("registry touch %s: %s", device_id, e)
+        _arm_response_signature(req, _psk_at([active, pending], res.psk_index), signed_path)
         # Schema v2: capture factory identity from headers. Not bound to
         # HMAC — metadata only. The Ed25519 manifest enforces SKU.
         serial_hdr = req.headers.get("X-Tmon-Serial", "")
@@ -1023,17 +1114,17 @@ async def _handle_device_sync(req: web.Request) -> web.Response:
                                     req.headers.get("X-Tmon-Sku", ""))
             except Exception as e:
                 log.warning("registry set_serial %s: %s", device_id, e)
-        # Mirror anti-rollback floor. bump_min_sv is monotonic, so a
-        # spoofed-high value only locks the device into rejecting
-        # downgrades — it can't enable one.
+        # Mirror the device's anti-rollback floor, following it in both
+        # directions — see record_min_sv for why this is observed state rather
+        # than a high-water mark now that staging decisions depend on it.
         min_sv_hdr = req.headers.get("X-Tmon-Min-Sv", "")
         if min_sv_hdr:
             try:
                 sv = int(min_sv_hdr)
                 if 0 <= sv <= 0xFFFFFFFF:
-                    registry.bump_min_sv(device_id, sv)
+                    registry.record_min_sv(device_id, sv)
             except (ValueError, Exception) as e:
-                log.warning("registry bump_min_sv %s: %s", device_id, e)
+                log.warning("registry record_min_sv %s: %s", device_id, e)
         # Persist the firmware version the device reports running into
         # Active.firmware_version (only-on-change). ota.decide() keys off it,
         # so this stops auto-discovery re-staging the same release after a
@@ -1154,7 +1245,7 @@ async def _handle_device_logs(req: web.Request) -> web.Response:
 
     signed_path = req.path
     try:
-        auth.verify_multi_body(
+        res = auth.verify_multi_body(
             [active, pending],
             "POST", signed_path,
             req.headers.get("X-Tmon-Timestamp", ""),
@@ -1170,6 +1261,7 @@ async def _handle_device_logs(req: web.Request) -> web.Response:
     except auth.AuthError as e:
         log.info("auth rejected /device/%s/logs from %s: %s", device_id, req.remote, e)
         return _error(401, "unauthorized")
+    _arm_response_signature(req, _psk_at([active, pending], res.psk_index), signed_path)
 
     lines = devlog.stamp_lines(raw.decode("utf-8", errors="replace"))
     try:
@@ -1224,7 +1316,7 @@ async def _handle_device_settings(req: web.Request) -> web.Response:
 
     signed_path = req.path
     try:
-        auth.verify_multi_body(
+        res = auth.verify_multi_body(
             [active, pending],
             "POST", signed_path,
             req.headers.get("X-Tmon-Timestamp", ""),
@@ -1240,6 +1332,7 @@ async def _handle_device_settings(req: web.Request) -> web.Response:
     except auth.AuthError as e:
         log.info("auth rejected /device/%s/settings from %s: %s", device_id, req.remote, e)
         return _error(401, "unauthorized")
+    _arm_response_signature(req, _psk_at([active, pending], res.psk_index), signed_path)
     try:
         text = raw.decode("utf-8").strip()
     except UnicodeDecodeError:
@@ -1434,8 +1527,16 @@ def _parse_uint32(s: str) -> int:
 
 def _pending_payload_json(p) -> str:
     wire: dict[str, Any] = {"version": int(p.version)}
-    if p.broker_url:
-        wire["broker_url"] = p.broker_url
+    # broker_url is deliberately NOT emitted. The broker's address is no longer
+    # configuration the control plane owns: the device locates it by mDNS on
+    # its own subnet and adopts it only after the response signature proves the
+    # pairing (compat/mdns.md). Echoing the registry's value here used to
+    # overwrite a freshly-discovered address with the one recorded at
+    # registration time — and, because the firmware treats a broker_url change
+    # as channel identity, reboot the device onto an address that had already
+    # stopped working. The registry field survives as a last-known-address
+    # record; nothing authoritative reads it. Deployed firmware tolerates the
+    # absence (promote_candidate guards on presence).
     if p.psk_hex:
         wire["psk_hex"] = p.psk_hex
     if p.city:

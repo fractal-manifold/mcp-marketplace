@@ -3,13 +3,17 @@ package mcp
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +21,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/config"
+	"github.com/fractal-manifold/tokenmonitor-mcp/internal/ota"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/registry"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/textutil"
 )
@@ -282,10 +287,13 @@ func handleSetDevicePending(d Deps) server.ToolHandlerFunc {
 			}
 		}
 
+		// No broker_url here: the device's broker address is not something the
+		// control plane sets any more. It is discovered by mDNS on the device's
+		// own subnet and adopted only after the response signature proves the
+		// pairing, so a staged address would be overwritten within a poll
+		// cycle — after costing a reboot. The provisioning tools still accept
+		// one as a cache seed for a device that has never resolved.
 		var update registry.ConfigPayload
-		if v := strings.TrimSpace(req.GetString("broker_url", "")); v != "" {
-			update.BrokerURL = v
-		}
 		if v := strings.ToLower(strings.TrimSpace(req.GetString("psk_hex", ""))); v != "" {
 			if len(v) != 64 {
 				return mcp.NewToolResultError("psk_hex must be exactly 64 hex chars"), nil
@@ -480,10 +488,11 @@ func handleSetDevicePending(d Deps) server.ToolHandlerFunc {
 		// Schema v2: signed manifest envelope. Optional in this call so
 		// CI can stage unsigned firmware against dev units, but a
 		// production device built without TMON_OTA_UNSIGNED will refuse
-		// to install an OTA whose pending lacks these fields. We do
-		// NOT parse the manifest here for sku/min_sv (the operator may
-		// be staging a manifest the broker doesn't have a pubkey for);
-		// the device-side gate is authoritative.
+		// to install an OTA whose pending lacks these fields. The broker
+		// holds no private key and cannot verify the signature — but it
+		// can READ the fields, which needs none, and that is enough to
+		// tell the operator what the device would silently refuse (see
+		// gateStagedFirmware).
 		if mb := strings.TrimSpace(req.GetString("firmware_manifest_b64", "")); mb != "" {
 			if len(mb) > 4096 {
 				return mcp.NewToolResultError("firmware_manifest_b64 exceeds 4 KiB"), nil
@@ -499,6 +508,23 @@ func handleSetDevicePending(d Deps) server.ToolHandlerFunc {
 		// Pair check: if either manifest field is present, BOTH must be.
 		if (update.FirmwareManifestB64 == "") != (update.FirmwareManifestSigB64 == "") {
 			return mcp.NewToolResultError("firmware_manifest_b64 and firmware_manifest_sig_b64 must be supplied together"), nil
+		}
+
+		// Predict the device-side gate before writing anything. A refusal here
+		// is a typo the operator can fix in seconds; the same mistake staged is
+		// a reboot the device spends telling nobody.
+		if update.FirmwareManifestB64 != "" || update.FirmwareURL != "" {
+			cur, err := d.Registry.Load(deviceID)
+			if err != nil {
+				if errors.Is(err, registry.ErrNotFound) {
+					return mcp.NewToolResultError(fmt.Sprintf("device %s not registered — call tokenmonitor_register_device first", deviceID)), nil
+				}
+				return mcp.NewToolResultErrorFromErr("load", err), nil
+			}
+			if bad := gateStagedFirmware(cur, update.FirmwareManifestB64,
+				update.FirmwareSHA256, update.FirmwareVersion, update.FirmwareURL); bad != nil {
+				return bad, nil
+			}
 		}
 
 		dev, err := d.Registry.SetPending(deviceID, update)
@@ -610,11 +636,30 @@ func handleRevertFirmware(d Deps) server.ToolHandlerFunc {
 			}
 			return mcp.NewToolResultErrorFromErr("load", err), nil
 		}
-		if targetSV > 0 && targetSV < dev.Active.MinSecureVersion {
-			return mcp.NewToolResultError(fmt.Sprintf(
-				"revert blocked by anti-rollback: target min_secure_version=%d < device floor=%d. "+
-					"To downgrade, issue a new firmware with min_secure_version below %d, signed by the KSK.",
-				targetSV, dev.Active.MinSecureVersion, dev.Active.MinSecureVersion)), nil
+		// The real authority is the manifest this call was handed, not the
+		// number the operator typed: the device gates on the signed
+		// min_secure_version AND on packed(version), and once its floor has
+		// risen past the target no manifest can lower it — a revert simply is
+		// not possible over OTA any more (USB is the way back). Predicting
+		// both here turns a silent on-device refusal, which costs a reboot and
+		// reports nothing, into an answer at the call site.
+		//
+		// target_min_secure_version stays accepted as a cross-check: if the
+		// operator states a floor, it must be the one the manifest actually
+		// declares, or one of the two is the wrong artifact.
+		if bad := gateStagedFirmware(dev, mb, fs, fv, fu); bad != nil {
+			return bad, nil
+		}
+		if targetSV > 0 {
+			if raw, err := base64.StdEncoding.DecodeString(mb); err == nil {
+				var tmf ota.ManifestFields
+				if json.Unmarshal(raw, &tmf) == nil && tmf.MinSecureVersion != targetSV {
+					return mcp.NewToolResultError(fmt.Sprintf(
+						"target_min_secure_version=%d but the supplied manifest for %s declares %d; "+
+							"one of the two is from a different build",
+						targetSV, tmf.Version, tmf.MinSecureVersion)), nil
+				}
+			}
 		}
 
 		update := registry.ConfigPayload{
@@ -680,6 +725,10 @@ func handlePublishFirmware(d Deps) server.ToolHandlerFunc {
 			return mcp.NewToolResultError("firmware_version must not contain whitespace or path separators"), nil
 		}
 
+		// Loaded to confirm the device is registered (SetPending below needs
+		// it, and the error here names the fix). The record's broker_url is
+		// NOT used to build the URL any more; its observed last_ip is, only to
+		// rank this host's own addresses — see localFirmwareBase.
 		dev, err := d.Registry.Load(deviceID)
 		if err != nil {
 			if errors.Is(err, registry.ErrNotFound) {
@@ -688,7 +737,7 @@ func handlePublishFirmware(d Deps) server.ToolHandlerFunc {
 			return mcp.NewToolResultErrorFromErr("load", err), nil
 		}
 
-		var firmwareURL, shaHex string
+		var firmwareURL, shaHex, originSource string
 		external := strings.TrimSpace(req.GetString("external_url", ""))
 
 		if external != "" {
@@ -747,11 +796,36 @@ func handlePublishFirmware(d Deps) server.ToolHandlerFunc {
 			}
 			shaHex = hex.EncodeToString(h.Sum(nil))
 
-			base := strings.TrimRight(dev.Active.BrokerURL, "/")
-			if base == "" {
-				return mcp.NewToolResultError("device has no active broker_url; cannot build firmware_url. Re-register the device first."), nil
+			// Build the URL from the address the device itself reached us on,
+			// not from the registry's recorded broker_url. The device locates
+			// the broker by mDNS and its address changes with DHCP, so the
+			// stored value goes stale silently — and a stale firmware_url is
+			// worse than unreachable: tmon_ota.c withholds the HMAC headers
+			// whenever the firmware origin differs from the svc_url the device
+			// is actually using, so the download would also be
+			// unauthenticated.
+			base, herr := firmwareBase(d, dev)
+			if herr != nil {
+				return mcp.NewToolResultError(herr.Error()), nil
 			}
-			firmwareURL = base + "/firmware/" + fileName
+			originSource = base.how
+			firmwareURL = base.url + "/firmware/" + fileName
+		}
+
+		// Cleartext transport is fine on a modern build — the manifest and the
+		// SHA are what establish trust, not TLS — but CONFIG_TMON_OTA_ALLOW_HTTP
+		// first appears in sdkconfig.secureboot at v0.10.2. Below that a
+		// production unit refuses any http:// firmware_url in config_sync.c and
+		// reports nothing, so the whole publish would land as silence.
+		if strings.HasPrefix(firmwareURL, "http://") {
+			if cur, ok := ota.PackSemver(dev.Active.FirmwareVersion); ok && cur < httpOTAFloor {
+				return mcp.NewToolResultError(fmt.Sprintf(
+					"device %s runs %s, and plain-http OTA only exists from 0.10.2 "+
+						"(CONFIG_TMON_OTA_ALLOW_HTTP); it would drop this pending without "+
+						"a word. Publish with external_url over https, or use the GitHub "+
+						"release path, to get it past 0.10.2 first.",
+					deviceID, dev.Active.FirmwareVersion)), nil
+			}
 		}
 
 		update := registry.ConfigPayload{
@@ -765,8 +839,9 @@ func handlePublishFirmware(d Deps) server.ToolHandlerFunc {
 		// refuses to install an OTA whose pending lacks these, so the local
 		// LAN-hosting path must be able to carry them too. Host-side signer
 		// (tools/tmtools/lib/manifest.py) produces the pair; the broker never
-		// signs. We do NOT parse the manifest here — the device-side gate is
-		// authoritative.
+		// signs — but it does read the fields and predict the device gate
+		// below, so a manifest this unit cannot install is refused here rather
+		// than silently on-device.
 		if mb := strings.TrimSpace(req.GetString("firmware_manifest_b64", "")); mb != "" {
 			if len(mb) > 4096 {
 				return mcp.NewToolResultError("firmware_manifest_b64 exceeds 4 KiB"), nil
@@ -783,6 +858,11 @@ func handlePublishFirmware(d Deps) server.ToolHandlerFunc {
 			return mcp.NewToolResultError("firmware_manifest_b64 and firmware_manifest_sig_b64 must be supplied together"), nil
 		}
 
+		if bad := gateStagedFirmware(dev, update.FirmwareManifestB64,
+			update.FirmwareSHA256, update.FirmwareVersion, update.FirmwareURL); bad != nil {
+			return bad, nil
+		}
+
 		dev2, err := d.Registry.SetPending(deviceID, update)
 		if err != nil {
 			return mcp.NewToolResultErrorFromErr("set_pending", err), nil
@@ -790,10 +870,140 @@ func handlePublishFirmware(d Deps) server.ToolHandlerFunc {
 		return mcp.NewToolResultJSON(struct {
 			OK             bool          `json:"ok"`
 			FirmwareURL    string        `json:"firmware_url"`
+			OriginSource   string        `json:"firmware_url_origin,omitempty"`
 			FirmwareSHA256 string        `json:"firmware_sha256"`
 			Version        string        `json:"firmware_version"`
 			Signed         bool          `json:"signed"`
 			Device         deviceSummary `json:"device"`
-		}{OK: true, FirmwareURL: firmwareURL, FirmwareSHA256: shaHex, Version: version, Signed: update.FirmwareManifestB64 != "", Device: summarise(dev2)})
+		}{OK: true, FirmwareURL: firmwareURL, OriginSource: originSource, FirmwareSHA256: shaHex, Version: version, Signed: update.FirmwareManifestB64 != "", Device: summarise(dev2)})
 	}
+}
+
+// httpOTAFloor is packed(0.10.2), the first firmware whose production sdkconfig
+// carries CONFIG_TMON_OTA_ALLOW_HTTP. Older units accept https only, and refuse
+// anything else in silence.
+const httpOTAFloor uint32 = 0<<24 | 10<<16 | 2
+
+// originChoice is a firmware base URL plus how it was arrived at. The "how"
+// goes into the tool result because the three sources differ in how much they
+// prove: only the first is the address the device demonstrably reached us on.
+type originChoice struct {
+	url string
+	how string
+}
+
+// firmwareBase returns "http://<ip>:<port>" for the origin this device will
+// accept a firmware download from, in descending order of proof:
+//
+//  1. the socket-local address of the device's last authenticated request —
+//     literally what it dialled, so it is what its NVS svc_url holds. The
+//     firmware compares the firmware_url origin against svc_url with strcmp
+//     and attaches the HMAC headers only on an exact match (tmon_ota.c), so
+//     any other address of ours yields a 401 on /firmware/ — and that path,
+//     unlike the manifest gate, poisons the version on-device after 3 tries;
+//  2. the address of ours whose subnet contains the device's last source IP.
+//     A laptop on WiFi and Ethernet at once has several usable addresses and
+//     only one is on the device's network;
+//  3. the first usable address, as before.
+//
+// (2) and (3) use the same interface filter as tokenmonitor_provision_hint
+// (docker/VPN/virtual interfaces excluded — a device configured with a Docker
+// bridge IP was a real bug).
+func firmwareBase(d Deps, dev *registry.Device) (originChoice, error) {
+	if a := dev.Active.LastLocalAddr; a != "" {
+		return originChoice{
+			url: "http://" + a,
+			how: "the address the device dialled on its last authenticated request — " +
+				"the one origin its OTA download will carry HMAC headers for",
+		}, nil
+	}
+	nets, err := localIPv4Nets()
+	if err != nil {
+		return originChoice{}, fmt.Errorf("listing interfaces: %w", err)
+	}
+	if len(nets) == 0 {
+		return originChoice{}, errors.New("this host has no reachable LAN address; cannot build firmware_url. Connect to the network the device is on, or publish with external_url.")
+	}
+	ip := pickLocalIP(nets, dev.Active.LastIP)
+	how := "this host's first LAN address; the device has not been seen from a " +
+		"matching subnet, so if its broker origin differs the download will 401 " +
+		"— have it poll /sync once and republish"
+	if dev.Active.LastIP != "" && ip != nets[0].IP.String() {
+		how = "this host's address on the device's own subnet (guessed from its " +
+			"last source IP, not proven)"
+	}
+	return originChoice{
+		url: "http://" + net.JoinHostPort(ip, strconv.Itoa(d.Cfg.Server.Port)),
+		how: how,
+	}, nil
+}
+
+// pickLocalIP is localFirmwareBase's choice, split out because it is the only
+// part that can be tested without the host's real interfaces. nets must be
+// non-empty.
+func pickLocalIP(nets []*net.IPNet, deviceIP string) string {
+	if ip := net.ParseIP(deviceIP); ip != nil {
+		if v4 := ip.To4(); v4 != nil {
+			for _, n := range nets {
+				if n.Contains(v4) {
+					return n.IP.String()
+				}
+			}
+		}
+	}
+	return nets[0].IP.String()
+}
+
+// gateStagedFirmware answers, before anything is written to the registry,
+// whether the device will actually install what the operator is about to stage.
+//
+// It exists because a device that refuses a manifest says NOTHING: tmon_ota.c
+// clears the pending, records no poison and sends no X-Tmon-Ota-Fail, so the
+// operator sees a device that simply keeps running the old version while every
+// refused arm costs it a reboot. The published 1.0.0 index was exactly that
+// shape — a signed, verifying manifest whose declared floor locked out every
+// unit at or past 0.11.4.
+//
+// Reading the fields needs no key, so the old stance here ("we do not parse the
+// manifest; the device-side gate is authoritative") cost the operator the one
+// signal the device never gives. The device-side gate stays authoritative — we
+// only decline to stage what it has already told us it will reject.
+//
+// Returns nil when the device would accept it. shaHex/version may be empty
+// (nothing to cross-check); manifestB64 empty means an unsigned stage, which
+// only a TMON_OTA_UNSIGNED build accepts and which this function cannot judge.
+func gateStagedFirmware(dev *registry.Device, manifestB64, shaHex, version, firmwareURL string) *mcp.CallToolResult {
+	// The firmware's own hard limits (config_sync.c): a pending that trips one
+	// of these is dropped before the gate ever runs.
+	if len(firmwareURL) >= 256 {
+		return mcp.NewToolResultError(fmt.Sprintf(
+			"firmware_url is %d chars; the device refuses any pending whose URL is ≥256",
+			len(firmwareURL)))
+	}
+	if manifestB64 == "" {
+		return nil
+	}
+	raw, err := base64.StdEncoding.DecodeString(manifestB64)
+	if err != nil {
+		return mcp.NewToolResultError("firmware_manifest_b64 is not valid base64")
+	}
+	if len(raw) > 512 {
+		return mcp.NewToolResultError(fmt.Sprintf(
+			"the manifest decodes to %d bytes; the device's buffer is 512 and it "+
+				"drops the whole pending above that", len(raw)))
+	}
+	var mf ota.ManifestFields
+	if err := json.Unmarshal(raw, &mf); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf(
+			"firmware_manifest_b64 does not decode to a JSON manifest: %v", err))
+	}
+	if verdict, why := ota.PredictPendingCrossCheck(mf, shaHex, version); verdict != ota.GateOK {
+		return mcp.NewToolResultError(fmt.Sprintf(
+			"the device would refuse this update (%s): %s", verdict, why))
+	}
+	if verdict, why := ota.PredictDeviceGate(mf, ota.GateDeviceOf(dev)); verdict != ota.GateOK {
+		return mcp.NewToolResultError(fmt.Sprintf(
+			"the device would refuse this update (%s): %s", verdict, why))
+	}
+	return nil
 }

@@ -1,6 +1,10 @@
 // Runtime state for tokenmonitor_status.
 
 import { RUNTIME } from "./version.js";
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import { runtimeDir } from "./sessionLife.js";
 
 export const Role = Object.freeze({ UNKNOWN: "unknown", LEADER: "leader", FOLLOWER: "follower" });
 
@@ -31,11 +35,13 @@ export class State {
     // nothing (never a false "up to date" or "outdated"). Mirrors Go
     // state.UpdateInfo.
     this._update = { known: false, outdated: false, current: "", latest: "", checkedAt: 0 };
+    this._shared = false;
   }
   setRole(r) {
     if (this._role === r) return;
     this._role = r;
     this._roleSince = Math.floor(Date.now() / 1000);
+    this._persist();
   }
   recordRequest(remote, status, when) {
     // One clock read: two fields sampled from different nows could place
@@ -46,6 +52,7 @@ export class State {
     this._lastRemote = remote || "";
     this._lastStatus = status;
     this._count += 1;
+    this._persist();
   }
   // lastRequestAt reports when a device last hit the broker, as epoch
   // milliseconds (0 if never). The mDNS publisher reads it to decide whether
@@ -64,6 +71,7 @@ export class State {
       latest: (u && u.latest) || "",
       checkedAt: (u && u.checkedAt) || 0,
     };
+    this._persist();
   }
   // update returns the last cached self-version-check result (default =
   // known:false, i.e. no check has succeeded yet). Mirrors Go State.Update.
@@ -89,4 +97,25 @@ export class State {
     }
     return out;
   }
+
+  enableShared() {
+    this._shared = true;
+    this._persist();
+  }
+
+  _persist() {
+    if (!this._shared) return;
+    const target = path.join(runtimeDir(), "broker-state.json");
+    const tmp = `${target}.tmp-${process.pid}`;
+    try {
+      writeFileSync(tmp, JSON.stringify(this.snapshot()) + "\n", { mode: 0o600 });
+      renameSync(tmp, target);
+    } catch {}
+  }
+}
+
+export function loadSharedSnapshot() {
+  const snap = JSON.parse(readFileSync(path.join(runtimeDir(), "broker-state.json"), "utf8"));
+  if (!snap || !snap.role) throw new Error("shared broker snapshot has no role");
+  return snap;
 }

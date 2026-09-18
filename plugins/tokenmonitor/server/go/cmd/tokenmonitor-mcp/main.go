@@ -1,14 +1,14 @@
 // tokenmonitor-mcp serves OAuth credentials to the TokenMonitor device.
 //
-// Default mode (no flags) is "MCP-stdio + bind-elected broker": several
-// Claude Code sessions can each launch this binary; one of them wins the
-// TCP port and runs the credentials broker, the rest probe in the
-// background and take over if the leader exits. See internal/leader.
+// Default mode is an MCP stdio adapter. Every live adapter holds a renewable
+// session lease and ensures one detached broker daemon exists. The daemon is a
+// cross-runtime singleton and exits after the last session lease disappears.
 //
 // Flags:
 //
-//	--daemon   Standalone broker. Just binds and serves; no leader probing.
-//	           Use this when running under systemd or any always-on supervisor.
+//	--daemon   Session-owned broker daemon; exits when no MCP sessions remain.
+//	--persistent-daemon
+//	           Explicit always-on broker for systemd/advanced installations.
 //	--once     Validate that the credentials file is readable + not expired,
 //	           print a one-line summary, and exit. Useful for smoke tests.
 //	--status   Probe the local broker (if any) for a status JSON dump.
@@ -37,7 +37,6 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -47,7 +46,6 @@ import (
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/broker"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/config"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/creds"
-	"github.com/fractal-manifold/tokenmonitor-mcp/internal/leader"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/logbuf"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/mcp"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/mdns"
@@ -55,6 +53,7 @@ import (
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/panelgen"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/registry"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/serial"
+	"github.com/fractal-manifold/tokenmonitor-mcp/internal/sessionlife"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/spend"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/state"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/updatecheck"
@@ -67,7 +66,8 @@ var Version = "dev"
 
 func main() {
 	configPath := flag.String("config", "", "Path to tokenmonitor.toml (default: ~/.config/tokenmonitor/tokenmonitor.toml)")
-	daemonMode := flag.Bool("daemon", false, "Standalone broker — bind unconditionally, no leader-election")
+	daemonMode := flag.Bool("daemon", false, "Session-owned broker daemon — exits after the last MCP lease")
+	persistentDaemon := flag.Bool("persistent-daemon", false, "Explicit always-on broker (does not stop when sessions end)")
 	onceMode := flag.Bool("once", false, "Validate credentials file and exit")
 	statusMode := flag.Bool("status", false, "Probe local broker and print status JSON")
 	logsMode := flag.Bool("logs", false, "Tail firmware logs from the running broker (Ctrl-C to stop)")
@@ -95,7 +95,7 @@ func main() {
 		// response: the client never sees `initialize`, drops the server from
 		// the session, and the user is told nothing. Start degraded instead —
 		// tools up, broker down (see runMCP).
-		if *onceMode || *statusMode || *logsMode || *daemonMode {
+		if *onceMode || *statusMode || *logsMode || *daemonMode || *persistentDaemon {
 			fmt.Fprintf(os.Stderr, "config: %v\n", cfgErr)
 			os.Exit(2)
 		}
@@ -122,10 +122,10 @@ func main() {
 		os.Exit(runStatus(cfg))
 	case *logsMode:
 		os.Exit(runLogs(cfg, *logsTail))
-	case *daemonMode:
-		os.Exit(runDaemon(cfg, logger, logs))
+	case *daemonMode || *persistentDaemon:
+		os.Exit(runDaemon(cfg, logger, logs, *persistentDaemon))
 	default:
-		os.Exit(runMCP(cfg, cfgErr, logger, logs))
+		os.Exit(runMCP(cfg, cfgErr, *configPath, logger, logs))
 	}
 }
 
@@ -161,7 +161,18 @@ func runOnce(cfg *config.Config) int {
 	return 0
 }
 
-func runDaemon(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int {
+func runDaemon(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer, persistent bool) int {
+	lock, acquired, err := sessionlife.AcquireDaemonLock()
+	if err != nil {
+		logger.Printf("daemon singleton: %v", err)
+		return 1
+	}
+	if !acquired {
+		logger.Printf("daemon singleton: another broker daemon is already running")
+		return 0
+	}
+	defer lock.Close()
+
 	addr := addrOf(cfg)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -170,9 +181,15 @@ func runDaemon(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int 
 	}
 	st := state.New()
 	st.SetRole(state.RoleLeader)
+	st.EnableShared()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	ctx, cancel := context.WithCancel(signalCtx)
+	defer cancel()
+	if !persistent {
+		go sessionlife.Monitor(ctx, cancel, logger.Printf)
+	}
 
 	fwBuf, fwLogs, serialCtrl, stopTailer := startFirmwareTailer(ctx, cfg, logger)
 	defer stopTailer()
@@ -316,16 +333,18 @@ func startPanelGenerators(ctx context.Context, cfg *config.Config, reg *registry
 	return panelgen.Start(ctx, cfg, dl, logger)
 }
 
-// runMCP launches the broker (under leader-election) and the MCP stdio
-// server in parallel. Either returning is treated as a normal shutdown
-// signal for the whole process — Claude Code expects an MCP server to
-// exit cleanly when its stdio peer closes.
-func runMCP(cfg *config.Config, cfgErr error, logger *log.Logger, logs *logbuf.Buffer) int {
+// runMCP is a lightweight per-client stdio adapter. Broker work lives only in
+// the detached session-owned daemon; the lease keeps that daemon alive for as
+// long as this Codex/Claude/Agy CLI or UI connection exists.
+func runMCP(cfg *config.Config, cfgErr error, configPath string, logger *log.Logger, logs *logbuf.Buffer) int {
 	st := state.New()
+	st.SetRole(state.RoleFollower)
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	ctx, cancel := context.WithCancel(ctx)
+	// Do not intercept SIGTERM in the stdio adapter: ServeStdio has no context
+	// parameter, so swallowing the default signal would leave a dead client with
+	// a hung MCP process. Normal EOF removes the lease cleanly; a hard kill is
+	// recovered by the daemon's stale-lease timeout.
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// Broker self-version check: is a newer plugin/broker release published?
@@ -333,24 +352,16 @@ func runMCP(cfg *config.Config, cfgErr error, logger *log.Logger, logs *logbuf.B
 	// broker /sync handler read a populated verdict. Best-effort — never blocks.
 	go updatecheck.Run(ctx, Version, st, logger)
 
-	var wg sync.WaitGroup
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer cancel()
-		mcpSrv := mcp.NewServer(mcp.Deps{
-			Cfg:       cfg,
-			State:     st,
-			Logs:      logs,
-			Registry:  openRegistry(logger),
-			Version:   Version,
-			ConfigErr: cfgErr,
-		})
-		if err := mcpserver.ServeStdio(mcpSrv); err != nil && !errors.Is(err, context.Canceled) {
-			logger.Printf("mcp stdio: %v", err)
-		}
-	}()
+	// Every live MCP connection counts toward daemon lifetime, even when this
+	// particular adapter loaded a broken config. A degraded session must not
+	// start a daemon with invented credentials, but it must keep an already
+	// healthy daemon (started by another CLI/UI) alive until the session closes.
+	lease, leaseErr := sessionlife.NewLease()
+	if leaseErr != nil {
+		logger.Printf("sessions: create lease: %v", leaseErr)
+	} else {
+		defer lease.Close()
+	}
 
 	if cfgErr != nil {
 		// Degraded start: tools up so the user can be told what is wrong, but
@@ -361,49 +372,22 @@ func runMCP(cfg *config.Config, cfgErr error, logger *log.Logger, logs *logbuf.B
 		logger.Printf("config: %v", cfgErr)
 		logger.Printf("config: starting degraded — MCP tools only, broker NOT started. " +
 			"Fix the config and restart; run tokenmonitor_health for details.")
-		wg.Wait()
-		return 0
+	} else if lease != nil {
+		go sessionlife.Supervise(ctx, configPath, logger.Printf)
 	}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer cancel()
-		// The serial tailer must run only inside the leader's lifecycle so
-		// the device port has exactly one reader. We start it here, scoped
-		// to the listener's context, so it dies cleanly when this peer
-		// loses leadership (or shuts down).
-		reg := openRegistry(logger)
-		err := leader.Run(ctx, addrOf(cfg), st, logger, func(c context.Context, ln net.Listener) error {
-			_, fwLogs, serialCtrl, stopTailer := startFirmwareTailer(c, cfg, logger)
-			defer stopTailer()
-			// Serial-lease table: followers ask this leader (the sole tailer
-			// owner) to yield the USB port for a provisioning session.
-			lease := usbprov.NewLeaseManager(serialCtrl, 0)
-			// mDNS publication is scoped to the leader: only the
-			// process that actually owns the bound port should be
-			// answering "I'm the broker" on the LAN.
-			mdnsPub := startMDNS(c, cfg, reg, st, logger)
-			defer mdnsPub.Close()
-			// Custom-panel generators, scoped to the leader's lifecycle
-			// so exactly one process spawns them; torn down (SIGTERM →
-			// SIGKILL) when this peer loses the bound port (ctx c).
-			stopPanel := startPanelGenerators(c, cfg, reg, logger)
-			defer stopPanel()
-			// Pull-OTA poller, scoped to the leader's lifecycle so only the
-			// process that owns the port stages updates. Dies when this peer
-			// loses leadership (ctx c is cancelled).
-			go ota.Run(c, cfg, reg, logger)
-			usageCache := buildUsageCache(cfg, logger)
-			spendCache := buildSpendCache(cfg, logger)
-			return broker.Serve(c, ln, cfg, st, logger, fwLogs, reg, usageCache, spendCache, lease)
-		})
-		if err != nil && !errors.Is(err, context.Canceled) {
-			logger.Printf("leader: %v", err)
-		}
-	}()
-
-	wg.Wait()
+	mcpSrv := mcp.NewServer(mcp.Deps{
+		Cfg:       cfg,
+		State:     st,
+		Logs:      logs,
+		Registry:  openRegistry(logger),
+		Version:   Version,
+		ConfigErr: cfgErr,
+	})
+	if err := mcpserver.ServeStdio(mcpSrv); err != nil && !errors.Is(err, context.Canceled) {
+		logger.Printf("mcp stdio: %v", err)
+	}
+	cancel()
 	return 0
 }
 

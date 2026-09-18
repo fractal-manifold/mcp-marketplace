@@ -38,6 +38,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .config import Config
+from .gate import GATE_OK, gate_device_of, predict_device_gate
 from .registry.store import (
     ConfigPayload,
     Registry,
@@ -451,9 +452,35 @@ def _decide(reg: Registry, dev, resolved: dict, dry_run: bool,
     # `mf_packed < floor`), so mirror that with `<` — NOT `<=`. A release
     # packing EQUAL to the floor is installable on-device; `<=` would wrongly
     # skip a newer same-base dev canary (X.Y.Z-dev.<ts2> packs to the same base
-    # as a matured X.Y.Z floor) that the device accepts.
+    # as a matured X.Y.Z floor) that the device accepts. (A conformant manifest
+    # sets its floor to packed(version) — the tmtools default. A manifest that
+    # sets it LOWER buys no rollback margin, it only locks out every device
+    # whose floor has climbed past that value; see predict_device_gate.)
+    # Secondary guard: the device is AHEAD of this release. Its floor records a
+    # version it has already run, so there is nothing to offer — and unlike the
+    # incompatibilities below, this is a healthy state, not a mistake.
     if release_packed < dev.active.payload.min_secure_version:
         out["action"] = "up_to_date"
+        return out
+
+    # Tertiary guard: run the DEVICE's own manifest gate before staging.
+    #
+    # Everything past this point is a release the device WANTS — newer than its
+    # floor — that it would nonetheless refuse. That used to go entirely
+    # unchecked, above all `manifest.min_secure_version` against the same floor,
+    # which the device tests FIRST. The device's refusal is silent: tmon_ota.c
+    # clears the pending, poisons nothing and reports nothing, so the broker
+    # re-staged, five times, and then tombstoned a release that was never broken
+    # — burning a device reboot on every arm.
+    #
+    # predict_device_gate mirrors ota_gate.c against the shared rows in
+    # compat/ota/gate_manifest.json. Note it sits BEFORE the streak bump: a
+    # manifest the device will refuse must never advance the install-loop
+    # counter, or a publishing mistake ends up blamed on the firmware.
+    verdict, why = predict_device_gate(mf, gate_device_of(dev))
+    if verdict != GATE_OK:
+        out["action"] = "skipped:" + verdict
+        out["reason"] = why
         return out
     # Avoid churning the config version: if a pending already carries this
     # exact firmware version, leave it.

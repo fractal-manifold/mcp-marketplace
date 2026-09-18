@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -240,6 +241,27 @@ type ConfigPayload struct {
 type Active struct {
 	ConfigPayload
 	LastSeen time.Time `toml:"last_seen,omitempty"`
+	// LastIP is the source address the device was last seen from, observed
+	// state exactly like LastSeen. It exists so the broker can answer "which
+	// of MY addresses is on the device's network" when staging an OTA: a host
+	// with WiFi and Ethernet on different subnets would otherwise hand out a
+	// firmware_url the device cannot reach, and — worse — one the firmware
+	// treats as a foreign origin, so it withholds the HMAC headers and the
+	// download 401s. Best-effort and never a security input: it only ranks
+	// addresses we already own.
+	LastIP string `toml:"last_ip,omitempty"`
+	// LastLocalAddr is OUR side of that same connection — the "<ipv4>:<port>"
+	// socket-local address the device actually dialled on its last
+	// authenticated request, taken from the socket and never from the Host
+	// header (which a relay forwards untouched).
+	//
+	// It is the only address known to match the device's NVS svc_url, and the
+	// firmware compares OTA origins against that by exact strcmp: hand it a
+	// firmware_url on any other address of ours and it withholds the HMAC
+	// headers, so /firmware/ 401s and — unlike the manifest gate — the version
+	// gets poisoned on-device after three tries. Observed state, best-effort,
+	// never a security input: it only ever selects among addresses we own.
+	LastLocalAddr string `toml:"last_local_addr,omitempty"`
 	// WiFiKnown is device-OBSERVED state, not configuration: the list of
 	// networks the device remembers, by name only. It lives here beside
 	// LastSeen rather than in ConfigPayload because nothing may ever push it
@@ -685,6 +707,7 @@ func (r *Registry) ReplaceActive(deviceID string, active ConfigPayload, channel 
 		// and has no reason to re-report them just because the broker record
 		// was replaced.
 		dev.Active = Active{ConfigPayload: active, LastSeen: prev.LastSeen,
+			LastIP: prev.LastIP, LastLocalAddr: prev.LastLocalAddr,
 			WiFiKnown: prev.WiFiKnown}
 		dev.Pending = nil
 		if len(channel) > 0 {
@@ -932,6 +955,8 @@ func (r *Registry) MaybePromote(deviceID string, observedVersion uint32, usedPen
 		dev.Active = Active{
 			ConfigPayload: promotedPayload,
 			LastSeen:      time.Now().UTC(),
+			LastIP:        dev.Active.LastIP,
+			LastLocalAddr: dev.Active.LastLocalAddr,
 			// Observed state survives a config promote untouched — the device
 			// reports it on its own cadence and a promote knows nothing about
 			// it. Without this the list would be wiped on every promote and
@@ -945,14 +970,26 @@ func (r *Registry) MaybePromote(deviceID string, observedVersion uint32, usedPen
 	return promoted, err
 }
 
-// Touch updates active.LastSeen without changing any config. Called
-// after every successful HMAC verification so list_devices can show
-// freshness. Silently no-ops on ErrNotFound — a legacy device polling
+// Touch updates active.LastSeen (and active.LastIP) without changing any
+// config. Called after every successful HMAC verification so list_devices can
+// show freshness. Silently no-ops on ErrNotFound — a legacy device polling
 // without X-Tmon-Device shouldn't be auto-registered.
-func (r *Registry) Touch(deviceID string) error {
+//
+// remoteAddr is the request's source, "host:port" or a bare host; anything
+// that is not a usable IPv4 literal leaves the recorded address alone rather
+// than clearing it, so a request arriving over IPv6 or loopback does not erase
+// the LAN address a later OTA wants to match against.
+//
+// localAddr is our own side of the connection, "<ipv4>:<port>" — what the
+// device dialled. Same rule: a value we cannot read leaves the last good one
+// in place, because a stale broker origin still beats guessing among this
+// host's interfaces.
+func (r *Registry) Touch(deviceID, remoteAddr, localAddr string) error {
 	if !ValidDeviceID(deviceID) {
 		return fmt.Errorf("registry: invalid device_id %q", deviceID)
 	}
+	ip := remoteIPv4(remoteAddr)
+	local := localIPv4Port(localAddr)
 	return r.withLock(deviceID, func(p string) error {
 		dev, err := r.loadLocked(p)
 		if err != nil {
@@ -962,8 +999,71 @@ func (r *Registry) Touch(deviceID string) error {
 			return err
 		}
 		dev.Active.LastSeen = time.Now().UTC()
+		if ip != "" {
+			dev.Active.LastIP = ip
+		}
+		if local != "" {
+			dev.Active.LastLocalAddr = local
+		}
 		return r.saveLocked(dev, p)
 	})
+}
+
+// localIPv4Port normalises a socket-local address to "<ipv4>:<port>",
+// returning "" for anything unusable. An IPv4-mapped address
+// ("::ffff:192.168.1.28", what a dual-stack listener reports) is unwrapped so a
+// broker bound to "::" records the same string as one bound to "0.0.0.0" — the
+// same normalisation auth.ResponseSigHost applies, and the device compares this
+// origin by exact string match, so the two must not disagree.
+func localIPv4Port(addr string) string {
+	if addr == "" {
+		return ""
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || port == "" {
+		return ""
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return ""
+	}
+	v4 := ip.To4()
+	if v4 == nil {
+		return ""
+	}
+	// A loopback address is real for a broker and device on the same host, but
+	// it is never the address a device on the LAN dialled; recording it would
+	// hand out a firmware_url pointing at the device itself.
+	if v4.IsLoopback() || v4.IsUnspecified() {
+		return ""
+	}
+	return net.JoinHostPort(v4.String(), port)
+}
+
+// remoteIPv4 extracts the IPv4 literal from an http.Request RemoteAddr,
+// returning "" for anything else (IPv6, a unix socket, a malformed value).
+func remoteIPv4(remoteAddr string) string {
+	if remoteAddr == "" {
+		return ""
+	}
+	host := remoteAddr
+	if h, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		host = h
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return ""
+	}
+	v4 := ip.To4()
+	if v4 == nil {
+		return ""
+	}
+	// Loopback is not a device on the LAN, and recording it would replace the
+	// address a later OTA wants to match its own interfaces against.
+	if v4.IsLoopback() {
+		return ""
+	}
+	return v4.String()
 }
 
 // SetSerial persists the X-Tmon-Serial / X-Tmon-Sku headers reported by
@@ -1096,11 +1196,24 @@ func (r *Registry) SetBlockedFirmwareVersion(deviceID, version string) error {
 	})
 }
 
-// BumpMinSV records that the device acknowledged installing a firmware
-// with at least `sv` packed semver. Monotonic — never lowers the
-// floor. Used by revert-via-MCP to reject downgrade pendings before
-// they reach the device.
-func (r *Registry) BumpMinSV(deviceID string, sv uint32) error {
+// RecordMinSV mirrors the anti-rollback floor the device reports in
+// X-Tmon-Min-Sv. It FOLLOWS the device, including downwards.
+//
+// It used to be monotonic here, on the reasoning that a spoofed-high value
+// could only lock a device out of downgrades. That stopped being true once the
+// broker began refusing to stage a manifest whose floor sits below the
+// device's (ota.PredictDeviceGate): a mirror that is stale-high now blocks
+// legitimate updates too, and the operator sees a refusal citing a floor the
+// device does not actually have.
+//
+// Following the device is safe. tmon_min_sv is the device's own state and the
+// device enforces it regardless of what it told us; the header is unsigned
+// metadata by contract (compat/SECURITY.md), so a lie here cannot make the
+// device install anything it would otherwise refuse — it can only make the
+// broker offer something the device then rejects, which is the pre-existing
+// behaviour for every unsigned header. Monotonicity is still enforced where it
+// belongs: mergePayload refuses to LOWER the floor via a pushed config.
+func (r *Registry) RecordMinSV(deviceID string, sv uint32) error {
 	if !ValidDeviceID(deviceID) {
 		return fmt.Errorf("registry: invalid device_id %q", deviceID)
 	}
@@ -1112,7 +1225,7 @@ func (r *Registry) BumpMinSV(deviceID string, sv uint32) error {
 			}
 			return err
 		}
-		if sv <= dev.Active.MinSecureVersion {
+		if sv == dev.Active.MinSecureVersion {
 			return nil
 		}
 		dev.Active.MinSecureVersion = sv

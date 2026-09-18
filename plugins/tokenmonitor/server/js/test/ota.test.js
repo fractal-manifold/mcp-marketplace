@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { createServer } from "node:http";
+import { createPrivateKey, sign as cryptoSign } from "node:crypto";
 
 import * as ota from "../src/ota.js";
 import { load as loadConfig } from "../src/config.js";
@@ -36,6 +37,36 @@ function s1Vector() {
   const m = VEC.manifests.find((x) => x.name.includes("S1"));
   assert.ok(m, "no S1 manifest vector");
   return { canonical: m.canonical_string, sigB64: m.signature_b64 };
+}
+
+// signedManifest signs a canonical manifest with the shared test seed.
+//
+// The frozen vectors pin signature bytes for a handful of historical manifests;
+// a policy test needs to vary min_secure_version, so it signs its own. Same
+// key, same canonical shape (sorted keys, no whitespace).
+function signedManifest(sku, version, minSV, channel = "", sha = "a".repeat(64)) {
+  const seed = Buffer.from(VEC.test_keypair.seed_hex, "hex");
+  // Node needs a PKCS#8 wrapper to take a raw Ed25519 seed.
+  const pkcs8 = Buffer.concat([
+    Buffer.from("302e020100300506032b657004220420", "hex"),
+    seed,
+  ]);
+  const key = createPrivateKey({ key: pkcs8, format: "der", type: "pkcs8" });
+  const head = channel ? `{"channel":"${channel}",` : "{";
+  const canonical = head +
+    `"key_id":"ed25519-2026-q2","min_secure_version":${minSV},` +
+    `"sha256":"${sha}","size":2048,"sku":"${sku}","version":"${version}"}`;
+  const sigB64 = cryptoSign(null, Buffer.from(canonical, "utf8"), key).toString("base64");
+  return { canonical, sigB64 };
+}
+
+// conformantIndex is signedManifest wrapped in a release index, with the floor
+// the tmtools default would pick: packed(version).
+function conformantIndex(sku, version, channel = "") {
+  const packed = ota.packSemver(version);
+  assert.ok(packed !== null, version);
+  const { canonical, sigB64 } = signedManifest(sku, version, packed, channel);
+  return index(canonical, sigB64, { version, binURL: `https://dl.example/tmon-${sku}-${version}.bin` });
 }
 
 function index(canonical, sigB64, { version = "0.5.1", binURL = "https://dl.example/tmon-S1-0.5.1.bin" } = {}) {
@@ -86,7 +117,7 @@ function registryWithDevice(sku, minSV) {
   // Production (non-DEV) serial keeps these staging tests single-channel
   // (stable). Dual-channel dev routing has its own test.
   reg.setSerial(TEST_DEVICE, "CWM-S1-MAD-2620-000001-0", sku);
-  if (minSV > 0) reg.bumpMinSV(TEST_DEVICE, minSV);
+  if (minSV > 0) reg.recordMinSV(TEST_DEVICE, minSV);
   return reg;
 }
 
@@ -214,8 +245,12 @@ test("check stages when release packed EQUALS the floor", { skip }, async () => 
   // The device refuses only packed < floor, so a release whose base == floor
   // is installable and must be staged (mirrors a newer same-base dev canary
   // after the floor matured). Fresh device, floor == release base.
-  const { canonical, sigB64 } = s1Vector();
-  const { server, url } = await mockReleases({ S1: index(canonical, sigB64) });
+  //
+  // It uses a freshly signed conformant manifest rather than the frozen S1
+  // vector: that vector declares min_secure_version=7, far below packed(0.5.1),
+  // which is exactly the shape the manifest gate now refuses. The vector stays
+  // as it is — it exists to pin signature bytes, not policy.
+  const { server, url } = await mockReleases({ S1: conformantIndex("S1", "0.5.1") });
   try {
     const cfg = makeCfg(url);
     const reg = registryWithDevice("S1", ota.packSemver("0.5.1"));

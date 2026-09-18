@@ -23,7 +23,7 @@
     },
     {
       "name": "tokenmonitor_recent_logs",
-      "description": "Tail the broker log buffer (in-memory). Useful to see why the device is being rejected or which IPs are polling. Default is the last 50 lines.",
+      "description": "Tail the shared daemon log. Useful to see why the device is being rejected or which IPs are polling. Default is the last 50 lines.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -149,10 +149,6 @@
             "type": "string",
             "description": "8 lowercase hex chars."
           },
-          "broker_url": {
-            "type": "string",
-            "description": "New broker URL."
-          },
           "psk_hex": {
             "type": "string",
             "description": "New 64-hex PSK to rotate to."
@@ -228,7 +224,7 @@
               "night",
               "auto"
             ],
-            "description": "Theme mode applied on the device: 'day' (light palette), 'night' (dark palette) or 'auto' (follows sunrise/sunset). Applied LIVE when the candidate is promoted — no reboot. Fields that DO reboot the device: broker_url, psk_hex, the WiFi pair, and arming a firmware update."
+            "description": "Theme mode applied on the device: 'day' (light palette), 'night' (dark palette) or 'auto' (follows sunrise/sunset). Applied LIVE when the candidate is promoted — no reboot. Fields that DO reboot the device: psk_hex, the WiFi pair, and arming a firmware update."
           },
           "pet_enabled": {
             "type": "boolean",
@@ -359,7 +355,7 @@
     },
     {
       "name": "tokenmonitor_revert_firmware",
-      "description": "Stage a rollback to a previously-shipped firmware version. The broker enforces anti-rollback: if target_min_secure_version is below the device's current floor (Active.MinSecureVersion in the registry), the call is rejected upfront. The device's own gate against the manifest's min_secure_version is the ultimate authority.",
+      "description": "Stage a rollback to a previously-shipped firmware version. The broker predicts the device's own manifest gate from the supplied manifest and refuses upfront anything the device would reject — in particular a target below the device's anti-rollback floor (Active.MinSecureVersion), which the device refuses in silence and which no manifest can lower. The device-side gate remains the ultimate authority.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
@@ -398,7 +394,7 @@
           },
           "target_min_secure_version": {
             "type": "number",
-            "description": "Packed 8.8.16 semver. Broker rejects if below the device's tmon_min_sv mirror."
+            "description": "Optional cross-check on the supplied manifest: if given, it must equal the min_secure_version that manifest declares, or the two came from different builds. The anti-rollback decision itself is taken from the manifest, not from this field."
           }
         }
       }

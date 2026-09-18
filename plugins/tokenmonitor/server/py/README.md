@@ -15,9 +15,10 @@ pip install -e .
 
 ```sh
 tokenmonitor-mcp-py --probe       # used by the tokenmonitor-mcp launcher
-tokenmonitor-mcp-py --daemon      # standalone broker
+tokenmonitor-mcp-py --daemon      # shared broker; exits when no sessions remain
+tokenmonitor-mcp-py --persistent-daemon
 tokenmonitor-mcp-py --version
-tokenmonitor-mcp-py               # default: MCP stdio + leader-elected broker
+tokenmonitor-mcp-py               # MCP stdio + lease for the shared daemon
 ```
 
 Config lives at `~/.config/tokenmonitor/tokenmonitor.toml`; the schema

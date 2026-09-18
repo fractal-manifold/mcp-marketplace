@@ -4,6 +4,7 @@
 import { createServer } from "node:http";
 import { request as httpRequest } from "node:http";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 
 import { VERSION, RUNTIME } from "./version.js";
 import * as auth from "./auth.js";
@@ -17,20 +18,24 @@ import { Buffer as LogBuffer } from "./logbuf.js";
 import { State, Role } from "./state.js";
 import { Registry } from "./registry/store.js";
 import { createHandler } from "./broker/server.js";
-import { run as leaderRun, tryListen } from "./leader.js";
+import { tryListen } from "./leader.js";
 import { serve as mcpServe } from "./mcp/server.js";
 import { Publisher as MdnsPublisher } from "./mdns.js";
 import { Tailer, TailerController } from "./serialTailer.js";
 import { LeaseManager, NopController } from "./usbprov/lease.js";
 import { PanelGenerator } from "./panelGenerator.js";
+import { acquireDaemonLock, createLease, startDaemon, waitForNoSessions } from "./sessionLife.js";
+
+const ENTRY_PATH = fileURLToPath(import.meta.url);
 
 function parseFlags(argv) {
-  const out = { config: "", daemon: false, once: false, status: false, logs: false, version: false, probe: false };
+  const out = { config: "", daemon: false, persistentDaemon: false, once: false, status: false, logs: false, version: false, probe: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--config") out.config = argv[++i] || "";
     else if (a.startsWith("--config=")) out.config = a.slice(9);
     else if (a === "--daemon") out.daemon = true;
+    else if (a === "--persistent-daemon") out.persistentDaemon = true;
     else if (a === "--once") out.once = true;
     else if (a === "--status") out.status = true;
     else if (a === "--logs") out.logs = true;
@@ -46,8 +51,9 @@ function printHelp() {
     "tokenmonitor-mcp-js — Node.js implementation of tokenmonitor-mcp",
     "",
     "Usage:",
-    "  tokenmonitor-mcp-js [--config PATH]          # MCP stdio + leader-elected broker (default)",
-    "  tokenmonitor-mcp-js --daemon [--config PATH] # standalone broker only",
+    "  tokenmonitor-mcp-js [--config PATH]          # MCP stdio; keeps one shared daemon alive",
+    "  tokenmonitor-mcp-js --daemon [--config PATH] # broker until the last session exits",
+    "  tokenmonitor-mcp-js --persistent-daemon      # explicit always-on broker",
     "  tokenmonitor-mcp-js --once                   # validate creds and exit",
     "  tokenmonitor-mcp-js --status                 # probe local broker, print JSON",
     "  tokenmonitor-mcp-js --version | --probe",
@@ -120,9 +126,20 @@ function runStatus(cfg) {
   });
 }
 
-async function runDaemon(cfg, logs, logger) {
+async function runDaemon(cfg, logs, logger, persistent = false) {
+  const daemonLock = await acquireDaemonLock();
+  if (!daemonLock.acquired) {
+    logger.info("daemon singleton: another broker daemon is already running");
+    return 0;
+  }
+  try { return await serveDaemon(cfg, logs, logger, persistent); }
+  finally { daemonLock.close(); }
+}
+
+async function serveDaemon(cfg, logs, logger, persistent) {
   const state = new State();
   state.setRole(Role.LEADER);
+  state.enableShared();
   const cache = new auth.NonceCache(cfg.security.nonce_cache_ttl_seconds);
   const registry = openRegistry(logger);
   const fwBuf = new LogBuffer(cfg.serial.lines || 2000);
@@ -140,7 +157,10 @@ async function runDaemon(cfg, logs, logger) {
   const spendCache = spend.buildSpendCache(cfg, { logger });
   const handler = createHandler({ cfg, cache, state, fwLogs, registry, logger, usageCache, spendCache, leaseManager });
   const server = await tryListen(() => createServer(handler), cfg.server.bind, cfg.server.port);
-  if (!server) { logger.error(`listen ${cfg.server.bind}:${cfg.server.port}: address in use`); return 1; }
+  if (!server) {
+    logger.error(`listen ${cfg.server.bind}:${cfg.server.port}: address in use`);
+    return 1;
+  }
   logger.info(`broker: serving on ${cfg.server.bind}:${cfg.server.port}`);
   let mdnsPub = null;
   if (registry) {
@@ -164,25 +184,31 @@ async function runDaemon(cfg, logs, logger) {
   // leader-scoped — a daemon is the leader by construction). Shares the OTA
   // abort so it tears down with the process. Mirrors Go's go updatecheck.Run.
   updatecheck.run(state, { baked: VERSION, logger, abortSignal: otaAbort.signal });
+  const idleWait = persistent ? null : waitForNoSessions(logger);
   try {
     // SIGTERM/SIGINT → graceful shutdown so the finally runs and children are
     // reaped. Registering a listener also overrides Node's default abrupt exit,
     // which would otherwise orphan the detached generators (Go gets this via
     // signal.NotifyContext).
-    await new Promise((resolve) => {
+    const signalWait = new Promise((resolve) => {
       const done = () => resolve();
       process.once("SIGTERM", done);
       process.once("SIGINT", done);
     });
+    await (idleWait ? Promise.race([signalWait, idleWait.promise]) : signalWait);
   } finally {
+    idleWait?.cancel();
     otaAbort.abort();
+    clearInterval(leaseReaper);
     await panelGen.stop();
     if (mdnsPub) await mdnsPub.close();
+    if (tailer) tailer.stop();
+    await new Promise((resolve) => server.close(resolve));
   }
   return 0;
 }
 
-async function runMCP(cfg, logs, logger, configErr = null) {
+async function runMCP(cfg, logs, logger, configErr = null, configPath = "") {
   if (configErr) {
     // Degraded start: tools up so the user can be told what is wrong, but no
     // broker. The config we are holding is invented (unusableConfig), so
@@ -194,31 +220,45 @@ async function runMCP(cfg, logs, logger, configErr = null) {
       "config: starting degraded — MCP tools only, broker NOT started. " +
         "Fix the config and restart; run tokenmonitor_health for details.",
     );
-    await mcpServe({
-      cfg,
-      state: new State(),
-      logs,
-      registry: openRegistry(logger),
-      version: VERSION,
-      configErr,
-    });
+    // It must not spawn a daemon with invented credentials, but this is still
+    // a live CLI/UI session and therefore keeps a healthy daemon owned by a
+    // different adapter alive.
+    let sessionLease = null;
+    try { sessionLease = createLease(); }
+    catch (e) { logger.error(`sessions: ${e.message}`); }
+    try {
+      await mcpServe({
+        cfg,
+        state: new State(),
+        logs,
+        registry: openRegistry(logger),
+        version: VERSION,
+        configErr,
+      });
+    } finally {
+      sessionLease?.close();
+    }
     return 0;
   }
 
   const state = new State();
-  const cache = new auth.NonceCache(cfg.security.nonce_cache_ttl_seconds);
-  const fwBuf = new LogBuffer(cfg.serial.lines || 2000);
-  let tailer = null;
-  const fwLogs = (limit) => ({ connected: tailer ? tailer.connected() : false, total_available: fwBuf.length, lines: fwBuf.tail(limit) });
+  state.setRole(Role.FOLLOWER);
   const abortCtrl = new AbortController();
   const registry = openRegistry(logger);
-  // Serial-lease table: followers ask this leader to yield the USB port. Built
-  // once; the controller reaches the lazily-created tailer via a getter. When
-  // no serial device is configured, a NopController leaves every port free.
-  const serialCtrl = cfg.serial.device
-    ? new TailerController(() => tailer)
-    : new NopController();
-  const leaseManager = new LeaseManager(serialCtrl, 0);
+
+  let sessionLease = null;
+  let daemonSupervisor = null;
+  try {
+    sessionLease = createLease();
+    startDaemon(ENTRY_PATH, configPath);
+    daemonSupervisor = setInterval(() => {
+      try { startDaemon(ENTRY_PATH, configPath); }
+      catch (e) { logger.error(`sessions: start broker daemon: ${e.message}`); }
+    }, 5_000);
+    daemonSupervisor.unref?.();
+  } catch (e) {
+    logger.error(`sessions: ${e.message}`);
+  }
 
   // Broker self-version check: best-effort, started once at startup and NOT
   // scoped to leadership — even a follower session should surface "broker
@@ -227,60 +267,13 @@ async function runMCP(cfg, logs, logger, configErr = null) {
   // go updatecheck.Run(ctx, Version, st, logger).
   updatecheck.run(state, { baked: VERSION, logger, abortSignal: abortCtrl.signal });
 
-  // makeServer is called by tryListen on each leadership attempt. The
-  // server it returns is the actual HTTP server — no probe-then-relisten.
-  const makeServer = () => {
-    if (cfg.serial.device && !tailer) {
-      tailer = new Tailer(cfg.serial.device, fwBuf, { baud: cfg.serial.baud });
-      tailer.start();
-    }
-    const usageCache = usage.buildCache(cfg, { credsModule: creds, logger });
-    const spendCache = spend.buildSpendCache(cfg, { logger });
-    const handler = createHandler({ cfg, cache, state, fwLogs, registry, logger, usageCache, spendCache, leaseManager });
-    return createServer(handler);
-  };
-
-  const onAcquired = async (_server) => {
-    // Reap lapsed leases (leader-scoped): a crashed follower's lease must not
-    // wedge the tailer off its port forever.
-    const leaseReaper = setInterval(() => { try { leaseManager.ReapExpired(); } catch {} }, 1000);
-    // The HTTP server is already listening. Hold until aborted.
-    // mDNS publication is scoped to the leader: only the process that
-    // actually owns the bound port should answer "I'm the broker" on
-    // the LAN.
-    let mdnsPub = null;
-    if (registry) {
-      try { mdnsPub = await MdnsPublisher.start(cfg.server.bind, cfg.server.port, registry, logger,
-        () => state.lastRequestAt()); }
-      catch (e) { logger.warn(`mdns: ${e.message} (broker discovery disabled)`); }
-    }
-    // Pull-OTA poller, scoped to leadership: it shares the leader's abort
-    // signal, so losing the bind tears it down alongside mDNS/the tailer.
-    ota.run(cfg, registry, abortCtrl.signal, logger);
-    // Custom-panel generators, scoped to leadership: torn down (SIGTERM →
-    // SIGKILL) when this peer loses the bound port.
-    const panelGen = new PanelGenerator(cfg, registry, logger);
-    panelGen.start(abortCtrl.signal);
-    try {
-      await new Promise((resolve) => {
-        abortCtrl.signal.addEventListener("abort", resolve, { once: true });
-      });
-    } finally {
-      clearInterval(leaseReaper);
-      await panelGen.stop();
-      if (mdnsPub) await mdnsPub.close();
-      if (tailer) { tailer.stop(); tailer = null; }
-    }
-  };
-
-  const leaderTask = leaderRun({
-    host: cfg.server.bind, port: cfg.server.port, state, makeServer, onAcquired,
-    abortSignal: abortCtrl.signal, logger,
-  });
-
   const deps = { cfg, state, logs, registry, version: VERSION };
   try { await mcpServe(deps); }
-  finally { abortCtrl.abort(); await leaderTask; }
+  finally {
+    abortCtrl.abort();
+    if (daemonSupervisor) clearInterval(daemonSupervisor);
+    sessionLease?.close();
+  }
   return 0;
 }
 
@@ -309,7 +302,7 @@ async function main() {
     // the client never sees `initialize`, drops the server from the session,
     // and the user is told nothing. Start degraded instead — tools up, broker
     // down (see runMCP).
-    if (flags.once || flags.status || flags.daemon) {
+    if (flags.once || flags.status || flags.daemon || flags.persistentDaemon) {
       process.stderr.write(`config: ${e.message}\n`);
       return 2;
     }
@@ -342,8 +335,8 @@ async function main() {
 
   if (flags.once) return runOnce(cfg);
   if (flags.status) return await runStatus(cfg);
-  if (flags.daemon) return await runDaemon(cfg, logs, logger);
-  return await runMCP(cfg, logs, logger, configErr);
+  if (flags.daemon || flags.persistentDaemon) return await runDaemon(cfg, logs, logger, flags.persistentDaemon);
+  return await runMCP(cfg, logs, logger, configErr, flags.config);
 }
 
 main().then((code) => process.exit(code ?? 0)).catch((e) => {

@@ -72,7 +72,7 @@ function makePost(body, { signed = true, contentLength = true } = {}) {
   req.method = "POST";
   req.url = path;
   req.headers = headers;
-  req.socket = { remoteAddress: "127.0.0.1" };
+  req.socket = { remoteAddress: "127.0.0.1", localAddress: "127.0.0.1", localPort: 8765 };
   req.destroy = () => { req.destroyed = true; };
   return req;
 }

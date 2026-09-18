@@ -7,9 +7,12 @@ implementations agree on the same shape.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import re
+import ipaddress
 import secrets
 import socket
 import time
@@ -17,8 +20,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .. import auth, creds, devlog
+from .. import auth, creds, devlog, session_life
 from ..config import Config
+from ..ota import pack_semver
+from ..gate import (
+    GATE_OK,
+    gate_device_of,
+    predict_device_gate,
+    predict_pending_cross_check,
+)
 from ..logbuf import Buffer
 from ..registry.store import (
     NotFound,
@@ -31,7 +41,7 @@ from ..registry.store import (
     valid_provider_mode,
     effective_channel,
 )
-from ..state import State
+from ..state import State, load_shared_snapshot
 
 log = logging.getLogger("tmon_mcp.mcp")
 
@@ -189,6 +199,137 @@ def _local_ipv4s() -> list[str]:
     return sorted(out)
 
 
+def _route_source_ip(device_ip: str) -> str:
+    """Which of this host's addresses the kernel would use to reach device_ip.
+
+    A UDP connect() sends no packet; it only consults the routing table. This
+    is the stdlib-only stand-in for "enumerate interfaces with their netmasks",
+    which Python cannot do without a third-party dependency — the Go and JS
+    brokers reach the same answer by matching the device against each
+    interface's prefix. Returns "" for anything unusable.
+    """
+    try:
+        ipaddress.IPv4Address(device_ip)
+    except ValueError:
+        return ""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect((device_ip, 9))
+            src = str(s.getsockname()[0])
+        finally:
+            s.close()
+    except OSError:
+        return ""
+    return "" if src.startswith("127.") else src
+
+
+def _pick_local_ip(ips: list[str], device_ip: str) -> str:
+    """The one of `ips` on the device's network, or the first as a fallback.
+
+    The probe's answer is only accepted when it is one of the addresses we
+    already enumerated. When `device_ip` is NOT on a directly connected subnet
+    — the device moved since its last poll, which is exactly the case this
+    whole change exists for — the probe returns the DEFAULT-route source, and
+    on a host with a full-tunnel VPN that is the tunnel address: unreachable
+    from the device, and a foreign origin, so the OTA would 401. Go and JS fall
+    back to the first physical address there; this makes Python agree.
+    """
+    src = _route_source_ip(device_ip)
+    return src if src in ips else ips[0]
+
+
+def _firmware_base(deps: Deps, dev) -> tuple[str, str] | None:
+    """(base_url, how) for the origin this device will accept a firmware
+    download from, in descending order of proof:
+
+      1. the socket-local address of the device's last authenticated request —
+         literally what it dialled, so it is what its NVS svc_url holds. The
+         firmware compares the firmware_url origin against svc_url with strcmp
+         and attaches the HMAC headers only on an exact match (tmon_ota.c), so
+         any other address of ours yields a 401 on /firmware/ — and that path,
+         unlike the manifest gate, poisons the version on-device after 3 tries;
+      2. the address of ours whose subnet contains the device's last source IP.
+         A laptop on WiFi and Ethernet at once has several usable addresses and
+         only one is on the device's network;
+      3. the first usable address, as before.
+
+    The "how" goes into the tool result because the three differ in how much
+    they prove. Returns None when this host has no LAN address at all.
+    Mirror of Go firmwareBase / JS firmwareBase."""
+    last_local = getattr(dev.active, "last_local_addr", "")
+    if last_local:
+        return (f"http://{last_local}",
+                "the address the device dialled on its last authenticated request — "
+                "the one origin its OTA download will carry HMAC headers for")
+    ips = _local_ipv4s()
+    if not ips:
+        return None
+    device_ip = dev.active.last_ip
+    ip = _pick_local_ip(ips, device_ip)
+    how = ("this host's first LAN address; the device has not been seen from a "
+           "matching subnet, so if its broker origin differs the download will "
+           "401 — have it poll /sync once and republish")
+    if device_ip and ip != ips[0]:
+        how = ("this host's address on the device's own subnet (guessed from its "
+               "last source IP, not proven)")
+    return f"http://{ip}:{deps.cfg.server.port}", how
+
+
+# httpOTAFloor mirror: packed(0.10.2) is the first firmware whose production
+# sdkconfig carries CONFIG_TMON_OTA_ALLOW_HTTP. Older units accept https only,
+# and refuse anything else in silence.
+_HTTP_OTA_FLOOR = (0 << 24) | (10 << 16) | 2
+
+
+def _gate_staged_firmware(dev, manifest_b64: str, sha_hex: str, version: str,
+                          firmware_url: str) -> str | None:
+    """Answer, before anything is written to the registry, whether the device
+    will actually install what the operator is about to stage. Returns an error
+    message, or None when the device would accept it.
+
+    It exists because a device that refuses a manifest says NOTHING: tmon_ota.c
+    clears the pending, records no poison and sends no X-Tmon-Ota-Fail, so the
+    operator sees a device that simply keeps running the old version while every
+    refused arm costs it a reboot. The published 1.0.0 index was exactly that
+    shape — a signed, verifying manifest whose declared floor locked out every
+    unit at or past 0.11.4.
+
+    Reading the fields needs no key, so the old stance here ("we do not parse
+    the manifest; the device-side gate is authoritative") cost the operator the
+    one signal the device never gives. The device-side gate stays authoritative
+    — we only decline to stage what it has already told us it will reject.
+
+    Mirror of Go gateStagedFirmware / JS gateStagedFirmware.
+    """
+    # The firmware's own hard limits (config_sync.c): a pending that trips one
+    # of these is dropped before the gate ever runs.
+    if len(firmware_url) >= 256:
+        return (f"firmware_url is {len(firmware_url)} chars; the device refuses "
+                "any pending whose URL is ≥256")
+    if not manifest_b64:
+        return None
+    try:
+        raw = base64.b64decode(manifest_b64, validate=True)
+    except (binascii.Error, ValueError):
+        return "firmware_manifest_b64 is not valid base64"
+    if len(raw) > 512:
+        return (f"the manifest decodes to {len(raw)} bytes; the device's buffer "
+                "is 512 and it drops the whole pending above that")
+    try:
+        mf = json.loads(raw)
+        if not isinstance(mf, dict):
+            raise ValueError("not an object")
+    except (ValueError, UnicodeDecodeError) as e:
+        return f"firmware_manifest_b64 does not decode to a JSON manifest: {e}"
+    verdict, why = predict_pending_cross_check(mf, sha_hex, version)
+    if verdict == GATE_OK:
+        verdict, why = predict_device_gate(mf, gate_device_of(dev))
+    if verdict != GATE_OK:
+        return f"the device would refuse this update ({verdict}): {why}"
+    return None
+
+
 def _registry_unavailable_text() -> str:
     return "device registry is not configured on this tokenmonitor-mcp install; configure ~/.config/tokenmonitor/devices/ and retry"
 
@@ -298,7 +439,7 @@ def _ota_info(cfg: Config) -> dict:
 
 
 def _status(deps: Deps) -> dict:
-    snap = deps.state.snapshot()
+    snap = _current_snapshot(deps.state)
     return {
         "version": deps.version,
         "addr": _broker_addr(deps.cfg),
@@ -359,7 +500,7 @@ async def _health(deps: Deps) -> dict:
 
     checks.append(await _self_ping(deps))
 
-    snap = deps.state.snapshot()
+    snap = _current_snapshot(deps.state)
     if snap.requests_total == 0:
         checks.append({"name": "observed_traffic", "pass": False, "detail": "no requests received yet"})
     elif snap.last_request_status == 200:
@@ -416,7 +557,19 @@ def _recent_logs(deps: Deps, args: dict) -> dict:
             limit = _clamp(int(raw), 1, 500)
         except ValueError:
             pass
-    return {"total_available": len(deps.logs), "lines": deps.logs.tail(limit)}
+    try:
+        return session_life.daemon_log_tail(limit)
+    except OSError:
+        return {"total_available": len(deps.logs), "lines": deps.logs.tail(limit)}
+
+
+def _current_snapshot(local: State):
+    try:
+        if session_life.daemon_running():
+            return load_shared_snapshot()
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    return local.snapshot()
 
 
 def _device_logs(deps: Deps, args: dict) -> dict:
@@ -555,8 +708,12 @@ def _set_device_pending(deps: Deps, args: dict) -> dict:
         except Exception as e:
             return {"error": str(e)}
     update = ConfigPayload()
-    if (v := (args.get("broker_url") or "").strip()):
-        update.broker_url = v
+    # No broker_url here: the device's broker address is not something the
+    # control plane sets any more. It is discovered by mDNS on the device's own
+    # subnet and adopted only after the response signature proves the pairing,
+    # so a staged address would be overwritten within a poll cycle — after
+    # costing a reboot. The provisioning tools still accept one as a cache seed
+    # for a device that has never resolved.
     if (v := (args.get("psk_hex") or "").strip().lower()):
         if len(v) != 64:
             return {"error": "psk_hex must be exactly 64 hex chars"}
@@ -683,6 +840,20 @@ def _set_device_pending(deps: Deps, args: dict) -> dict:
     if mb:
         update.firmware_manifest_b64 = mb
         update.firmware_manifest_sig_b64 = ms
+    # Predict the device-side gate before writing anything. A refusal here is a
+    # typo the operator can fix in seconds; the same mistake staged is a reboot
+    # the device spends telling nobody.
+    if mb or update.firmware_url:
+        try:
+            cur = deps.registry.load(device_id)
+        except NotFound:
+            return {"error": f"device {device_id} not registered — call tokenmonitor_register_device first"}
+        except Exception as e:
+            return {"error": str(e)}
+        bad = _gate_staged_firmware(cur, mb, update.firmware_sha256,
+                                    update.firmware_version, update.firmware_url)
+        if bad:
+            return {"error": bad}
     try:
         dev = deps.registry.set_pending(device_id, update)
     except NotFound:
@@ -721,13 +892,31 @@ def _revert_firmware(deps: Deps, args: dict) -> dict:
         return {"error": f"device {device_id} not registered"}
     except Exception as e:
         return {"error": str(e)}
-    floor = dev.active.payload.min_secure_version
-    if target_sv and target_sv < floor:
-        return {"error": (
-            f"revert blocked by anti-rollback: target min_secure_version={target_sv} "
-            f"< device floor={floor}. To downgrade, issue a new firmware with "
-            f"min_secure_version below {floor}, signed by the KSK."
-        )}
+    # The real authority is the manifest this call was handed, not the number
+    # the operator typed: the device gates on the signed min_secure_version AND
+    # on packed(version), and once its floor has risen past the target no
+    # manifest can lower it — a revert simply is not possible over OTA any more
+    # (USB is the way back). Predicting both here turns a silent on-device
+    # refusal, which costs a reboot and reports nothing, into an answer at the
+    # call site.
+    bad_gate = _gate_staged_firmware(dev, mb, fs, fv, fu)
+    if bad_gate:
+        return {"error": bad_gate}
+    # target_min_secure_version stays accepted as a cross-check: if the operator
+    # states a floor, it must be the one the manifest actually declares, or one
+    # of the two is the wrong artifact.
+    if target_sv:
+        try:
+            tmf = json.loads(base64.b64decode(mb, validate=True))
+        except Exception:  # noqa: BLE001 - already reported by the gate above
+            tmf = None
+        if isinstance(tmf, dict) and int(tmf.get("min_secure_version", 0) or 0) != target_sv:
+            return {"error": (
+                f"target_min_secure_version={target_sv} but the supplied manifest "
+                f"for {tmf.get('version', '')} declares "
+                f"{int(tmf.get('min_secure_version', 0) or 0)}; one of the two is "
+                "from a different build"
+            )}
     upd = ConfigPayload()
     upd.firmware_url = fu
     upd.firmware_sha256 = fs
@@ -881,6 +1070,10 @@ def _publish_firmware(deps: Deps, args: dict) -> dict:
     if any(ch in version for ch in " \t/\\"):
         return {"error": "firmware_version must not contain whitespace or path separators"}
 
+    # Loaded to confirm the device is registered (set_pending below needs it,
+    # and the error here names the fix). The record's broker_url is NOT used to
+    # build the URL any more; the address it dialled us on is, falling back to
+    # ranking this host's own addresses — see _firmware_base.
     try:
         dev = deps.registry.load(device_id)
     except NotFound:
@@ -888,6 +1081,7 @@ def _publish_firmware(deps: Deps, args: dict) -> dict:
     except Exception as e:
         return {"error": str(e)}
 
+    origin_source = ""
     external = (args.get("external_url") or "").strip()
     if external:
         if not external.startswith("https://"):
@@ -928,10 +1122,27 @@ def _publish_firmware(deps: Deps, args: dict) -> dict:
                 pass
         tmp.replace(dst)
         sha_hex = h.hexdigest()
-        base = (dev.active.payload.broker_url or "").rstrip("/")
-        if not base:
-            return {"error": "device has no active broker_url; cannot build firmware_url. Re-register the device first."}
+        chosen = _firmware_base(deps, dev)
+        if chosen is None:
+            return {"error": "this host has no reachable LAN address; cannot build firmware_url. "
+                             "Connect to the network the device is on, or publish with external_url."}
+        base, origin_source = chosen
         firmware_url = f"{base}/firmware/{file_name}"
+
+    # Cleartext transport is fine on a modern build — the manifest and the SHA
+    # are what establish trust, not TLS — but CONFIG_TMON_OTA_ALLOW_HTTP first
+    # appears in sdkconfig.secureboot at v0.10.2. Below that a production unit
+    # refuses any http:// firmware_url in config_sync.c and reports nothing, so
+    # the whole publish would land as silence.
+    if firmware_url.startswith("http://"):
+        running = pack_semver(dev.active.payload.firmware_version or "")
+        if running is not None and running < _HTTP_OTA_FLOOR:
+            return {"error": (
+                f"device {device_id} runs {dev.active.payload.firmware_version}, and "
+                "plain-http OTA only exists from 0.10.2 (CONFIG_TMON_OTA_ALLOW_HTTP); "
+                "it would drop this pending without a word. Publish with external_url "
+                "over https, or use the GitHub release path, to get it past 0.10.2 first."
+            )}
 
     update = ConfigPayload()
     update.firmware_url = firmware_url
@@ -955,18 +1166,22 @@ def _publish_firmware(deps: Deps, args: dict) -> dict:
         update.firmware_manifest_b64 = mb
         update.firmware_manifest_sig_b64 = ms
 
+    bad_gate = _gate_staged_firmware(dev, mb, sha_hex, version, firmware_url)
+    if bad_gate:
+        return {"error": bad_gate}
+
     try:
         dev2 = deps.registry.set_pending(device_id, update)
     except Exception as e:
         return {"error": str(e)}
-    return {
-        "ok": True,
-        "firmware_url": firmware_url,
-        "firmware_sha256": sha_hex,
-        "firmware_version": version,
-        "signed": bool(mb),
-        "device": _device_summary(dev2),
-    }
+    out: dict = {"ok": True, "firmware_url": firmware_url}
+    if origin_source:
+        out["firmware_url_origin"] = origin_source
+    out["firmware_sha256"] = sha_hex
+    out["firmware_version"] = version
+    out["signed"] = bool(mb)
+    out["device"] = _device_summary(dev2)
+    return out
 
 
 async def _discover_devices(args: dict) -> dict:

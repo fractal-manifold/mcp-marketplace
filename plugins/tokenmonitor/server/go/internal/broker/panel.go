@@ -159,7 +159,7 @@ func handleDevicePanel(cfg *config.Config, cache *auth.NonceCache, logger *log.L
 		return
 	}
 
-	if _, verr := auth.VerifyMulti(
+	res, verr := auth.VerifyMulti(
 		[][]byte{active, pending},
 		"GET", r.URL.Path,
 		r.Header.Get("X-Tmon-Timestamp"),
@@ -170,11 +170,13 @@ func handleDevicePanel(cfg *config.Config, cache *auth.NonceCache, logger *log.L
 		cache,
 		time.Duration(cfg.Security.MaxTimestampSkewSeconds)*time.Second,
 		time.Now(),
-	); verr != nil {
+	)
+	if verr != nil {
 		logger.Printf("auth rejected /device/%s/panel from %s: %v", deviceID, r.RemoteAddr, verr)
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
+	armResponseSignature(w, pskAt([][]byte{active, pending}, res.PSKIndex), r, r.URL.Path)
 
 	path := resolvePanelPath(cfg, deviceID)
 	if path == "" {

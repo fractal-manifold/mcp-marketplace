@@ -23,6 +23,7 @@
 import { createPublicKey, verify as cryptoVerify } from "node:crypto";
 
 import { effectiveChannel, candidateChannels } from "./registry/store.js";
+import { GATE_OK, gateDeviceOf, predictDeviceGate } from "./gate.js";
 
 const DEFAULT_POLL_MINUTES = 60;
 const MIN_POLL_MINUTES = 5;
@@ -369,8 +370,34 @@ function decide(reg, dev, resolved, dryRun, logger, stageStreaks) {
   // Floor guard: device refuses only packed(version) STRICTLY BELOW the floor
   // (tmon_ota.c: `mf_packed < floor`), so mirror with `<` — NOT `<=`. A release
   // packing EQUAL to the floor is installable; `<=` would wrongly skip a newer
-  // same-base dev canary that the device accepts.
+  // same-base dev canary that the device accepts. (A conformant manifest sets
+  // its floor to packed(version) — the tmtools default. A manifest that sets it
+  // LOWER buys no rollback margin, it only locks out every device whose floor
+  // has climbed past that value; see predictDeviceGate.)
   if (releasePacked < Number(dev.active.payload.min_secure_version || 0)) { out.action = "up_to_date"; return out; }
+
+  // Run the DEVICE's own manifest gate before staging.
+  //
+  // Everything past this point is a release the device WANTS — newer than its
+  // floor — that it would nonetheless refuse. That used to go entirely
+  // unchecked, above all `manifest.min_secure_version` against the same floor,
+  // which the device tests FIRST. The device's refusal is silent: tmon_ota.c
+  // clears the pending, poisons nothing and reports nothing, so the broker
+  // re-staged, five times, and then tombstoned a release that was never broken
+  // — burning a device reboot on every arm.
+  //
+  // predictDeviceGate mirrors ota_gate.c against the shared rows in
+  // compat/ota/gate_manifest.json. Note it sits BEFORE the streak bump: a
+  // manifest the device will refuse must never advance the install-loop
+  // counter, or a publishing mistake ends up blamed on the firmware.
+  {
+    const [verdict, why] = predictDeviceGate(mf, gateDeviceOf(dev));
+    if (verdict !== GATE_OK) {
+      out.action = "skipped:" + verdict;
+      out.reason = why;
+      return out;
+    }
+  }
   if (dev.pending && dev.pending.payload.firmware_version === String(mf.version || "")) { out.action = "skipped:already-pending"; return out; }
   // A dry run must not advance the streak: check_updates dry_run:true is a
   // read-only query and never causes a download.

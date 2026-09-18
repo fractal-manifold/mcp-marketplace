@@ -213,3 +213,79 @@ export function verifyMultiBody(psks, method, path, tsHeader, nonceHeader, sigHe
   if (!cache.checkAndAdd(nonceLC, nowTs)) throw new AuthError(ERR_NONCE_REPLAY);
   return { pskIndex: matched };
 }
+
+// --------------------------------------------------------------------------
+// Response direction (v1)
+// --------------------------------------------------------------------------
+// The request signatures above only ever proved the DEVICE to the BROKER. That
+// was enough while the broker's address was configuration someone typed; it is
+// not enough now that the device locates its broker by mDNS, where any host on
+// the LAN can advertise a `devs=` list containing our (public) device_id. This
+// tag is the other half: proof that the responder holds the device's PSK.
+//
+// Mirrors auth.ComputeResponseSignature in the Go broker and
+// tmon_resp_sig_canonical() in firmware/components/crypto. Vectors:
+// compat/vectors/hmac.json → response_vectors.
+
+export const RESPONSE_SIG_PREFIX = "tmon-resp-v1";
+export const RESPONSE_SIG_HEADER = "X-Tmon-Resp-Signature";
+
+// Lowercase-hex SHA-256 of the exact response bytes.
+export function bodySha256Hex(body) {
+  return createHash("sha256").update(body ?? Buffer.alloc(0)).digest("hex");
+}
+
+// HMAC-SHA256(psk, PREFIX\nDEVICE\nNONCE\nHOST\nPATH\nSTATUS\nBODY_SHA256).
+//
+// `nonce` is the request's X-Tmon-Nonce, lower-cased exactly as the request
+// verifiers do — that binding is what makes the tag a challenge-response
+// rather than something an impostor could precompute or replay. `status` is
+// the decimal HTTP status, so a 200 tag cannot be spliced onto a 503.
+//
+// `host` is the LOCAL socket address this broker answered on ("<ipv4>:<port>"),
+// never the client-supplied Host header. It is what makes the tag prove *this
+// address*: without it an impostor can advertise itself on the LAN, forward
+// each request to the real broker, and return the real broker's tag — which
+// verifies, and the device then adopts and caches the relay. See
+// responseSigHost().
+export function computeResponseSignature(psk, device, nonce, host, path, status, bodySha256) {
+  const key = Buffer.isBuffer(psk) ? psk : Buffer.from(psk, "utf8");
+  const mac = createHmac("sha256", key);
+  mac.update(RESPONSE_SIG_PREFIX);
+  mac.update("\n");
+  mac.update(device ?? "");
+  mac.update("\n");
+  mac.update(String(nonce ?? "").toLowerCase());
+  mac.update("\n");
+  mac.update(host);
+  mac.update("\n");
+  mac.update(path);
+  mac.update("\n");
+  mac.update(String(status));
+  mac.update("\n");
+  mac.update(bodySha256);
+  return mac.digest("hex");
+}
+
+// responseSigHost returns the HOST field for `req`: the local end of its
+// socket, "<ip>:<port>".
+//
+// Taken from the socket, never from the Host header — a relay forwards that
+// header untouched, so signing it would prove nothing about who answered. An
+// IPv4-mapped local address ("::ffff:192.168.1.28", what a dual-stack listener
+// reports) is unwrapped so a broker bound to "::" signs the same bytes as one
+// bound to "0.0.0.0".
+//
+// Returns "" when there is no usable local address; the caller must then emit
+// no tag rather than sign an empty host, which would canonicalise every
+// address alike and switch the relay binding back off.
+export function responseSigHost(req) {
+  const sock = req?.socket;
+  let host = sock?.localAddress;
+  const port = sock?.localPort;
+  if (!host || typeof port !== "number") return "";
+  host = String(host);
+  if (host.toLowerCase().startsWith("::ffff:")) host = host.slice(7);
+  if (!host) return "";
+  return `${host}:${port}`;
+}

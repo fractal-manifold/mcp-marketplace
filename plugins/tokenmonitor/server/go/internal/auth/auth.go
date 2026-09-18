@@ -22,6 +22,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -357,4 +359,102 @@ func VerifyMultiBody(
 		return VerifyResult{}, ErrNonceReplay
 	}
 	return VerifyResult{PSKIndex: matchedIdx}, nil
+}
+
+// --- response direction ------------------------------------------------
+
+// ResponseSigPrefix is the domain-separation tag that opens the response
+// canonical input. It exists so a response tag can never be confused with a
+// request tag: the request forms start with an HTTP method, and no method is
+// ever this string.
+const ResponseSigPrefix = "tmon-resp-v1"
+
+// ComputeResponseSignature reproduces the canonical RESPONSE signature —
+// the value of the X-Tmon-Resp-Signature header — as lowercase hex:
+//
+//	HMAC-SHA256(psk,
+//	  "tmon-resp-v1\n<DEVICE>\n<NONCE>\n<HOST>\n<PATH>\n<STATUS>\n<BODY_SHA256>")
+//
+// This is what lets the DEVICE authenticate the BROKER. The request HMAC only
+// ever proved the other direction, which was enough while the broker's address
+// was operator-configured; it is not enough now that the device locates the
+// broker by mDNS, where anything on the LAN can answer (device_id is public —
+// it travels in X-Tmon-Device on every request).
+//
+//   - DEVICE is the request's X-Tmon-Device verbatim ("" when absent).
+//   - NONCE is the request's X-Tmon-Nonce, lower-cased — the same
+//     normalisation Verify applies before checking the request signature.
+//     Binding it makes this a challenge-response: the device picks the nonce,
+//     so a tag cannot be precomputed or replayed onto a later request.
+//   - HOST is the address THIS broker answered on — the connection's local
+//     socket address as "<ipv4>:<port>", never the client-supplied Host
+//     header. It is what makes the tag prove this address rather than merely
+//     "somebody holding the PSK": without it an attacker can advertise the
+//     service on its own IP, relay each request to the real broker, and hand
+//     back a tag that verifies, at which point the device adopts and caches
+//     the relay. See ResponseSigHost.
+//   - PATH is canonicalised exactly as in the request forms.
+//   - STATUS is the decimal HTTP status, so a 200 tag cannot be spliced onto
+//     a 503.
+//   - bodySHA256 is the lowercase-hex SHA-256 of the exact response body,
+//     which is why the tag also authenticates the body and not just the
+//     origin.
+//
+// See compat/HMAC_CANONICAL.md ("Response signature") for the contract.
+func ComputeResponseSignature(psk []byte, device, nonce, host, path string, status int, bodySHA256 string) string {
+	mac := hmac.New(sha256.New, psk)
+	mac.Write([]byte(ResponseSigPrefix))
+	mac.Write([]byte{'\n'})
+	mac.Write([]byte(device))
+	mac.Write([]byte{'\n'})
+	mac.Write([]byte(strings.ToLower(nonce)))
+	mac.Write([]byte{'\n'})
+	mac.Write([]byte(host))
+	mac.Write([]byte{'\n'})
+	mac.Write([]byte(path))
+	mac.Write([]byte{'\n'})
+	mac.Write([]byte(strconv.Itoa(status)))
+	mac.Write([]byte{'\n'})
+	mac.Write([]byte(bodySHA256))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// ResponseSigHost is the HOST field of the response canonical: the local
+// address of the connection the request arrived on, as "<ipv4>:<port>".
+//
+// It MUST come from the socket, never from the Host header — a relay forwards
+// the header untouched, so signing that would prove nothing about who actually
+// answered. An IPv4-mapped local address ("::ffff:192.168.1.28", what a
+// dual-stack listener reports) is unwrapped, so a broker bound to "::" and one
+// bound to "0.0.0.0" sign the same bytes for the same device.
+//
+// Returns "" when the request carries no local address; a caller that gets ""
+// must emit no tag rather than sign an empty host, which would canonicalise
+// every address alike and switch the relay binding back off.
+func ResponseSigHost(r *http.Request) string {
+	addr, _ := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
+	if addr == nil {
+		return ""
+	}
+	host, port, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return ""
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if v4 := ip.To4(); v4 != nil {
+			host = v4.String()
+		}
+	}
+	if host == "" || port == "" {
+		return ""
+	}
+	return net.JoinHostPort(host, port)
+}
+
+// BodySHA256Hex is the lowercase-hex SHA-256 of a response body, the last
+// field of the response canonical input. An empty body hashes as the SHA-256
+// of the empty string, not as "" — there is no special case.
+func BodySHA256Hex(body []byte) string {
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:])
 }

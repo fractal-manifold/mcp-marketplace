@@ -8,8 +8,15 @@
 package state
 
 import (
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
+
+	"github.com/fractal-manifold/tokenmonitor-mcp/internal/sessionlife"
 )
 
 type Role int
@@ -33,6 +40,7 @@ func (r Role) String() string {
 
 type State struct {
 	mu                sync.RWMutex
+	persistMu         sync.Mutex
 	role              Role
 	roleSince         time.Time
 	lastRequestAt     time.Time
@@ -40,6 +48,7 @@ type State struct {
 	lastRequestStatus int
 	requestsTotal     uint64
 	update            UpdateInfo
+	shared            bool
 }
 
 // UpdateInfo is the cached result of the broker self-version check: is a newer
@@ -70,23 +79,32 @@ func (s *State) LastRequestAt() time.Time {
 // SetRole records a role transition. No-op if the role didn't change.
 func (s *State) SetRole(r Role) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.role == r {
+		s.mu.Unlock()
 		return
 	}
 	s.role = r
 	s.roleSince = time.Now()
+	shared := s.shared
+	s.mu.Unlock()
+	if shared {
+		s.persist()
+	}
 }
 
 // RecordRequest is called by the broker handler after each /credentials hit
 // (regardless of whether auth passed — what matters is observed traffic).
 func (s *State) RecordRequest(remote string, status int, t time.Time) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.lastRequestAt = t
 	s.lastRequestRemote = remote
 	s.lastRequestStatus = status
 	s.requestsTotal++
+	shared := s.shared
+	s.mu.Unlock()
+	if shared {
+		s.persist()
+	}
 }
 
 // SetUpdate records the latest broker self-version-check result. The
@@ -94,8 +112,12 @@ func (s *State) RecordRequest(remote string, status int, t time.Time) {
 // the MCP health/status tools read it back via Update.
 func (s *State) SetUpdate(u UpdateInfo) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.update = u
+	shared := s.shared
+	s.mu.Unlock()
+	if shared {
+		s.persist()
+	}
 }
 
 // Update returns the last cached self-version-check result (zero value =
@@ -150,4 +172,64 @@ func (s *State) Snapshot() Snapshot {
 		snap.LatestVersion = s.update.Latest
 	}
 	return snap
+}
+
+// EnableShared makes this daemon's snapshot visible to the lightweight MCP
+// adapters. It is explicit so state unit tests and follower adapters never
+// write into the user's runtime directory.
+func (s *State) EnableShared() {
+	s.mu.Lock()
+	s.shared = true
+	s.mu.Unlock()
+	s.persist()
+}
+
+func sharedPath() (string, error) {
+	dir, err := sessionlife.RuntimeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "broker-state.json"), nil
+}
+
+func (s *State) persist() {
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
+	path, err := sharedPath()
+	if err != nil {
+		return
+	}
+	b, err := json.Marshal(s.Snapshot())
+	if err != nil {
+		return
+	}
+	tmp := path + ".tmp-" + strconv.Itoa(os.Getpid())
+	if err := os.WriteFile(tmp, append(b, '\n'), 0o600); err != nil {
+		return
+	}
+	if err := replaceFile(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+	}
+}
+
+// LoadSharedSnapshot reads the daemon-owned snapshot atomically published on
+// disk. Adapters fall back to their local state when the daemon has not yet
+// produced one.
+func LoadSharedSnapshot() (Snapshot, error) {
+	path, err := sharedPath()
+	if err != nil {
+		return Snapshot{}, err
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	var snap Snapshot
+	if err := json.Unmarshal(b, &snap); err != nil {
+		return Snapshot{}, err
+	}
+	if snap.Role == "" {
+		return Snapshot{}, errors.New("shared broker snapshot has no role")
+	}
+	return snap, nil
 }

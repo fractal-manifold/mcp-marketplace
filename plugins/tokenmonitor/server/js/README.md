@@ -15,9 +15,10 @@ npm install
 
 ```sh
 tokenmonitor-mcp-js --probe       # used by the tokenmonitor-mcp launcher
-tokenmonitor-mcp-js --daemon
+tokenmonitor-mcp-js --daemon      # shared broker; exits when no sessions remain
+tokenmonitor-mcp-js --persistent-daemon
 tokenmonitor-mcp-js --version
-tokenmonitor-mcp-js               # default: MCP stdio + leader-elected broker
+tokenmonitor-mcp-js               # MCP stdio + lease for the shared daemon
 ```
 
 Requires Node ≥ 20. Config lives at

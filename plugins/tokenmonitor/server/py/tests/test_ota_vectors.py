@@ -120,7 +120,7 @@ def _registry_with_device(tmp_path, sku: str, min_sv: int) -> Registry:
     # (stable). Dual-channel dev routing has its own test.
     reg.set_serial(TEST_DEVICE, "CWM-S1-MAD-2620-000001-0", sku)
     if min_sv > 0:
-        reg.bump_min_sv(TEST_DEVICE, min_sv)
+        reg.record_min_sv(TEST_DEVICE, min_sv)
     return reg
 
 
@@ -176,15 +176,52 @@ async def test_check_stages_when_release_at_floor(tmp_path):
     # The device refuses only packed < floor (tmon_ota.c), so a release whose
     # base EQUALS the floor is installable and must be staged — not treated as
     # up_to_date. Mirrors a newer same-base dev canary after the floor matured.
-    canonical, sig_b64 = _s1_vector()
-    server = await _mock_server({"S1": _index(canonical, sig_b64)})
+    #
+    # It uses a freshly signed conformant manifest rather than the frozen S1
+    # vector: that vector declares min_secure_version=7, far below
+    # packed(0.5.1), which is exactly the shape the manifest gate now refuses.
+    # The vector stays as it is — it exists to pin signature bytes, not policy.
+    idx = _conformant_index("S1", "0.5.1")
+    server = await _mock_server({"S1": idx})
     try:
         cfg = _cfg_for(str(server.make_url("/")).rstrip("/"))
         reg = _registry_with_device(tmp_path, "S1", ota.pack_semver("0.5.1"))
         rep = await ota.check(cfg, reg, dry_run=True)
-        assert rep["devices"][0]["action"] == "would_stage"
+        assert rep["devices"][0]["action"] == "would_stage", rep["devices"][0]
     finally:
         await server.close()
+
+
+def _signed_manifest(sku: str, version: str, min_sv: int, channel: str = "",
+                     sha: str = "a" * 64) -> tuple[str, str]:
+    """Sign a canonical manifest with the shared test seed.
+
+    The frozen vectors pin signature bytes for a handful of historical
+    manifests; a policy test needs to vary min_secure_version, so it signs its
+    own. Same key, same canonical shape (sorted keys, no whitespace).
+    """
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    priv = Ed25519PrivateKey.from_private_bytes(
+        bytes.fromhex(VECTORS["test_keypair"]["seed_hex"]))
+    head = f'{{"channel":"{channel}",' if channel else "{"
+    canonical = (
+        head
+        + f'"key_id":"ed25519-2026-q2","min_secure_version":{min_sv},'
+        + f'"sha256":"{sha}","size":2048,"sku":"{sku}","version":"{version}"}}'
+    )
+    sig = priv.sign(canonical.encode("utf-8"))
+    return canonical, base64.b64encode(sig).decode("ascii")
+
+
+def _conformant_index(sku: str, version: str, channel: str = "") -> dict:
+    """_signed_manifest wrapped in a release index, with the floor the tmtools
+    default would pick: packed(version)."""
+    packed = ota.pack_semver(version)
+    assert packed is not None, version
+    canonical, sig_b64 = _signed_manifest(sku, version, packed, channel)
+    return _index(canonical, sig_b64, version=version,
+                  bin_url=f"https://dl.example/tmon-{sku}-{version}.bin")
 
 
 async def test_check_rejects_tampered_signature(tmp_path):

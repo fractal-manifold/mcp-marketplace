@@ -13,12 +13,21 @@ import { randomBytes, createHash } from "node:crypto";
 import * as auth from "../auth.js";
 import * as creds from "../creds.js";
 import * as ota from "../ota.js";
+import { packSemver } from "../ota.js";
+import {
+  GATE_OK,
+  gateDeviceOf,
+  predictDeviceGate,
+  predictPendingCrossCheck,
+} from "../gate.js";
 import * as devlog from "../devlog.js";
 import { validDeviceID, effectiveChannel, providerModeEnabled, providerModeFromBool, validProviderMode } from "../registry/store.js";
 import { firmwarePath } from "../config.js";
 import { clipCodePoints } from "../textutil.js";
 import { handleUSBScan, handleUSBProvision } from "./usb.js";
 import { setWiFiTool } from "./wifi.js";
+import { daemonLogTail, daemonRunning } from "../sessionLife.js";
+import { loadSharedSnapshot } from "../state.js";
 
 function compatDir() {
   let dir = dirname(fileURLToPath(import.meta.url));
@@ -118,15 +127,54 @@ function isVirtualIface(name) {
 }
 
 function localIPv4s() {
+  return localIPv4Nets().map((n) => n.address);
+}
+
+// localIPv4Nets is localIPv4s with the CIDR kept, in the same order. The prefix
+// is what lets a caller ask "which of my addresses is on the same network as
+// this device" instead of guessing with the first one.
+function localIPv4Nets() {
   const out = [];
   const ifaces = networkInterfaces();
   for (const name of Object.keys(ifaces)) {
     if (isVirtualIface(name)) continue;
     for (const i of ifaces[name] || []) {
-      if (i.family === "IPv4" && !i.internal) out.push(i.address);
+      if (i.family === "IPv4" && !i.internal) out.push({ address: i.address, cidr: i.cidr || "" });
     }
   }
-  return out.sort();
+  return out.sort((a, b) => (a.address < b.address ? -1 : a.address > b.address ? 1 : 0));
+}
+
+// ipv4ToInt returns the address as an unsigned 32-bit number, or null.
+function ipv4ToInt(ip) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(String(ip || ""));
+  if (!m) return null;
+  let v = 0;
+  for (let i = 1; i <= 4; i++) {
+    const o = Number(m[i]);
+    if (!Number.isInteger(o) || o < 0 || o > 255) return null;
+    v = (v * 256) + o;
+  }
+  return v;
+}
+
+// pickLocalIP is localFirmwareBase's choice, split out because it is the only
+// part testable without the host's real interfaces. nets must be non-empty.
+export function pickLocalIP(nets, deviceIP) {
+  const target = ipv4ToInt(deviceIP);
+  if (target != null) {
+    for (const n of nets) {
+      const [addr, bitsRaw] = String(n.cidr || "").split("/");
+      const bits = Number.parseInt(bitsRaw, 10);
+      const base = ipv4ToInt(addr);
+      if (base == null || !Number.isInteger(bits) || bits < 0 || bits > 32) continue;
+      // A /0 mask would be `>>> 32`, which JS evaluates as `>>> 0` — no shift
+      // at all — so the all-ones mask has to be spelled out.
+      const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+      if (((base & mask) >>> 0) === ((target & mask) >>> 0)) return n.address;
+    }
+  }
+  return nets[0].address;
 }
 
 export function registryUnavailableMsg() {
@@ -164,7 +212,10 @@ export async function serve(deps) {
   await new Promise((resolve) => { server.onclose = resolve; });
 }
 
-async function dispatch(deps, name, args) {
+// Exported for tests: the tool bodies are plain functions of (deps, args), and
+// driving them through the same dispatch the MCP transport uses keeps the tests
+// honest about the names.
+export async function dispatch(deps, name, args) {
   switch (name) {
     case "tokenmonitor_status": return statusTool(deps);
     case "tokenmonitor_health": return await healthTool(deps);
@@ -209,7 +260,7 @@ function statusTool(deps) {
     oauth_path: deps.cfg.oauthPathAbs(),
     config: configInfo(deps.cfg),
     ota: otaInfo(deps.cfg),
-    snapshot: deps.state.snapshot(),
+    snapshot: currentSnapshot(deps.state),
   };
 }
 
@@ -255,7 +306,7 @@ async function healthTool(deps) {
     checks.push({ name: "credentials", pass: false, detail: e.message });
   }
   checks.push(await selfPing(deps));
-  const snap = deps.state.snapshot();
+  const snap = currentSnapshot(deps.state);
   if (!snap.requests_total) checks.push({ name: "observed_traffic", pass: false, detail: "no requests received yet" });
   else if (snap.last_request_status === 200) checks.push({ name: "observed_traffic", pass: true, detail: `last request OK at ${snap.last_request_at || ""}` });
   else checks.push({ name: "observed_traffic", pass: false, detail: `last request returned ${snap.last_request_status}` });
@@ -304,7 +355,14 @@ function recentLogsTool(deps, args) {
     const n = Number.parseInt(args.limit, 10);
     if (Number.isFinite(n)) limit = clamp(n, 1, 500);
   }
-  return { total_available: deps.logs.length, lines: deps.logs.tail(limit) };
+  try { return daemonLogTail(limit); }
+  catch { return { total_available: deps.logs.length, lines: deps.logs.tail(limit) }; }
+}
+
+function currentSnapshot(local) {
+  try { if (daemonRunning()) return loadSharedSnapshot(); }
+  catch { return local.snapshot(); }
+  return local.snapshot();
 }
 
 function firmwareLogsTool(deps, args) {
@@ -352,6 +410,99 @@ function deviceLogsTool(deps, args) {
   const lines = devlog.read(deps.registry.dir, deviceID);
   const total = lines.length;
   return { device_id: deviceID, total_available: total, lines: limit < total ? lines.slice(total - limit) : lines };
+}
+
+// httpOTAFloor is packed(0.10.2), the first firmware whose production sdkconfig
+// carries CONFIG_TMON_OTA_ALLOW_HTTP. Older units accept https only, and refuse
+// anything else in silence.
+const HTTP_OTA_FLOOR = (0 << 24) | (10 << 16) | 2;
+
+// firmwareBase returns { url, how } for the origin this device will accept a
+// firmware download from, in descending order of proof:
+//
+//   1. the socket-local address of the device's last authenticated request —
+//      literally what it dialled, so it is what its NVS svc_url holds. The
+//      firmware compares the firmware_url origin against svc_url with strcmp
+//      and attaches the HMAC headers only on an exact match (tmon_ota.c), so
+//      any other address of ours yields a 401 on /firmware/ — and that path,
+//      unlike the manifest gate, poisons the version on-device after 3 tries;
+//   2. the address of ours whose subnet contains the device's last source IP.
+//      A laptop on WiFi and Ethernet at once has several usable addresses and
+//      only one is on the device's network;
+//   3. the first usable address, as before.
+//
+// The "how" goes into the tool result because the three differ in how much they
+// prove. Returns null when this host has no LAN address at all.
+function firmwareBase(deps, dev) {
+  const lastLocal = dev.active.lastLocalAddr || "";
+  if (lastLocal) {
+    return {
+      url: `http://${lastLocal}`,
+      how: "the address the device dialled on its last authenticated request — " +
+        "the one origin its OTA download will carry HMAC headers for",
+    };
+  }
+  const nets = localIPv4Nets();
+  if (!nets.length) return null;
+  const deviceIP = dev.active.lastIP || "";
+  const ip = pickLocalIP(nets, deviceIP);
+  let how = "this host's first LAN address; the device has not been seen from a " +
+    "matching subnet, so if its broker origin differs the download will 401 — " +
+    "have it poll /sync once and republish";
+  if (deviceIP && ip !== nets[0].ip) {
+    how = "this host's address on the device's own subnet (guessed from its " +
+      "last source IP, not proven)";
+  }
+  return { url: `http://${ip}:${deps.cfg.server.port}`, how };
+}
+
+// gateStagedFirmware answers, before anything is written to the registry,
+// whether the device will actually install what the operator is about to stage.
+// Returns an error message, or null when the device would accept it.
+//
+// It exists because a device that refuses a manifest says NOTHING: tmon_ota.c
+// clears the pending, records no poison and sends no X-Tmon-Ota-Fail, so the
+// operator sees a device that simply keeps running the old version while every
+// refused arm costs it a reboot. The published 1.0.0 index was exactly that
+// shape — a signed, verifying manifest whose declared floor locked out every
+// unit at or past 0.11.4.
+//
+// Reading the fields needs no key, so the old stance here ("we do not parse the
+// manifest; the device-side gate is authoritative") cost the operator the one
+// signal the device never gives. The device-side gate stays authoritative — we
+// only decline to stage what it has already told us it will reject.
+function gateStagedFirmware(dev, manifestB64, shaHex, version, firmwareURL) {
+  // The firmware's own hard limits (config_sync.c): a pending that trips one of
+  // these is dropped before the gate ever runs.
+  if (String(firmwareURL || "").length >= 256) {
+    return `firmware_url is ${String(firmwareURL).length} chars; the device ` +
+      "refuses any pending whose URL is ≥256";
+  }
+  if (!manifestB64) return null;
+  let raw;
+  try {
+    raw = Buffer.from(manifestB64, "base64");
+    if (raw.toString("base64").replace(/=+$/, "") !== manifestB64.replace(/=+$/, "")) {
+      return "firmware_manifest_b64 is not valid base64";
+    }
+  } catch {
+    return "firmware_manifest_b64 is not valid base64";
+  }
+  if (raw.length > 512) {
+    return `the manifest decodes to ${raw.length} bytes; the device's buffer is ` +
+      "512 and it drops the whole pending above that";
+  }
+  let mf;
+  try {
+    mf = JSON.parse(raw.toString("utf8"));
+    if (mf === null || typeof mf !== "object" || Array.isArray(mf)) throw new Error("not an object");
+  } catch (e) {
+    return `firmware_manifest_b64 does not decode to a JSON manifest: ${e.message}`;
+  }
+  let [verdict, why] = predictPendingCrossCheck(mf, shaHex, version);
+  if (verdict === GATE_OK) [verdict, why] = predictDeviceGate(mf, gateDeviceOf(dev));
+  if (verdict !== GATE_OK) return `the device would refuse this update (${verdict}): ${why}`;
+  return null;
 }
 
 function provisionHintTool(deps) {
@@ -419,7 +570,12 @@ function setDevicePendingTool(deps, args) {
     }
   }
   const upd = { version: 0, broker_url: "", psk_hex: "", city: "", br_day: 0, br_night: 0, vol: null, providers: null, provider_modes: null, autorotate_enabled: null, autorotate_interval_s: null, theme_mode: "", pet_enabled: null, pet_species: null, pet_name: "", panel_enabled: null, gemini_models: null, log_enabled: null, firmware_url: "", firmware_sha256: "", firmware_version: "", firmware_manifest_b64: "", firmware_manifest_sig_b64: "", min_secure_version: 0 };
-  if (args.broker_url) upd.broker_url = String(args.broker_url).trim();
+  // No broker_url here: the device's broker address is not something the
+  // control plane sets any more. It is discovered by mDNS on the device's own
+  // subnet and adopted only after the response signature proves the pairing, so
+  // a staged address would be overwritten within a poll cycle — after costing a
+  // reboot. The provisioning tools still accept one as a cache seed for a
+  // device that has never resolved.
   if (args.psk_hex) {
     const v = String(args.psk_hex).trim().toLowerCase();
     if (v.length !== 64) return { error: "psk_hex must be exactly 64 hex chars" };
@@ -514,6 +670,19 @@ function setDevicePendingTool(deps, args) {
     upd.firmware_manifest_b64 = mb;
     upd.firmware_manifest_sig_b64 = ms;
   }
+  // Predict the device-side gate before writing anything. A refusal here is a
+  // typo the operator can fix in seconds; the same mistake staged is a reboot
+  // the device spends telling nobody.
+  if (mb || upd.firmware_url) {
+    let cur;
+    try { cur = deps.registry.load(deviceID); }
+    catch (e) {
+      if (/not found/.test(e.message)) return { error: `device ${deviceID} not registered — call tokenmonitor_register_device first` };
+      return { error: e.message };
+    }
+    const bad = gateStagedFirmware(cur, mb, upd.firmware_sha256, upd.firmware_version, upd.firmware_url);
+    if (bad) return { error: bad };
+  }
   try { return { ok: true, device: deviceSummary(deps.registry.setPending(deviceID, upd)) }; }
   catch (e) {
     if (/not found/.test(e.message)) return { error: `device ${deviceID} not registered — call tokenmonitor_register_device first` };
@@ -534,6 +703,10 @@ function publishFirmwareTool(deps, args) {
   if (version.length > 31) return { error: "firmware_version must be ≤31 chars" };
   if (/[\s/\\]/.test(version)) return { error: "firmware_version must not contain whitespace or path separators" };
 
+  // Loaded to confirm the device is registered (setPending below needs it, and
+  // the error here names the fix). The record's broker_url is NOT used to build
+  // the URL any more; its observed lastIP is, only to rank this host's own
+  // addresses — see localFirmwareBase.
   let dev;
   try { dev = deps.registry.load(deviceID); }
   catch (e) {
@@ -542,6 +715,7 @@ function publishFirmwareTool(deps, args) {
   }
 
   let firmwareURL, shaHex;
+  let originSource = "";
   const external = String(args.external_url || "").trim();
   if (external) {
     if (!external.startsWith("https://")) return { error: "external_url must be HTTPS" };
@@ -577,9 +751,25 @@ function publishFirmwareTool(deps, args) {
     }
     renameSync(tmp, dst);
     shaHex = h.digest("hex");
-    const base = (dev.active.payload.broker_url || "").replace(/\/$/, "");
-    if (!base) return { error: "device has no active broker_url; cannot build firmware_url. Re-register the device first." };
-    firmwareURL = `${base}/firmware/${fileName}`;
+    const chosen = firmwareBase(deps, dev);
+    if (!chosen) return { error: "this host has no reachable LAN address; cannot build firmware_url. Connect to the network the device is on, or publish with external_url." };
+    originSource = chosen.how;
+    firmwareURL = `${chosen.url}/firmware/${fileName}`;
+  }
+
+  // Cleartext transport is fine on a modern build — the manifest and the SHA
+  // are what establish trust, not TLS — but CONFIG_TMON_OTA_ALLOW_HTTP first
+  // appears in sdkconfig.secureboot at v0.10.2. Below that a production unit
+  // refuses any http:// firmware_url in config_sync.c and reports nothing, so
+  // the whole publish would land as silence.
+  if (firmwareURL.startsWith("http://")) {
+    const running = packSemver(String(dev.active.payload.firmware_version || ""));
+    if (running !== null && running < HTTP_OTA_FLOOR) {
+      return { error: `device ${deviceID} runs ${dev.active.payload.firmware_version}, ` +
+        "and plain-http OTA only exists from 0.10.2 (CONFIG_TMON_OTA_ALLOW_HTTP); it " +
+        "would drop this pending without a word. Publish with external_url over https, " +
+        "or use the GitHub release path, to get it past 0.10.2 first." };
+    }
   }
 
   // Optional signed-manifest envelope — same validation as setDevicePending.
@@ -597,9 +787,18 @@ function publishFirmwareTool(deps, args) {
                 theme_mode: "", gemini_models: null,
                 firmware_url: firmwareURL, firmware_sha256: shaHex, firmware_version: version,
                 firmware_manifest_b64: mb, firmware_manifest_sig_b64: ms };
+  const badGate = gateStagedFirmware(dev, mb, shaHex, version, firmwareURL);
+  if (badGate) return { error: badGate };
+
   try {
     const dev2 = deps.registry.setPending(deviceID, upd);
-    return { ok: true, firmware_url: firmwareURL, firmware_sha256: shaHex, firmware_version: version, signed: !!mb, device: deviceSummary(dev2) };
+    const out = { ok: true, firmware_url: firmwareURL };
+    if (originSource) out.firmware_url_origin = originSource;
+    out.firmware_sha256 = shaHex;
+    out.firmware_version = version;
+    out.signed = !!mb;
+    out.device = deviceSummary(dev2);
+    return out;
   } catch (e) { return { error: e.message }; }
 }
 
@@ -625,12 +824,25 @@ function revertFirmwareTool(deps, args) {
     if (/not found/.test(e.message)) return { error: `device ${deviceID} not registered` };
     return { error: e.message };
   }
-  const floor = Number(dev.active.payload.min_secure_version || 0);
-  if (targetSV && targetSV < floor) {
-    return { error: (
-      `revert blocked by anti-rollback: target min_secure_version=${targetSV} < device floor=${floor}. ` +
-      `To downgrade, issue a new firmware with min_secure_version below ${floor}, signed by the KSK.`
-    ) };
+  // The real authority is the manifest this call was handed, not the number the
+  // operator typed: the device gates on the signed min_secure_version AND on
+  // packed(version), and once its floor has risen past the target no manifest
+  // can lower it — a revert simply is not possible over OTA any more (USB is
+  // the way back). Predicting both here turns a silent on-device refusal, which
+  // costs a reboot and reports nothing, into an answer at the call site.
+  const badGate = gateStagedFirmware(dev, mb, fs, fv, fu);
+  if (badGate) return { error: badGate };
+  // target_min_secure_version stays accepted as a cross-check: if the operator
+  // states a floor, it must be the one the manifest actually declares, or one
+  // of the two is the wrong artifact.
+  if (targetSV) {
+    let tmf = null;
+    try { tmf = JSON.parse(Buffer.from(mb, "base64").toString("utf8")); } catch { /* reported by the gate above */ }
+    if (tmf && typeof tmf === "object" && Number(tmf.min_secure_version || 0) !== targetSV) {
+      return { error: `target_min_secure_version=${targetSV} but the supplied manifest ` +
+        `for ${String(tmf.version || "")} declares ${Number(tmf.min_secure_version || 0)}; ` +
+        "one of the two is from a different build" };
+    }
   }
   const upd = { version: 0, broker_url: "", psk_hex: "", city: "", br_day: 0, br_night: 0, vol: null,
                 providers: null, provider_modes: null, autorotate_enabled: null, autorotate_interval_s: null,

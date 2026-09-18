@@ -101,11 +101,14 @@ type ghRelease struct {
 	Assets     []ghAsset `json:"assets"`
 }
 
-// manifestFields is the subset of the canonical OTA manifest the broker
-// inspects for the staging decision. The manifest bytes are
+// ManifestFields is the subset of the canonical OTA manifest the broker
+// inspects for the staging decision. Exported because the MCP tools that
+// hand-stage a manifest (set_device_pending, publish_firmware,
+// revert_firmware) must run it through PredictDeviceGate too — a manifest the
+// device will refuse is worth catching at the operator, not six reboots later. The manifest bytes are
 // signature-verified as-is; this struct only reads fields, never
 // re-encodes (re-encoding could diverge from the signed canonical form).
-type manifestFields struct {
+type ManifestFields struct {
 	KeyID            string `json:"key_id"`
 	MinSecureVersion uint32 `json:"min_secure_version"`
 	SHA256           string `json:"sha256"`
@@ -384,26 +387,30 @@ type DeviceResult struct {
 	Action   string `json:"action"` // staged | would_stage | up_to_date | skipped:<reason> | error:<reason>
 	From     string `json:"from,omitempty"`
 	To       string `json:"to,omitempty"`
+	// Reason explains a skip an operator would otherwise have to guess at —
+	// above all the ones where the device would refuse the manifest silently,
+	// which used to look identical to "the device just never updated".
+	Reason string `json:"reason,omitempty"`
 }
 
 // Report is the structured result of a Check, returned to the MCP tool
 // and logged by the background loop.
 type Report struct {
-	Repo      string         `json:"repo"`
-	Enabled   bool           `json:"enabled"`
-	Configured bool          `json:"configured"`
-	DryRun    bool           `json:"dry_run"`
-	CheckedAt time.Time      `json:"checked_at"`
-	PerSKU    []SKUResult    `json:"per_sku"`
-	Devices   []DeviceResult `json:"devices"`
-	Note      string         `json:"note,omitempty"`
-	Staged    int            `json:"staged"`
+	Repo       string         `json:"repo"`
+	Enabled    bool           `json:"enabled"`
+	Configured bool           `json:"configured"`
+	DryRun     bool           `json:"dry_run"`
+	CheckedAt  time.Time      `json:"checked_at"`
+	PerSKU     []SKUResult    `json:"per_sku"`
+	Devices    []DeviceResult `json:"devices"`
+	Note       string         `json:"note,omitempty"`
+	Staged     int            `json:"staged"`
 }
 
 // resolved bundles a verified index + parsed manifest for a SKU.
 type resolved struct {
 	idx Index
-	mf  manifestFields
+	mf  ManifestFields
 }
 
 // Check runs one pass. dryRun=true reports without writing. skuFilter (if
@@ -565,7 +572,7 @@ func (c *Checker) resolveSKU(ctx context.Context, sku, channel string, devRels [
 		sres.Error = "signature_b64 decode failed or wrong length"
 		return nil, sres
 	}
-	var mf manifestFields
+	var mf ManifestFields
 	if err := json.Unmarshal(man, &mf); err != nil {
 		sres.Error = "manifest is not valid JSON"
 		return nil, sres
@@ -637,12 +644,14 @@ func (c *Checker) decide(dev *registry.Device, r *resolved, dryRun bool) DeviceR
 	// Primary guard: never announce a release that isn't STRICTLY newer than
 	// the version the device is actually running. Active.FirmwareVersion is
 	// the last version we saw the device promote, i.e. what's installed.
-	// MinSecureVersion is only the anti-rollback FLOOR, which a manifest can
-	// (and usually does) set BELOW its own version to leave room for limited
-	// rollback — so comparing the release to the floor alone re-stages a
-	// version the device already runs, and the device just re-downloads and
-	// rejects it as same-version every cycle. That churn is exactly what this
-	// check prevents. Skipped only when we don't yet have a parseable running
+	// MinSecureVersion is only the anti-rollback FLOOR, so comparing the
+	// release to the floor alone re-stages a version the device already runs,
+	// and the device just re-downloads and rejects it as same-version every
+	// cycle. That churn is exactly what this check prevents. (A conformant
+	// manifest sets its floor to packed(version) — the tmtools default. A
+	// manifest that sets it LOWER does not buy a rollback margin, it only
+	// locks out every device whose floor has climbed past that value; see
+	// PredictDeviceGate.) Skipped only when we don't yet have a parseable running
 	// version (fresh device), in which case the floor guard below decides.
 	// Uses CompareSemver (not raw packed base) so dev iteration works: two
 	// "0.6.8-dev.<ts>" builds share a base, and the newer timestamp must still
@@ -656,16 +665,38 @@ func (c *Checker) decide(dev *registry.Device, r *resolved, dryRun bool) DeviceR
 		out.Action = "up_to_date"
 		return out
 	}
-	// Secondary guard (defense in depth): respect the reported anti-rollback
-	// floor. The device refuses only packed(version) STRICTLY BELOW the floor
-	// (tmon_ota.c: `mf_packed < floor`), so mirror that with `<` — NOT `<=`.
-	// A release packing EQUAL to the floor is installable on-device; with `<=`
-	// the broker would wrongly skip a newer same-base dev canary (X.Y.Z-dev.<ts2>
-	// packs to the same base as a matured X.Y.Z floor) that the device accepts.
+	// Secondary guard: the device is AHEAD of this release. Its floor records
+	// a version it has already run, so there is nothing to offer — and unlike
+	// the incompatibilities below, this is a healthy state, not a mistake.
+	// Mirror the device with `<`, NOT `<=`: a release packing EQUAL to the
+	// floor is installable on-device (tmon_ota.c refuses only `mf_packed <
+	// floor`), and skipping on equality would strand every same-base dev
+	// canary — X.Y.Z-dev.<ts2> packs to the same base as a matured X.Y.Z floor.
 	if releasePacked < dev.Active.MinSecureVersion {
 		out.Action = "up_to_date"
 		return out
 	}
+
+	// Tertiary guard: run the DEVICE's own manifest gate before staging.
+	//
+	// Everything past this point is a release the device WANTS — newer than
+	// its floor — that it would nonetheless refuse. That used to go entirely
+	// unchecked, above all `manifest.min_secure_version` against the same
+	// floor, which the device tests FIRST. The device's refusal is silent:
+	// tmon_ota.c clears the pending, poisons nothing and reports nothing, so
+	// the broker re-staged, five times, and then tombstoned a release that was
+	// never broken — burning a device reboot on every arm.
+	//
+	// PredictDeviceGate mirrors ota_gate.c against the shared rows in
+	// compat/ota/gate_manifest.json. Note it sits BEFORE bumpStreak: a
+	// manifest the device will refuse must never advance the install-loop
+	// counter, or a publishing mistake ends up blamed on the firmware.
+	if verdict, why := PredictDeviceGate(r.mf, GateDeviceOf(dev)); verdict != GateOK {
+		out.Action = "skipped:" + string(verdict)
+		out.Reason = why
+		return out
+	}
+
 	// Avoid churning the config version: if a pending already carries this
 	// exact firmware version, leave it.
 	if dev.Pending != nil && dev.Pending.FirmwareVersion == r.mf.Version {

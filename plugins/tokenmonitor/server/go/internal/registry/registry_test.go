@@ -131,13 +131,13 @@ func TestGolden_NoVol(t *testing.T) {
 
 func TestValidDeviceID(t *testing.T) {
 	cases := map[string]bool{
-		"ab12cd34": true,
-		"00000000": true,
-		"AB12CD34": false, // uppercase rejected
-		"ab12cd":   false, // too short
+		"ab12cd34":  true,
+		"00000000":  true,
+		"AB12CD34":  false, // uppercase rejected
+		"ab12cd":    false, // too short
 		"ab12cd345": false,
-		"zzzzzzzz": false,
-		"":         false,
+		"zzzzzzzz":  false,
+		"":          false,
 	}
 	for id, want := range cases {
 		if got := ValidDeviceID(id); got != want {
@@ -412,8 +412,8 @@ func TestReplaceActive_ConvergesAndPreservesMetadata(t *testing.T) {
 	if err := r.SetActiveFirmwareVersion(testID, "1.2.3", nil); err != nil {
 		t.Fatalf("SetActiveFirmwareVersion: %v", err)
 	}
-	if err := r.BumpMinSV(testID, 7); err != nil {
-		t.Fatalf("BumpMinSV: %v", err)
+	if err := r.RecordMinSV(testID, 7); err != nil {
+		t.Fatalf("RecordMinSV: %v", err)
 	}
 
 	dev, err := r.ReplaceActive(testID, ConfigPayload{
@@ -537,7 +537,6 @@ func TestMaybePromote_RequiresPendingPSKAndExactVersion(t *testing.T) {
 	}
 }
 
-
 func TestMaybePromote_ThemeOnlyPromotesWithActivePSK(t *testing.T) {
 	r := newReg(t)
 	if _, err := r.Register(testID, ConfigPayload{
@@ -626,8 +625,70 @@ func TestPSKsFor(t *testing.T) {
 
 func TestTouch_NoOpsForUnknown(t *testing.T) {
 	r := newReg(t)
-	if err := r.Touch(testID); err != nil {
+	if err := r.Touch(testID, "192.168.1.55:41234", "192.168.1.28:8765"); err != nil {
 		t.Errorf("Touch unknown should be nil, got %v", err)
+	}
+}
+
+// The address a device is seen from is what lets publish_firmware choose the
+// one of this host's interfaces that is on the device's network. It has to
+// survive the two paths that rebuild active — a re-provision and a promote —
+// or an OTA staged right after either would go back to guessing.
+func TestTouch_RecordsLastIPAndSurvivesRebuilds(t *testing.T) {
+	r := newReg(t)
+	if _, err := r.Register(testID, ConfigPayload{PSKHex: testPSK, BrokerURL: "u"}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := r.Touch(testID, "192.168.2.44:9000", "192.168.2.28:8765"); err != nil {
+		t.Fatalf("Touch: %v", err)
+	}
+	dev, err := r.Load(testID)
+	if err != nil || dev.Active.LastIP != "192.168.2.44" {
+		t.Fatalf("last_ip = %q err=%v", dev.Active.LastIP, err)
+	}
+	// A dual-stack listener reports IPv4 peers in mapped form.
+	if err := r.Touch(testID, "[::ffff:192.168.2.45]:9000", "[::ffff:192.168.2.28]:8765"); err != nil {
+		t.Fatalf("Touch mapped: %v", err)
+	}
+	dev, _ = r.Load(testID)
+	if dev.Active.LastIP != "192.168.2.45" {
+		t.Fatalf("mapped peer: last_ip = %q", dev.Active.LastIP)
+	}
+	if err := r.Touch(testID, "192.168.2.44:9000", "192.168.2.28:8765"); err != nil {
+		t.Fatalf("Touch: %v", err)
+	}
+
+	// A source we cannot use as an IPv4 literal must not erase what we know:
+	// one request over IPv6 or a proxy should not cost the OTA its hint.
+	// Loopback and unusable peers alike: neither may erase what we know.
+	for _, bad := range []string{"", "[fe80::1]:5000", "not-an-address",
+		"127.0.0.1", "127.0.0.1:8765", "::ffff:127.0.0.1"} {
+		if err := r.Touch(testID, bad, bad); err != nil {
+			t.Fatalf("Touch(%q): %v", bad, err)
+		}
+		dev, _ = r.Load(testID)
+		if dev.Active.LastIP != "192.168.2.44" {
+			t.Fatalf("Touch(%q) clobbered last_ip: %q", bad, dev.Active.LastIP)
+		}
+	}
+
+	if _, err := r.SetPending(testID, ConfigPayload{City: "Madrid"}); err != nil {
+		t.Fatalf("SetPending: %v", err)
+	}
+	if _, err := r.MaybePromote(testID, 2, false); err != nil {
+		t.Fatalf("MaybePromote: %v", err)
+	}
+	dev, _ = r.Load(testID)
+	if dev.Active.LastIP != "192.168.2.44" {
+		t.Errorf("promote lost last_ip: %q", dev.Active.LastIP)
+	}
+
+	if _, err := r.ReplaceActive(testID, ConfigPayload{PSKHex: testPSK, BrokerURL: "u"}); err != nil {
+		t.Fatalf("ReplaceActive: %v", err)
+	}
+	dev, _ = r.Load(testID)
+	if dev.Active.LastIP != "192.168.2.44" {
+		t.Errorf("re-provision lost last_ip: %q", dev.Active.LastIP)
 	}
 }
 
@@ -814,5 +875,123 @@ func TestChannelRoutingVectors(t *testing.T) {
 		if got := CandidateChannels(dev); !reflect.DeepEqual(got, c.Expected) {
 			t.Errorf("CandidateChannels(channel=%q, serial=%q) = %v, want %v", c.Channel, c.Serial, got, c.Expected)
 		}
+	}
+}
+
+// RecordMinSV mirrors what the device reports, in BOTH directions. It was
+// monotonic until the broker started refusing to stage a manifest whose floor
+// sits below the device's: a high-water mark that the device has since moved
+// away from stops being a safety margin and becomes a permanent block on
+// legitimate updates, citing a floor the device does not have. Monotonicity
+// still applies where it is a safety property — mergePayload, i.e. a floor
+// PUSHED at the device, which must never go down.
+func TestRecordMinSVFollowsTheDevice(t *testing.T) {
+	r, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := r.Register(testID, ConfigPayload{PSKHex: testPSK, BrokerURL: "http://b"}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	if err := r.RecordMinSV(testID, 16777216); err != nil { // packed(1.0.0)
+		t.Fatalf("RecordMinSV: %v", err)
+	}
+	dev, err := r.Load(testID)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if dev.Active.MinSecureVersion != 16777216 {
+		t.Fatalf("floor not recorded: %d", dev.Active.MinSecureVersion)
+	}
+
+	// The device is re-flashed and its NVS cleared, so it now reports a lower
+	// floor. The registry must believe it — otherwise every subsequent release
+	// is refused against a floor that no longer exists anywhere.
+	if err := r.RecordMinSV(testID, 655360); err != nil { // packed(0.10.0)
+		t.Fatalf("RecordMinSV (lower): %v", err)
+	}
+	dev, err = r.Load(testID)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if dev.Active.MinSecureVersion != 655360 {
+		t.Fatalf("floor did not follow the device down: %d, want 655360",
+			dev.Active.MinSecureVersion)
+	}
+
+	// A PUSHED floor is a different thing and stays monotonic.
+	merged := mergePayload(ConfigPayload{MinSecureVersion: 655360},
+		ConfigPayload{MinSecureVersion: 7})
+	if merged.MinSecureVersion != 655360 {
+		t.Fatalf("a pushed config lowered the floor to %d", merged.MinSecureVersion)
+	}
+}
+
+// The address the device DIALLED is the one thing that identifies the origin
+// its OTA download will authenticate against: the firmware compares a
+// firmware_url's origin with its NVS svc_url by exact strcmp and drops the HMAC
+// headers on any mismatch, so /firmware/ 401s. Like last_ip it has to survive
+// a promote and a re-provision, or the very next publish goes back to guessing
+// among this host's interfaces.
+func TestTouch_RecordsTheAddressTheDeviceDialled(t *testing.T) {
+	r := newReg(t)
+	if _, err := r.Register(testID, ConfigPayload{PSKHex: testPSK, BrokerURL: "u"}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := r.Touch(testID, "192.168.2.44:9000", "192.168.2.28:8765"); err != nil {
+		t.Fatalf("Touch: %v", err)
+	}
+	dev, err := r.Load(testID)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if dev.Active.LastLocalAddr != "192.168.2.28:8765" {
+		t.Fatalf("last_local_addr = %q", dev.Active.LastLocalAddr)
+	}
+
+	// A dual-stack listener reports its own address in mapped form. It must
+	// normalise to the same bytes a broker bound to 0.0.0.0 records, because
+	// the device's comparison is a string compare.
+	if err := r.Touch(testID, "192.168.2.44:9000", "[::ffff:192.168.2.28]:8765"); err != nil {
+		t.Fatalf("Touch mapped: %v", err)
+	}
+	dev, _ = r.Load(testID)
+	if dev.Active.LastLocalAddr != "192.168.2.28:8765" {
+		t.Fatalf("mapped local: last_local_addr = %q", dev.Active.LastLocalAddr)
+	}
+
+	// Nothing usable must erase it. Loopback is deliberately in this list: it
+	// is a real local address when broker and device share a host, but it is
+	// never what a device on the LAN dialled, and recording it would hand out
+	// a firmware_url pointing at the device itself.
+	for _, bad := range []string{"", "no-port", "[fe80::1]:8765", "127.0.0.1:8765",
+		"0.0.0.0:8765", "192.168.2.28"} {
+		if err := r.Touch(testID, "192.168.2.44:9000", bad); err != nil {
+			t.Fatalf("Touch(local=%q): %v", bad, err)
+		}
+		dev, _ = r.Load(testID)
+		if dev.Active.LastLocalAddr != "192.168.2.28:8765" {
+			t.Fatalf("Touch(local=%q) clobbered it: %q", bad, dev.Active.LastLocalAddr)
+		}
+	}
+
+	if _, err := r.SetPending(testID, ConfigPayload{City: "Madrid"}); err != nil {
+		t.Fatalf("SetPending: %v", err)
+	}
+	if _, err := r.MaybePromote(testID, 2, false); err != nil {
+		t.Fatalf("MaybePromote: %v", err)
+	}
+	dev, _ = r.Load(testID)
+	if dev.Active.LastLocalAddr != "192.168.2.28:8765" {
+		t.Fatalf("promote lost last_local_addr: %q", dev.Active.LastLocalAddr)
+	}
+
+	if _, err := r.ReplaceActive(testID, ConfigPayload{PSKHex: testPSK, BrokerURL: "u"}); err != nil {
+		t.Fatalf("ReplaceActive: %v", err)
+	}
+	dev, _ = r.Load(testID)
+	if dev.Active.LastLocalAddr != "192.168.2.28:8765" {
+		t.Fatalf("re-provision lost last_local_addr: %q", dev.Active.LastLocalAddr)
 	}
 }

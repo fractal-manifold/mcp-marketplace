@@ -31,7 +31,7 @@ function makeReq(method, url, headers = {}) {
   req.method = method;
   req.url = url;
   req.headers = Object.assign({ host: "localhost" }, headers);
-  req.socket = { remoteAddress: "127.0.0.1" };
+  req.socket = { remoteAddress: "127.0.0.1", localAddress: "127.0.0.1", localPort: 8765 };
   return req;
 }
 

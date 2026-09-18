@@ -2,9 +2,11 @@ package ota
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -138,6 +140,9 @@ func TestSemverVectors(t *testing.T) {
 type compatVectors struct {
 	TestKeypair struct {
 		PubHex string `json:"pub_hex"`
+		// SeedHex lets a test SIGN a manifest of its own shape, not just
+		// verify the frozen ones — see signedManifest.
+		SeedHex string `json:"seed_hex"`
 	} `json:"test_keypair"`
 	Manifests []struct {
 		Name            string `json:"name"`
@@ -235,6 +240,55 @@ func TestVerifyManifestVectors(t *testing.T) {
 	}
 }
 
+// signedManifest builds a canonical manifest and signs it with the shared test
+// seed, so a test can pin a decision against a manifest shaped the way it
+// needs. The static vectors in compat/ed25519/vectors.json are byte-frozen
+// signature fixtures — ota-S1-v0.5.1 carries min_secure_version 7, which is
+// nowhere near packed(0.5.1) — so they cannot express "a device at floor F is
+// offered a CONFORMANT release", which is what the anti-rollback decisions
+// actually turn on.
+//
+// Key order is lexicographic and there is no whitespace: the firmware's parser
+// is byte-exact, so anything else would not be a manifest.
+func signedManifest(t *testing.T, keyID, sku, version, channel string, minSV uint32) (canonical, sigB64 string) {
+	t.Helper()
+	v := loadVectors(t)
+	seed, err := hex.DecodeString(v.TestKeypair.SeedHex)
+	if err != nil {
+		t.Fatalf("decode seed_hex: %v", err)
+	}
+	priv := ed25519.NewKeyFromSeed(seed)
+
+	chanField := ""
+	if channel != "" {
+		chanField = fmt.Sprintf("{\"channel\":%q,", channel)
+	} else {
+		chanField = "{"
+	}
+	canonical = fmt.Sprintf(
+		chanField+"\"key_id\":%q,\"min_secure_version\":%d,\"sha256\":%q,"+
+			"\"size\":%d,\"sku\":%q,\"version\":%q}",
+		keyID, minSV, strings.Repeat("a", 64), 2048, sku, version)
+	return canonical, base64.StdEncoding.EncodeToString(ed25519.Sign(priv, []byte(canonical)))
+}
+
+// conformantIndex is signedManifest wrapped in a release index, with the floor
+// the tmtools default would pick: packed(version).
+func conformantIndex(t *testing.T, keyID, sku, version, channel string) Index {
+	t.Helper()
+	packed, ok := PackSemver(version)
+	if !ok {
+		t.Fatalf("version %q does not pack", version)
+	}
+	canonical, sigB64 := signedManifest(t, keyID, sku, version, channel, packed)
+	return Index{
+		Version:      version,
+		ManifestB64:  base64.StdEncoding.EncodeToString([]byte(canonical)),
+		SignatureB64: sigB64,
+		BinURL:       "https://downloads.example/tmon-" + sku + "-" + version + ".bin",
+	}
+}
+
 // s1Vector returns the S1 manifest vector (key_id ed25519-2026-q2,
 // version 0.5.1) used to build a mock release index.
 func s1Vector(t *testing.T, v compatVectors) (canonical, sigB64 string) {
@@ -309,8 +363,8 @@ func newRegistryWithDevice(t *testing.T, deviceID, sku string, minSV uint32) *re
 		t.Fatalf("SetSerial: %v", err)
 	}
 	if minSV > 0 {
-		if err := reg.BumpMinSV(deviceID, minSV); err != nil {
-			t.Fatalf("BumpMinSV: %v", err)
+		if err := reg.RecordMinSV(deviceID, minSV); err != nil {
+			t.Fatalf("RecordMinSV: %v", err)
 		}
 	}
 	return reg
@@ -420,13 +474,11 @@ func TestCheckUpToDate(t *testing.T) {
 // stage. Here we use a fresh device (no running version) at floor==release.
 func TestCheckStagesWhenReleaseAtFloor(t *testing.T) {
 	v := loadVectors(t)
-	canonical, sigB64 := s1Vector(t, v)
-	idx := Index{
-		Version:      "0.5.1",
-		ManifestB64:  base64.StdEncoding.EncodeToString([]byte(canonical)),
-		SignatureB64: sigB64,
-		BinURL:       "https://downloads.example/tmon-S1-0.5.1.bin",
-	}
+	// A CONFORMANT manifest — min_secure_version == packed(version), the
+	// tmtools default. The frozen ota-S1-v0.5.1 vector declares 7, which the
+	// device would refuse outright at this floor, so it cannot express the
+	// boundary this test is about.
+	idx := conformantIndex(t, "ed25519-2026-q2", "S1", "0.5.1", "")
 	srv := mockReleases(t, map[string]Index{"S1": idx})
 	defer srv.Close()
 

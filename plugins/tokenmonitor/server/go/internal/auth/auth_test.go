@@ -489,3 +489,57 @@ func findCompatVectors(t *testing.T) string {
 // the verifier safely — exercise that strings.ToLower on the sig header
 // doesn't crash for short inputs.
 var _ = strings.ToLower
+
+// Loads response_vectors from compat/vectors/hmac.json — the RESPONSE
+// direction, which is what lets the device authenticate the broker before
+// adopting an address it found by mDNS. Same file the Python, JS and firmware
+// suites read, so all four are pinned to identical bytes.
+func TestComputeResponseSignature_CompatVectors(t *testing.T) {
+	path := findCompatVectors(t)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var doc struct {
+		ResponseVectors []struct {
+			Name        string `json:"name"`
+			PSKUTF8     string `json:"psk_utf8"`
+			Device      string `json:"device"`
+			Nonce       string `json:"nonce"`
+			Host        string `json:"host"`
+			Path        string `json:"path"`
+			Status      int    `json:"status"`
+			BodyUTF8    string `json:"body_utf8"`
+			BodySHA256  string `json:"body_sha256"`
+			ExpectedHex string `json:"expected_hex"`
+		} `json:"response_vectors"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parse hmac.json: %v", err)
+	}
+	if len(doc.ResponseVectors) == 0 {
+		t.Fatal("response_vectors empty")
+	}
+	for _, v := range doc.ResponseVectors {
+		if got := BodySHA256Hex([]byte(v.BodyUTF8)); got != v.BodySHA256 {
+			t.Errorf("%s: body_sha256 = %s, want %s", v.Name, got, v.BodySHA256)
+			continue
+		}
+		got := ComputeResponseSignature([]byte(v.PSKUTF8), v.Device, v.Nonce, v.Host, v.Path, v.Status, v.BodySHA256)
+		if got != v.ExpectedHex {
+			t.Errorf("%s: signature = %s, want %s", v.Name, got, v.ExpectedHex)
+		}
+	}
+}
+
+// Domain separation: a response tag must never collide with a request tag,
+// however the fields line up. The literal "tmon-resp-v1" prefix is what
+// guarantees it — a request canonical always opens with an HTTP method.
+func TestResponseSignature_DoesNotCollideWithRequestForm(t *testing.T) {
+	psk := []byte("active-32-bytes-of-secret-mat!!!")
+	req := ComputeSignature(psk, "GET", "/credentials", "100", "abc", "ab12cd34", "1")
+	resp := ComputeResponseSignature(psk, "ab12cd34", "abc", "h:1", "/credentials", 100, "1")
+	if req == resp {
+		t.Fatal("request and response canonical forms collided")
+	}
+}

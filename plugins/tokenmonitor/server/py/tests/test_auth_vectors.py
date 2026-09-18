@@ -338,3 +338,72 @@ def test_tampered_device_header_rejected():
             "99887766", "", cache, 60, now,
         )
     assert "signature" in str(exc.value)
+
+
+# --- response direction (v1) -----------------------------------------------
+
+
+def test_response_vectors_match_byte_for_byte():
+    """The broker's half of the pairing proof.
+
+    A device that located this broker by mDNS adopts the address only when
+    this tag verifies. One byte of disagreement with the Go reference means
+    every device on the LAN refuses every broker it finds — a failure that,
+    from the device, is indistinguishable from an empty network.
+    """
+    data = _load_vectors()
+    vecs = data.get("response_vectors")
+    assert vecs, "compat response_vectors empty"
+    for v in vecs:
+        psk = v["psk_utf8"].encode()
+        body = v["body_utf8"].encode()
+        assert auth.body_sha256_hex(body) == v["body_sha256"], v["name"]
+        got = auth.compute_response_signature(
+            psk, v["device"], v["nonce"], v["host"], v["path"], v["status"],
+            v["body_sha256"],
+        )
+        assert got == v["expected_hex"], f"{v['name']}: {got} != {v['expected_hex']}"
+
+
+def test_response_signature_does_not_collide_with_a_request_signature():
+    """The "tmon-resp-v1" prefix is the domain separation. Without it, a
+    response tag and a request signature over similar fields could be lifted
+    from one slot into the other."""
+    psk = b"k" * 32
+    resp = auth.compute_response_signature(
+        psk, "ab12cd34", "0" * 32, "10.0.0.1:8765", "/credentials", 200,
+        auth.body_sha256_hex(b""),
+    )
+    req = auth.compute_signature(psk, "GET", "/credentials", "1700000000", "0" * 32,
+                                 "ab12cd34", "1")
+    assert resp != req
+
+
+def test_response_signature_lowercases_the_nonce():
+    psk = b"k" * 32
+    lower = auth.compute_response_signature(psk, "d", "abcdef", "h:1", "/p", 200, "0" * 64)
+    upper = auth.compute_response_signature(psk, "d", "ABCDEF", "h:1", "/p", 200, "0" * 64)
+    assert lower == upper
+
+
+def test_response_signature_binds_the_status():
+    """Anti-splicing: a 200 tag must not validate a 503 carrying the same body."""
+    psk = b"k" * 32
+    ok = auth.compute_response_signature(psk, "d", "n", "h:1", "/p", 200, "0" * 64)
+    unavailable = auth.compute_response_signature(psk, "d", "n", "h:1", "/p", 503, "0" * 64)
+    assert ok != unavailable
+
+
+def test_response_signature_binds_the_address_that_answered():
+    """The anti-relay property. An impostor that advertises itself on the LAN
+    can forward our request to the real broker and hand back the real broker's
+    tag; the only thing that stops the device adopting the relay is that the
+    tag names the address the BROKER answered on, which the device compares
+    against the address it dialled."""
+    psk = b"k" * 32
+    real = auth.compute_response_signature(psk, "d", "n", "192.168.1.28:8765", "/p", 200, "0" * 64)
+    relay = auth.compute_response_signature(psk, "d", "n", "192.168.1.99:8765", "/p", 200, "0" * 64)
+    assert real != relay
+    # The port is part of it too: two brokers on one host are distinct peers.
+    other_port = auth.compute_response_signature(psk, "d", "n", "192.168.1.28:9999", "/p", 200, "0" * 64)
+    assert real != other_port

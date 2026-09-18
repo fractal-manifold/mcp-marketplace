@@ -7,7 +7,6 @@ import asyncio
 import json
 import logging
 import signal
-import socket
 import sys
 import time
 from contextlib import suppress
@@ -18,10 +17,11 @@ from . import RUNTIME, __version__
 from . import auth, creds
 from . import ota
 from . import spend
+from . import session_life
 from . import usage
 from .broker.server import make_app
 from .config import devices_path, load, unusable_config
-from .leader import try_bind, run as leader_run
+from .leader import try_bind
 from .logbuf import Buffer, LogbufHandler
 from .mcp.server import Deps as McpDeps, serve as mcp_serve
 from .mdns import Publisher as MdnsPublisher
@@ -93,9 +93,21 @@ def _run_status(cfg) -> int:
     return 0
 
 
-async def _run_daemon(cfg, logs: Buffer, logger: logging.Logger) -> int:
+async def _run_daemon(cfg, logs: Buffer, logger: logging.Logger, persistent: bool = False) -> int:
+    lock = session_life.acquire_daemon_lock()
+    if not lock.acquired:
+        logger.info("daemon singleton: another broker daemon is already running")
+        return 0
+    try:
+        return await _serve_daemon(cfg, logs, logger, persistent)
+    finally:
+        lock.close()
+
+
+async def _serve_daemon(cfg, logs: Buffer, logger: logging.Logger, persistent: bool) -> int:
     state = State()
     state.set_role(Role.LEADER)
+    state.enable_shared()
     cache = auth.NonceCache(cfg.security.nonce_cache_ttl_seconds)
     registry = _open_registry(logger)
     tailer: Tailer | None = None
@@ -153,9 +165,15 @@ async def _run_daemon(cfg, logs: Buffer, logger: logging.Logger) -> int:
     for sig in (signal.SIGTERM, signal.SIGINT):
         with suppress(NotImplementedError):
             loop.add_signal_handler(sig, shutdown.set)
+    session_task = None
+    if not persistent:
+        session_task = asyncio.create_task(session_life.monitor_sessions(shutdown, logger))
     try:
         await shutdown.wait()
     finally:
+        shutdown.set()
+        if session_task is not None:
+            await session_task
         ota_stop.set()
         await ota_task
         await update_task
@@ -168,7 +186,10 @@ async def _run_daemon(cfg, logs: Buffer, logger: logging.Logger) -> int:
     return 0
 
 
-async def _run_mcp(cfg, logs: Buffer, logger: logging.Logger, cfg_err: Exception | None = None) -> int:
+async def _run_mcp(
+    cfg, logs: Buffer, logger: logging.Logger,
+    cfg_err: Exception | None = None, config_path: str = "",
+) -> int:
     if cfg_err is not None:
         # Degraded start: tools up so the user can be told what is wrong, but
         # no broker. The config we are holding is invented (unusable_config),
@@ -180,6 +201,14 @@ async def _run_mcp(cfg, logs: Buffer, logger: logging.Logger, cfg_err: Exception
             "config: starting degraded — MCP tools only, broker NOT started. "
             "Fix the config and restart; run tokenmonitor_health for details."
         )
+        # Do not spawn a daemon with invented credentials, but keep a daemon
+        # owned by another healthy adapter alive while this CLI/UI session is
+        # connected.
+        lease = None
+        try:
+            lease = session_life.SessionLease()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("sessions: %s", exc)
         deps = McpDeps(
             cfg=cfg,
             state=State(),
@@ -188,64 +217,26 @@ async def _run_mcp(cfg, logs: Buffer, logger: logging.Logger, cfg_err: Exception
             version=__version__,
             config_err=cfg_err,
         )
-        await mcp_serve(deps)
+        try:
+            await mcp_serve(deps)
+        finally:
+            if lease is not None:
+                lease.close()
         return 0
 
     state = State()
-    cache = auth.NonceCache(cfg.security.nonce_cache_ttl_seconds)
-    fw_buf = Buffer(cfg.serial.lines or 2000)
-    tailer: Tailer | None = None
-
-    def fw_logs(limit: int) -> dict:
-        return {"connected": tailer.connected() if tailer else False, "total_available": len(fw_buf), "lines": fw_buf.tail(limit)}
-
+    state.set_role(Role.FOLLOWER)
     stop = asyncio.Event()
 
-    async def on_leader(sock: socket.socket) -> None:
-        nonlocal tailer
-        registry = _open_registry(logger)
-        if cfg.serial.device:
-            tailer = Tailer(cfg.serial.device, fw_buf, baud=cfg.serial.baud)
-            tailer.start()
-        # Serial-lease table: followers ask this leader (the sole tailer owner)
-        # to yield the USB port for a provisioning session.
-        from .usbprov import LeaseManager, NopController
-        lease = LeaseManager(tailer if tailer is not None else NopController(), 0)
-        usage_cache = usage.build_cache(cfg)
-        spend_cache = spend.build_cache(cfg, logger)
-        app = make_app(cfg, cache, state, fw_logs, registry, usage_cache, spend_cache, lease)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.SockSite(runner, sock)
-        await site.start()
-        mdns_pub: MdnsPublisher | None = None
-        if registry is not None:
-            try:
-                mdns_pub = await MdnsPublisher.start(
-                    cfg.server.bind, cfg.server.port, registry,
-                    state.last_request_at_epoch)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("mdns: %s (broker discovery disabled)", e)
-        # Pull-OTA poller, scoped to leadership: it shares the same `stop`
-        # event, so losing the bind tears it down alongside mDNS/the tailer.
-        ota_task = asyncio.create_task(ota.run(cfg, registry, stop))
-        # Custom-panel generators, scoped to leadership: torn down (SIGTERM →
-        # SIGKILL) when this peer loses the bound port.
-        panel_gen = PanelGenerator(cfg, registry, logger)
-        panel_gen.start()
-        try:
-            await stop.wait()
-        finally:
-            await ota_task
-            await panel_gen.stop()
-            if mdns_pub is not None:
-                await mdns_pub.close()
-            if tailer:
-                tailer.stop()
-                tailer = None
-            await runner.cleanup()
-
-    broker_task = asyncio.create_task(leader_run(cfg.server.bind, cfg.server.port, state, on_leader, stop))
+    lease = None
+    daemon_task = None
+    try:
+        lease = session_life.SessionLease()
+        daemon_task = asyncio.create_task(
+            session_life.supervise_daemon(stop, config_path, logger)
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("sessions: %s", exc)
 
     # Broker self-version check runs once at startup, NOT leader-scoped (mirror
     # of Go main.go): both the MCP tools and any /sync we later serve as leader
@@ -257,8 +248,11 @@ async def _run_mcp(cfg, logs: Buffer, logger: logging.Logger, cfg_err: Exception
         await mcp_serve(deps)
     finally:
         stop.set()
-        await broker_task
         await update_task
+        if daemon_task is not None:
+            await daemon_task
+        if lease is not None:
+            lease.close()
     return 0
 
 
@@ -266,6 +260,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="tokenmonitor-mcp-py", add_help=True)
     parser.add_argument("--config", default="", help="Path to tokenmonitor.toml (default: ~/.config/tokenmonitor/tokenmonitor.toml)")
     parser.add_argument("--daemon", action="store_true")
+    parser.add_argument("--persistent-daemon", action="store_true")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--logs", action="store_true")
@@ -299,7 +294,7 @@ def main() -> int:
         # response: the client never sees `initialize`, drops the server from
         # the session, and the user is told nothing. Start degraded instead —
         # tools up, broker down (see _run_mcp).
-        if args.once or args.status or args.daemon:
+        if args.once or args.status or args.daemon or args.persistent_daemon:
             print(f"config: {e}", file=sys.stderr)
             return 2
         cfg_err = e
@@ -322,9 +317,9 @@ def main() -> int:
         return _run_once(cfg)
     if args.status:
         return _run_status(cfg)
-    if args.daemon:
-        return asyncio.run(_run_daemon(cfg, logs, logger))
-    return asyncio.run(_run_mcp(cfg, logs, logger, cfg_err))
+    if args.daemon or args.persistent_daemon:
+        return asyncio.run(_run_daemon(cfg, logs, logger, args.persistent_daemon))
+    return asyncio.run(_run_mcp(cfg, logs, logger, cfg_err, args.config))
 
 
 if __name__ == "__main__":

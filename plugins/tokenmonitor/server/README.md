@@ -27,6 +27,17 @@ with `runtime=` in `~/.config/tokenmonitor/launcher.conf`). Dependencies
 — including native ones (serialport, fs-ext, cryptography) — are resolved on
 first run into `~/.cache/tokenmonitor/<version>/`, not committed here.
 
+## Broker process lifecycle
+
+The selected runtime remains a per-client MCP stdio adapter, but broker work is
+performed by one detached daemon shared by every Codex, Claude Code and Agy
+CLI/UI session. Each adapter creates a cross-runtime lease and renews it every
+five seconds. A global mkdir lock admits one daemon only; stale leases are
+reaped after 30 seconds, and the daemon exits after ten seconds with no leases.
+While a session remains, its adapter also restarts a crashed daemon. Use
+`--persistent-daemon` only for an intentionally always-on service; ordinary
+`--daemon` follows the session-owned shutdown contract.
+
 **Prebuilt-first Go path.** When the Go runtime is selected the launcher, by
 default, **prefers** a prebuilt, statically-linked Go binary for the host
 (`linux|darwin|windows` × `amd64|arm64`) from the broker GitHub release

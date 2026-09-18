@@ -28,6 +28,106 @@ function writeJSON(res, status, body) {
 }
 function writeError(res, status, msg) { writeJSON(res, status, { error: msg }); }
 
+// --- response signature (the broker's half of the pairing proof) ------------
+//
+// The device now finds this broker by mDNS rather than by a configured
+// address, so it needs a way to tell us apart from anything else on the LAN
+// advertising the same (public) device_id. Every per-device-authenticated
+// response carries an HMAC over the request's own nonce, the path, the status
+// and the body, keyed with the device's PSK. Mirrors armResponseSignature /
+// statusRecorder.finish in the Go broker; see compat/HMAC_CANONICAL.md.
+//
+// Deliberately NOT emitted on: pre-auth errors (we have no PSK to sign with,
+// and must not turn an unauthenticated probe into an oracle), the legacy
+// global-PSK path (there is no per-device pairing to prove), and /firmware/
+// (a ranged, streamed multi-megabyte download — the OTA image carries its own
+// Ed25519 signature).
+
+function chunkToBuffer(chunk, encoding) {
+  if (chunk == null) return null;
+  if (Buffer.isBuffer(chunk)) return chunk;
+  return Buffer.from(String(chunk), typeof encoding === "string" ? encoding : "utf8");
+}
+
+// Buffer everything the handler writes from here on, so the tag can cover the
+// body, and flush it with the signature attached. Must be called BEFORE the
+// first write — after auth succeeded and with the PSK that actually satisfied
+// it (during a rotation that is the pending one; the device holds it too, or
+// its request would not have verified).
+//
+// Node sends the header block on the first write, and writeHead() materialises
+// it eagerly, so both are intercepted: setHeader() after either would throw
+// ERR_HTTP_HEADERS_SENT and take down the response.
+function armResponseSignature(res, psk, req, path) {
+  if (!psk || psk.length === 0) return;
+  if (res.__tmonRespSigArmed || res.headersSent) return;
+
+  const host = auth.responseSigHost(req);
+  if (!host) {
+    // No local address to bind to. Signing an empty host would make every
+    // address canonicalise alike and switch the relay binding off, so emit no
+    // tag at all: the device reads a missing tag as "an older broker", which
+    // is survivable, where a forgeable one is not.
+    return;
+  }
+  res.__tmonRespSigArmed = true;
+
+  const device = req.headers["x-tmon-device"] || "";
+  const nonce = req.headers["x-tmon-nonce"] || "";
+  const chunks = [];
+  // writeHead() and write() are optional: the handlers armed here answer in a
+  // single end(), and the test fakes only implement what they need.
+  const origWriteHead = typeof res.writeHead === "function" ? res.writeHead.bind(res) : null;
+  const origWrite = typeof res.write === "function" ? res.write.bind(res) : null;
+  const origEnd = res.end.bind(res);
+  let deferred = null;   // { status, headers } captured from writeHead
+
+  if (origWriteHead) {
+    res.writeHead = (status, reasonOrHeaders, maybeHeaders) => {
+      const headers = typeof reasonOrHeaders === "string" ? maybeHeaders : reasonOrHeaders;
+      deferred = { status, headers };
+      res.statusCode = status;
+      return res;
+    };
+  }
+
+  res.write = (chunk, encoding, cb) => {
+    const buf = chunkToBuffer(chunk, encoding);
+    if (buf) chunks.push(buf);
+    if (typeof encoding === "function") encoding();
+    else if (typeof cb === "function") cb();
+    return true;
+  };
+
+  res.end = (chunk, encoding, cb) => {
+    if (typeof chunk === "function") { cb = chunk; chunk = null; encoding = null; }
+    else if (typeof encoding === "function") { cb = encoding; encoding = null; }
+    const buf = chunkToBuffer(chunk, encoding);
+    if (buf) chunks.push(buf);
+    const body = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
+
+    if (origWriteHead) res.writeHead = origWriteHead;
+    if (origWrite) res.write = origWrite; else delete res.write;
+    res.end = origEnd;
+
+    const sig = auth.computeResponseSignature(
+      psk, device, nonce, host, path, res.statusCode, auth.bodySha256Hex(body),
+    );
+    // setHeader first, then replay any deferred writeHead: Node merges headers
+    // set either way, so this keeps one code path for both.
+    res.setHeader(auth.RESPONSE_SIG_HEADER, sig);
+    if (deferred) origWriteHead(deferred.status, deferred.headers);
+    return body.length > 0 ? origEnd(body, cb) : origEnd(cb);
+  };
+}
+
+// psks[i] when that index exists. verifyMulti's pskIndex always points at a
+// real entry on success; the bounds check is so a future caller passing a
+// shorter array degrades to "do not sign" rather than throwing mid-response.
+function pskAt(psks, i) {
+  return i >= 0 && i < psks.length ? psks[i] : null;
+}
+
 function parseUint32(s) {
   if (!s) return 0;
   const n = Number.parseInt(s, 10);
@@ -165,7 +265,21 @@ async function handleFirmware({ cfg, cache, registry, logger, name }, req, res) 
       cfg.security.max_timestamp_skew_seconds,
     );
   } catch (e) {
-    logger.info(`auth rejected /firmware/${name}: ${e.message}`);
+    if (!(req.headers["x-tmon-signature"] || "")) {
+      // No signature at all is not a bad key — it is the device deliberately
+      // withholding the headers because this URL's origin is not the one it
+      // proved as its broker (tmon_ota.c compares the firmware_url origin
+      // against NVS svc_url with strcmp). Naming it separately matters because
+      // the two failures need opposite fixes, and this one poisons the version
+      // on-device after three tries.
+      logger.info(`auth rejected /firmware/${name}: unsigned request — the device ` +
+        `withholds HMAC headers when the firmware_url origin differs from the ` +
+        `broker address it proved; we answered on ${auth.responseSigHost(req)}. ` +
+        `Re-stage with a firmware_url on that origin (publish_firmware picks it ` +
+        `automatically once the device has polled /sync)`);
+    } else {
+      logger.info(`auth rejected /firmware/${name}: ${e.message}`);
+    }
     return writeError(res, 401, "unauthorized");
   }
 
@@ -256,7 +370,10 @@ function verifyForPath({ cfg, cache, registry, logger }, req, res, path, recordS
     } catch (e) { logger.info(`auth rejected ${path} device=${deviceID}: ${e.message}`); recordStatus.s = 401; writeError(res, 401, "unauthorized"); return false; }
     const obs = parseUint32(req.headers["x-tmon-config-version"] || "");
     try { registry.maybePromote(deviceID, obs, res2.pskIndex === 1); } catch (e) { logger.warn(`promote ${deviceID}: ${e.message}`); }
-    try { registry.touch(deviceID); } catch (e) { logger.warn(`touch ${deviceID}: ${e.message}`); }
+    try { registry.touch(deviceID, req.socket?.remoteAddress || "", auth.responseSigHost(req)); } catch (e) { logger.warn(`touch ${deviceID}: ${e.message}`); }
+    // Prove to the device that we hold its PSK — with the same key that just
+    // satisfied its request, so a rotation signs with the pending one.
+    armResponseSignature(res, pskAt([active, pending], res2.pskIndex), req, path);
     return true;
   }
   try {
@@ -398,7 +515,8 @@ function handleCredentials({ cfg, cache, state, registry, logger }, req, res) {
         const obs = parseUint32(req.headers["x-tmon-config-version"] || "");
         try { registry.maybePromote(deviceID, obs, res2.pskIndex === 1); } catch (e) { logger.warn(`promote ${deviceID}: ${e.message}`); }
       }
-      try { registry.touch(deviceID); } catch (e) { logger.warn(`touch ${deviceID}: ${e.message}`); }
+      try { registry.touch(deviceID, req.socket?.remoteAddress || "", auth.responseSigHost(req)); } catch (e) { logger.warn(`touch ${deviceID}: ${e.message}`); }
+      armResponseSignature(res, pskAt([active, pending], res2.pskIndex), req, "/credentials");
     } else {
       try {
         auth.verify(
@@ -513,8 +631,9 @@ function handleDevicePanel({ cfg, cache, state, registry, logger, deviceID }, re
     logger.warn(`registry lookup ${deviceID}: ${e.message}`); return finishErr(500, "registry error");
   }
   const signedPath = `/device/${deviceID}/panel`;
+  let res2;
   try {
-    auth.verifyMulti(
+    res2 = auth.verifyMulti(
       [active, pending],
       "GET", signedPath,
       req.headers["x-tmon-timestamp"], req.headers["x-tmon-nonce"], req.headers["x-tmon-signature"],
@@ -522,6 +641,7 @@ function handleDevicePanel({ cfg, cache, state, registry, logger, deviceID }, re
       cache, cfg.security.max_timestamp_skew_seconds,
     );
   } catch (e) { logger.info(`auth rejected ${signedPath}: ${e.message}`); return finishErr(401, "unauthorized"); }
+  armResponseSignature(res, pskAt([active, pending], res2.pskIndex), req, signedPath);
 
   const path = resolvePanelPath(cfg, deviceID);
   if (!path) return finishErr(404, "panel not configured");
@@ -561,6 +681,7 @@ function handleDeviceSync({ cfg, cache, state, registry, logger, deviceID }, req
       cache, cfg.security.max_timestamp_skew_seconds,
     );
   } catch (e) { logger.info(`auth rejected ${signedPath}: ${e.message}`); return finishErr(401, "unauthorized"); }
+  armResponseSignature(res, pskAt([active, pending], res2.pskIndex), req, signedPath);
 
   // Everything past the HMAC check runs under a try/catch: registry.load can
   // race a concurrent device delete (NotFound), hit corrupt TOML, or a bad PSK
@@ -570,7 +691,7 @@ function handleDeviceSync({ cfg, cache, state, registry, logger, deviceID }, req
   try {
     const observed = parseUint32(req.headers["x-tmon-config-version"] || "");
     try { registry.maybePromote(deviceID, observed, res2.pskIndex === 1); } catch (e) { logger.warn(`promote: ${e.message}`); }
-    try { registry.touch(deviceID); } catch (e) { logger.warn(`touch: ${e.message}`); }
+    try { registry.touch(deviceID, req.socket?.remoteAddress || "", auth.responseSigHost(req)); } catch (e) { logger.warn(`touch: ${e.message}`); }
     // Schema v2: capture factory identity from headers. Not bound to
     // HMAC — metadata only; the Ed25519 manifest enforces SKU.
     const serialHdr = String(req.headers["x-tmon-serial"] || "");
@@ -578,14 +699,15 @@ function handleDeviceSync({ cfg, cache, state, registry, logger, deviceID }, req
       try { registry.setSerial(deviceID, serialHdr, String(req.headers["x-tmon-sku"] || "")); }
       catch (e) { logger.warn(`set-serial: ${e.message}`); }
     }
-    // Mirror anti-rollback floor. bumpMinSV is monotonic, so a spoofed-high
-    // value only locks the device into rejecting downgrades.
+    // Mirror the device's anti-rollback floor, following it in both directions
+    // — see recordMinSV for why this is observed state rather than a high-water
+    // mark now that staging decisions depend on it.
     const minSvHdr = String(req.headers["x-tmon-min-sv"] || "");
     if (minSvHdr) {
       const sv = Number.parseInt(minSvHdr, 10);
       if (Number.isFinite(sv) && sv >= 0 && sv <= 0xFFFFFFFF) {
-        try { registry.bumpMinSV(deviceID, sv); }
-        catch (e) { logger.warn(`bump-min-sv: ${e.message}`); }
+        try { registry.recordMinSV(deviceID, sv); }
+        catch (e) { logger.warn(`record-min-sv: ${e.message}`); }
       }
     }
     // Persist the device's actually-running firmware version (unsigned
@@ -722,8 +844,9 @@ function handleDeviceLogs({ cfg, cache, state, registry, logger, deviceID }, req
     const raw = Buffer.concat(chunks);
     // Body-aware auth AFTER the size-bounded body is assembled: the v3
     // canonical covers sha256(body), so the signature can't be checked sooner.
+    let res2;
     try {
-      auth.verifyMultiBody(
+      res2 = auth.verifyMultiBody(
         [active, pending],
         "POST", signedPath,
         req.headers["x-tmon-timestamp"] || "", req.headers["x-tmon-nonce"] || "", req.headers["x-tmon-signature"] || "",
@@ -732,6 +855,7 @@ function handleDeviceLogs({ cfg, cache, state, registry, logger, deviceID }, req
         cache, cfg.security.max_timestamp_skew_seconds,
       );
     } catch (e) { logger.info(`auth rejected ${signedPath}: ${e.message}`); return finishErr(401, "unauthorized"); }
+    armResponseSignature(res, pskAt([active, pending], res2.pskIndex), req, signedPath);
     const body = raw.toString("utf8");
     const lines = devlog.stampLines(body, new Date());
     try { devlog.append(registry.dir, deviceID, lines); }
@@ -860,8 +984,9 @@ function handleDeviceSettings({ cfg, cache, state, registry, logger, deviceID },
     const rawBuf = Buffer.concat(chunks);
     // Body-aware auth AFTER the size-bounded body is assembled: the v3
     // canonical covers sha256(body), so the signature can't be checked sooner.
+    let res2;
     try {
-      auth.verifyMultiBody(
+      res2 = auth.verifyMultiBody(
         [active, pending],
         "POST", signedPath,
         req.headers["x-tmon-timestamp"] || "", req.headers["x-tmon-nonce"] || "", req.headers["x-tmon-signature"] || "",
@@ -870,6 +995,7 @@ function handleDeviceSettings({ cfg, cache, state, registry, logger, deviceID },
         cache, cfg.security.max_timestamp_skew_seconds,
       );
     } catch (e) { logger.info(`auth rejected ${signedPath}: ${e.message}`); return finishErr(401, "unauthorized"); }
+    armResponseSignature(res, pskAt([active, pending], res2.pskIndex), req, signedPath);
     const raw = rawBuf.toString("utf8");
     // Canonical body handling shared with the Go/Python brokers: an empty
     // (or whitespace-only) body is a no-op; anything present must be a single
@@ -965,9 +1091,20 @@ function handleDeviceSettings({ cfg, cache, state, registry, logger, deviceID },
   });
 }
 
+export const _testing = { pendingPayloadJSON: (p) => pendingPayloadJSON(p) };
+
 function pendingPayloadJSON(p) {
   const wire = { version: p.version };
-  if (p.broker_url) wire.broker_url = p.broker_url;
+  // broker_url is deliberately NOT emitted. The broker's address is no longer
+  // configuration the control plane owns: the device locates it by mDNS on its
+  // own subnet and adopts it only after the response signature proves the
+  // pairing (compat/mdns.md). Echoing the registry's value here used to
+  // overwrite a freshly-discovered address with the one recorded at
+  // registration time — and, because the firmware treats a broker_url change
+  // as channel identity, reboot the device onto an address that had already
+  // stopped working. The registry field survives as a last-known-address
+  // record; nothing authoritative reads it. Deployed firmware tolerates the
+  // absence (promote_candidate guards on presence).
   if (p.psk_hex) wire.psk_hex = p.psk_hex;
   if (p.city) wire.city = p.city;
   // br_day / br_night have documented ranges 10..100 / 5..100, so 0 is

@@ -40,6 +40,7 @@ import (
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/devlog"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/logbuf"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/registry"
+	"github.com/fractal-manifold/tokenmonitor-mcp/internal/sessionlife"
 	"github.com/fractal-manifold/tokenmonitor-mcp/internal/state"
 )
 
@@ -86,7 +87,7 @@ func NewServer(d Deps) *server.MCPServer {
 
 	s.AddTool(
 		mcp.NewTool("tokenmonitor_recent_logs",
-			mcp.WithDescription("Tail the broker log buffer (in-memory). Useful to see why the device is being rejected or which IPs are polling. Default is the last 50 lines."),
+			mcp.WithDescription("Tail the shared daemon log. Useful to see why the device is being rejected or which IPs are polling. Default is the last 50 lines."),
 			mcp.WithString("limit",
 				mcp.Description("How many lines to return (1..500). Defaults to 50."),
 			),
@@ -151,7 +152,6 @@ func NewServer(d Deps) *server.MCPServer {
 		mcp.NewTool("tokenmonitor_set_device_pending",
 			mcp.WithDescription("Stage a pending config update for a registered device. The next time the device polls /device/<id>/sync, it will receive the encrypted payload and apply it under the candidate/rollback safety net. Only fields you supply are changed; omitted fields keep their active value. Setting psk_hex triggers a key rotation that the broker tracks via two-PSK acceptance until the device confirms."),
 			mcp.WithString("device_id", mcp.Required(), mcp.Description("8 lowercase hex chars.")),
-			mcp.WithString("broker_url", mcp.Description("New broker URL.")),
 			mcp.WithString("psk_hex", mcp.Description("New 64-hex PSK to rotate to.")),
 			mcp.WithString("city", mcp.Description("New city for ambient weather.")),
 			mcp.WithNumber("br_day", mcp.Description("Daytime brightness 10..100.")),
@@ -168,7 +168,7 @@ func NewServer(d Deps) *server.MCPServer {
 			mcp.WithBoolean("autorotate_enabled", mcp.Description("Cycle through enabled providers on the dashboard.")),
 			mcp.WithNumber("autorotate_interval_s", mcp.Description("Seconds between provider cycles, 1..300.")),
 			mcp.WithString("theme_mode",
-				mcp.Description("Theme mode applied on the device: 'day' (light palette), 'night' (dark palette) or 'auto' (follows sunrise/sunset). Applied LIVE when the candidate is promoted — no reboot. Fields that DO reboot the device: broker_url, psk_hex, the WiFi pair, and arming a firmware update."),
+				mcp.Description("Theme mode applied on the device: 'day' (light palette), 'night' (dark palette) or 'auto' (follows sunrise/sunset). Applied LIVE when the candidate is promoted — no reboot. Fields that DO reboot the device: psk_hex, the WiFi pair, and arming a firmware update."),
 				mcp.Enum("day", "night", "auto"),
 			),
 			mcp.WithBoolean("pet_enabled", mcp.Description("Show the on-device virtual pet (default true). The pet is device-owned, like the display settings; the user can also toggle it on the device.")),
@@ -211,14 +211,14 @@ func NewServer(d Deps) *server.MCPServer {
 
 	s.AddTool(
 		mcp.NewTool("tokenmonitor_revert_firmware",
-			mcp.WithDescription("Stage a rollback to a previously-shipped firmware version. The broker enforces anti-rollback: if target_min_secure_version is below the device's current floor (Active.MinSecureVersion in the registry), the call is rejected upfront. The device's own gate against the manifest's min_secure_version is the ultimate authority."),
+			mcp.WithDescription("Stage a rollback to a previously-shipped firmware version. The broker predicts the device's own manifest gate from the supplied manifest and refuses upfront anything the device would reject — in particular a target below the device's anti-rollback floor (Active.MinSecureVersion), which the device refuses in silence and which no manifest can lower. The device-side gate remains the ultimate authority."),
 			mcp.WithString("device_id", mcp.Required(), mcp.Description("8 lowercase hex chars.")),
 			mcp.WithString("firmware_url", mcp.Required(), mcp.Description("HTTPS URL of the target .bin.")),
 			mcp.WithString("firmware_sha256", mcp.Required(), mcp.Description("64 lowercase hex chars.")),
 			mcp.WithString("firmware_version", mcp.Required(), mcp.Description("semver MAJOR.MINOR.PATCH of the target.")),
 			mcp.WithString("firmware_manifest_b64", mcp.Required(), mcp.Description("Canonical manifest base64.")),
 			mcp.WithString("firmware_manifest_sig_b64", mcp.Required(), mcp.Description("Ed25519 sig base64.")),
-			mcp.WithNumber("target_min_secure_version", mcp.Description("Packed 8.8.16 semver. Broker rejects if below the device's tmon_min_sv mirror.")),
+			mcp.WithNumber("target_min_secure_version", mcp.Description("Optional cross-check on the supplied manifest: if given, it must equal the min_secure_version that manifest declares, or the two came from different builds. The anti-rollback decision itself is taken from the manifest, not from this field.")),
 		),
 		handleRevertFirmware(d),
 	)
@@ -265,7 +265,7 @@ func NewServer(d Deps) *server.MCPServer {
 
 func handleStatus(d Deps) server.ToolHandlerFunc {
 	return func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		snap := d.State.Snapshot()
+		snap := currentSnapshot(d.State)
 		out := struct {
 			Version    string         `json:"version"`
 			Addr       string         `json:"addr"`
@@ -374,7 +374,7 @@ func handleHealth(d Deps) server.ToolHandlerFunc {
 
 		// 3. role consistency: if we recorded a successful 200 recently
 		//    it really is talking to *something*.
-		snap := d.State.Snapshot()
+		snap := currentSnapshot(d.State)
 		switch {
 		case snap.RequestsTotal == 0:
 			checks = append(checks, healthCheck{"observed_traffic", false,
@@ -414,6 +414,15 @@ func handleHealth(d Deps) server.ToolHandlerFunc {
 			Checks []healthCheck `json:"checks"`
 		}{OK: allOK, Role: snap.Role, Checks: checks})
 	}
+}
+
+func currentSnapshot(local *state.State) state.Snapshot {
+	if sessionlife.DaemonRunning() {
+		if snap, err := state.LoadSharedSnapshot(); err == nil {
+			return snap
+		}
+	}
+	return local.Snapshot()
 }
 
 func runSelfPing(ctx context.Context, cfg *config.Config) healthCheck {
@@ -469,11 +478,15 @@ func handleRecentLogs(d Deps) server.ToolHandlerFunc {
 				}
 			}
 		}
-		lines := d.Logs.Tail(limit)
+		lines, total, err := sessionlife.DaemonLogTail(limit)
+		if err != nil {
+			lines = d.Logs.Tail(limit)
+			total = d.Logs.Len()
+		}
 		return mcp.NewToolResultJSON(struct {
 			Total int      `json:"total_available"`
 			Lines []string `json:"lines"`
-		}{Total: d.Logs.Len(), Lines: lines})
+		}{Total: total, Lines: lines})
 	}
 }
 
@@ -639,11 +652,26 @@ func isVirtualIface(name string) bool {
 }
 
 func localIPv4s() ([]string, error) {
+	nets, err := localIPv4Nets()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(nets))
+	for _, n := range nets {
+		out = append(out, n.IP.String())
+	}
+	return out, nil
+}
+
+// localIPv4Nets is localIPv4s with the prefix length kept, in the same order.
+// The mask is what lets a caller ask "which of my addresses is on the same
+// network as this device" instead of guessing with the first one.
+func localIPv4Nets() ([]*net.IPNet, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil, err
 	}
-	var out []string
+	var out []*net.IPNet
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
 			continue
@@ -664,7 +692,14 @@ func localIPv4s() ([]string, error) {
 			if ip == nil {
 				continue
 			}
-			out = append(out, ip.String())
+			mask := n.Mask
+			if len(mask) == net.IPv6len {
+				mask = mask[12:]
+			}
+			if len(mask) != net.IPv4len {
+				mask = ip.DefaultMask()
+			}
+			out = append(out, &net.IPNet{IP: ip, Mask: mask})
 		}
 	}
 	return out, nil

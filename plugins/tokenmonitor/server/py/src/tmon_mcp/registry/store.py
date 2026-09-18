@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import ipaddress
 import os
 import re
 import threading
@@ -331,10 +332,89 @@ def _iso_now() -> datetime:
     return datetime.now(tz=timezone.utc)
 
 
+def local_ipv4_port(addr: str) -> str:
+    """Normalise a socket-local address to "<ipv4>:<port>", else "".
+
+    An IPv4-mapped address ("::ffff:192.168.1.28", what a dual-stack listener
+    reports) is unwrapped so a broker bound to "::" records the same string as
+    one bound to "0.0.0.0" — the device compares this origin by exact string
+    match, so the two must not disagree. Loopback and the unspecified address
+    return "": both are real local addresses, but neither is what a device on
+    the LAN dialled, and recording one would hand out a firmware_url pointing
+    back at the device itself.
+    """
+    if not addr:
+        return ""
+    host = addr
+    port = ""
+    if host.startswith("["):
+        host, _, rest = host[1:].partition("]")
+        port = rest[1:] if rest.startswith(":") else ""
+    elif host.count(":") == 1:
+        host, _, port = host.partition(":")
+    else:
+        return ""
+    if not port or not port.isdigit():
+        return ""
+    if host.lower().startswith("::ffff:"):
+        host = host[7:]
+    try:
+        ip = ipaddress.IPv4Address(host)
+    except ValueError:
+        return ""
+    if ip.is_loopback or ip.is_unspecified:
+        return ""
+    return f"{ip}:{port}"
+
+
+def remote_ipv4(remote_addr: str) -> str:
+    """The IPv4 literal in an "ip", "ip:port" or "[v6]:port" peer, else "".
+
+    An IPv4-mapped address ("::ffff:192.168.1.5", what a dual-stack listener
+    reports) is unwrapped. Loopback returns "" — a request from this host is
+    not a device on the LAN, and recording it would replace the address a
+    later OTA wants to match its own interfaces against.
+    """
+    if not remote_addr:
+        return ""
+    host = remote_addr
+    if host.startswith("["):
+        host = host[1:].split("]", 1)[0]
+    elif host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    if host.lower().startswith("::ffff:"):
+        host = host[7:]
+    try:
+        addr = ipaddress.IPv4Address(host)
+    except ValueError:
+        return ""
+    return "" if addr.is_loopback else str(addr)
+
+
 @dataclass
 class Active:
     payload: ConfigPayload = field(default_factory=ConfigPayload)
     last_seen: datetime | None = None
+    # The source address the device was last seen from, observed state exactly
+    # like last_seen. It exists so the broker can answer "which of MY addresses
+    # is on the device's network" when staging an OTA: a host with WiFi and
+    # Ethernet on different subnets would otherwise hand out a firmware_url the
+    # device cannot reach, and — worse — one the firmware treats as a foreign
+    # origin, so it withholds the HMAC headers and the download 401s.
+    # Best-effort and never a security input: it only ranks addresses we own.
+    last_ip: str = ""
+    # OUR side of that same connection — the "<ipv4>:<port>" socket-local
+    # address the device actually dialled on its last authenticated request,
+    # taken from the socket and never from the Host header (which a relay
+    # forwards untouched).
+    #
+    # It is the only address known to match the device's NVS svc_url, and the
+    # firmware compares OTA origins against that by exact strcmp: hand it a
+    # firmware_url on any other address of ours and it withholds the HMAC
+    # headers, so /firmware/ 401s and — unlike the manifest gate — the version
+    # gets poisoned on-device after three tries. Observed state, best-effort,
+    # never a security input: it only ever selects among addresses we own.
+    last_local_addr: str = ""
     # Device-OBSERVED state, not configuration: the networks the device
     # remembers, by NAME only. It lives here beside last_seen rather than in
     # ConfigPayload because nothing may ever push it TO a device — it is only
@@ -394,6 +474,10 @@ class Device:
         doc["active"] = self.active.payload.to_toml_dict()
         if self.active.last_seen:
             doc["active"]["last_seen"] = self.active.last_seen
+        if self.active.last_ip:
+            doc["active"]["last_ip"] = self.active.last_ip
+        if self.active.last_local_addr:
+            doc["active"]["last_local_addr"] = self.active.last_local_addr
         # "is not None", not truthiness: an empty list means the device
         # reported remembering NO networks, which is a different answer from
         # never having reported at all — and every load() re-reads this file,
@@ -426,6 +510,8 @@ def _device_from_toml(text: str) -> Device:
     if "last_seen" in active_d:
         ls = active_d["last_seen"]
         active.last_seen = ls if isinstance(ls, datetime) else _parse_iso(str(ls))
+    active.last_ip = str(active_d.get("last_ip", ""))
+    active.last_local_addr = str(active_d.get("last_local_addr", ""))
     if "wifi_known" in active_d:
         active.wifi_known = [
             {"ssid": str(n.get("ssid", "")),
@@ -579,6 +665,8 @@ class Registry:
             active.firmware_version = prev.payload.firmware_version
             active.min_secure_version = prev.payload.min_secure_version
             dev.active = Active(payload=active, last_seen=prev.last_seen,
+                                last_ip=prev.last_ip,
+                                last_local_addr=prev.last_local_addr,
                                 wifi_known=prev.wifi_known)
             dev.pending = None
             if channel is not None:
@@ -684,6 +772,8 @@ class Registry:
             dev.active = Active(
                 payload=promoted_payload,
                 last_seen=_iso_now(),
+                last_ip=dev.active.last_ip,
+                last_local_addr=dev.active.last_local_addr,
                 # Observed state survives a config promote untouched — the
                 # device reports it on its own cadence and a promote knows
                 # nothing about it. Without this the list would be wiped on
@@ -695,15 +785,35 @@ class Registry:
             self._save_locked(dev)
             return True
 
-    def touch(self, device_id: str) -> None:
+    def touch(self, device_id: str, remote_addr: str = "",
+              local_addr: str = "") -> None:
+        """Record freshness (and both ends of the connection) after a verified
+        request.
+
+        remote_addr is the request's peer, "host:port" or a bare host; anything
+        that is not a usable IPv4 literal leaves the recorded address alone
+        rather than clearing it, so a request arriving over IPv6 or loopback
+        does not erase the LAN address a later OTA wants to match against.
+
+        local_addr is our own side, "<ipv4>:<port>" — what the device dialled.
+        Same rule: a value we cannot read leaves the last good one in place,
+        because a stale broker origin still beats guessing among this host's
+        interfaces.
+        """
         if not valid_device_id(device_id):
             return
+        ip = remote_ipv4(remote_addr)
+        local = local_ipv4_port(local_addr)
         with self._with_lock(device_id):
             try:
                 dev = self._load_locked(device_id)
             except NotFound:
                 return
             dev.active.last_seen = _iso_now()
+            if ip:
+                dev.active.last_ip = ip
+            if local:
+                dev.active.last_local_addr = local
             self._save_locked(dev)
 
     def set_serial(self, device_id: str, serial: str, sku: str) -> None:
@@ -812,8 +922,26 @@ class Registry:
                 dev.channel = norm
                 self._save_locked(dev)
 
-    def bump_min_sv(self, device_id: str, sv: int) -> None:
-        """Monotonic anti-rollback floor. Never lowers."""
+    def record_min_sv(self, device_id: str, sv: int) -> None:
+        """Mirror the anti-rollback floor the device reports in X-Tmon-Min-Sv.
+        It FOLLOWS the device, including downwards.
+
+        It used to be monotonic here, on the reasoning that a spoofed-high value
+        could only lock a device out of downgrades. That stopped being true once
+        the broker began refusing to stage a manifest whose floor sits below the
+        device's (gate.predict_device_gate): a mirror that is stale-high now
+        blocks legitimate updates too, and the operator sees a refusal citing a
+        floor the device does not actually have.
+
+        Following the device is safe. tmon_min_sv is the device's own state and
+        the device enforces it regardless of what it told us; the header is
+        unsigned metadata by contract (compat/SECURITY.md), so a lie here cannot
+        make the device install anything it would otherwise refuse — it can only
+        make the broker offer something the device then rejects, which is the
+        pre-existing behaviour for every unsigned header. Monotonicity is still
+        enforced where it belongs: _merge_payload refuses to LOWER the floor via
+        a pushed config. Mirror of Go RecordMinSV / JS recordMinSV.
+        """
         if not valid_device_id(device_id):
             return
         with self._with_lock(device_id):
@@ -821,7 +949,7 @@ class Registry:
                 dev = self._load_locked(device_id)
             except NotFound:
                 return
-            if sv <= dev.active.payload.min_secure_version:
+            if sv == dev.active.payload.min_secure_version:
                 return
             dev.active.payload.min_secure_version = int(sv)
             self._save_locked(dev)

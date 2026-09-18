@@ -266,3 +266,81 @@ test("Tampered X-Tmon-Device is rejected", () => {
     /signature/,
   );
 });
+
+// --- response direction (v1) ------------------------------------------------
+
+test("HMAC response vectors match byte-for-byte", { skip }, () => {
+  // The broker's half of the pairing proof. A device that located this broker
+  // by mDNS adopts the address only when this tag verifies, so one byte of
+  // disagreement with the Go reference means every device on the LAN refuses
+  // every broker it finds — indistinguishable, from the device, from an empty
+  // network.
+  assert.ok((data.response_vectors ?? []).length > 0, "compat response_vectors empty");
+  for (const v of data.response_vectors) {
+    const body = Buffer.from(v.body_utf8, "utf8");
+    assert.equal(auth.bodySha256Hex(body), v.body_sha256, `${v.name}: body digest`);
+    const got = auth.computeResponseSignature(
+      Buffer.from(v.psk_utf8, "utf8"),
+      v.device, v.nonce, v.host, v.path, v.status, v.body_sha256,
+    );
+    assert.equal(got, v.expected_hex, `response vector ${v.name}`);
+  }
+});
+
+test("response tag does not collide with a request signature", () => {
+  // The "tmon-resp-v1" prefix is the domain separation: without it a response
+  // tag and a request signature over similar fields could be lifted from one
+  // slot into the other.
+  const psk = Buffer.alloc(32, 0x6b);
+  const resp = auth.computeResponseSignature(psk, "ab12cd34", "0".repeat(32), "10.0.0.1:8765", "/credentials", 200, auth.bodySha256Hex(Buffer.alloc(0)));
+  const req = auth.computeSignature(psk, "GET", "/credentials", "1700000000", "0".repeat(32), "ab12cd34", "1");
+  assert.notEqual(resp, req);
+});
+
+test("response tag lowercases the nonce and binds the status", () => {
+  const psk = Buffer.alloc(32, 0x6b);
+  const zero = "0".repeat(64);
+  assert.equal(
+    auth.computeResponseSignature(psk, "d", "abcdef", "h:1", "/p", 200, zero),
+    auth.computeResponseSignature(psk, "d", "ABCDEF", "h:1", "/p", 200, zero),
+  );
+  // Anti-splicing: a 200 tag must not validate a 503 carrying the same body.
+  assert.notEqual(
+    auth.computeResponseSignature(psk, "d", "n", "h:1", "/p", 200, zero),
+    auth.computeResponseSignature(psk, "d", "n", "h:1", "/p", 503, zero),
+  );
+});
+
+test("response tag binds the address that answered", () => {
+  // The anti-relay property. An impostor advertising itself on the LAN can
+  // forward our request to the real broker and hand back the real broker's
+  // tag; the only thing that stops the device adopting the relay is that the
+  // tag names the address the BROKER answered on, which the device compares
+  // against the address it dialled.
+  const psk = Buffer.alloc(32, 0x6b);
+  const zero = "0".repeat(64);
+  const real = auth.computeResponseSignature(psk, "d", "n", "192.168.1.28:8765", "/p", 200, zero);
+  assert.notEqual(real, auth.computeResponseSignature(psk, "d", "n", "192.168.1.99:8765", "/p", 200, zero));
+  // The port counts too: two brokers on one host are distinct peers.
+  assert.notEqual(real, auth.computeResponseSignature(psk, "d", "n", "192.168.1.28:9999", "/p", 200, zero));
+});
+
+test("responseSigHost reads the socket, never the Host header", () => {
+  // A relay forwards the Host header untouched, so signing it would prove
+  // nothing about who actually answered.
+  assert.equal(
+    auth.responseSigHost({ headers: { host: "attacker.local" },
+                           socket: { localAddress: "192.168.1.28", localPort: 8765 } }),
+    "192.168.1.28:8765",
+  );
+  // A dual-stack listener reports IPv4 peers in mapped form; both bindings
+  // must sign the same bytes for the same device.
+  assert.equal(
+    auth.responseSigHost({ socket: { localAddress: "::ffff:192.168.1.28", localPort: 8765 } }),
+    "192.168.1.28:8765",
+  );
+  // Nothing usable → "", and the caller must then emit no tag at all.
+  for (const sock of [undefined, {}, { localAddress: "1.2.3.4" }, { localPort: 8765 }]) {
+    assert.equal(auth.responseSigHost({ socket: sock }), "");
+  }
+});

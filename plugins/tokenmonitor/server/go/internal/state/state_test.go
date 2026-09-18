@@ -84,3 +84,18 @@ func TestUpdate_OmittedUntilKnown(t *testing.T) {
 		t.Errorf("UpdateAvailable = %v, want non-nil false", snap.UpdateAvailable)
 	}
 }
+
+func TestSharedSnapshotRoundTrip(t *testing.T) {
+	t.Setenv("TMON_RUNTIME_DIR", t.TempDir())
+	s := New()
+	s.SetRole(RoleLeader)
+	s.EnableShared()
+	s.RecordRequest("192.168.1.4:1234", 200, time.Unix(1700000000, 0))
+	snap, err := LoadSharedSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Role != "leader" || snap.RequestsTotal != 1 || snap.LastRequestStatus != 200 {
+		t.Fatalf("shared snapshot = %+v", snap)
+	}
+}

@@ -118,7 +118,7 @@ def test_replace_active_converges_and_preserves_metadata(tmp_path: Path):
     reg.set_pending("abcdef0a", ConfigPayload(city="Barcelona"))
     # Device-reported OTA state that a re-provision must NOT discard.
     reg.set_active_firmware_version("abcdef0a", "1.2.3")
-    reg.bump_min_sv("abcdef0a", 7)
+    reg.record_min_sv("abcdef0a", 7)
 
     dev = reg.replace_active(
         "abcdef0a",
@@ -338,3 +338,62 @@ def test_set_active_firmware_version_clears_stale_tombstone(tmp_path: Path):
     reg.set_active_firmware_version("abcdef08", "0.9.2")
     assert reg.load("abcdef08").blocked_firmware_version == ""
     assert reg.load("abcdef08").active.payload.firmware_version == "0.9.2"
+
+
+def test_record_min_sv_follows_the_device(tmp_path: Path):
+    """The floor mirror follows the device in BOTH directions.
+
+    It used to be a high-water mark, on the reasoning that a spoofed-high value
+    could only lock a device out of downgrades. That stopped being true once the
+    broker began refusing to stage a manifest whose floor sits below the
+    device's: a mirror stuck high now blocks legitimate updates too — the exact
+    shape a USB re-flash with an NVS wipe leaves behind — and the operator sees
+    a refusal citing a floor the device does not have. Mirror of Go
+    TestRecordMinSVFollowsTheDevice.
+    """
+    reg = Registry(str(tmp_path))
+    reg.register("abcdef0a", ConfigPayload(broker_url="u", psk_hex="aa" * 32))
+
+    reg.record_min_sv("abcdef0a", 16777216)  # packed(1.0.0)
+    assert reg.load("abcdef0a").active.payload.min_secure_version == 16777216
+
+    reg.record_min_sv("abcdef0a", 720900)  # the unit came back on 0.11.4, NVS wiped
+    assert reg.load("abcdef0a").active.payload.min_secure_version == 720900
+
+    reg.record_min_sv("abcdef0a", 16777217)  # and up again after the update
+    assert reg.load("abcdef0a").active.payload.min_secure_version == 16777217
+
+
+def test_touch_records_the_address_the_device_dialled(tmp_path: Path):
+    """The address the device DIALLED identifies the origin its OTA download
+    will authenticate against: the firmware compares a firmware_url's origin
+    with its NVS svc_url by exact strcmp and drops the HMAC headers on any
+    mismatch, so /firmware/ 401s. Like last_ip it has to survive a promote and a
+    re-provision. Mirror of Go TestTouch_RecordsTheAddressTheDeviceDialled."""
+    reg = Registry(str(tmp_path))
+    reg.register("abcdef0a", ConfigPayload(broker_url="u", psk_hex="aa" * 32))
+
+    reg.touch("abcdef0a", "192.168.2.44:9000", "192.168.2.28:8765")
+    assert reg.load("abcdef0a").active.last_local_addr == "192.168.2.28:8765"
+
+    # A dual-stack listener reports its own address in mapped form; it must
+    # normalise to the same bytes a broker bound to 0.0.0.0 records, because the
+    # device's comparison is a string compare.
+    reg.touch("abcdef0a", "192.168.2.44:9000", "[::ffff:192.168.2.28]:8765")
+    assert reg.load("abcdef0a").active.last_local_addr == "192.168.2.28:8765"
+
+    # Nothing usable may erase it. Loopback is deliberately in this list: it is
+    # a real local address when broker and device share a host, but never what a
+    # device on the LAN dialled, and recording it would hand out a firmware_url
+    # pointing at the device itself.
+    for bad in ("", "no-port", "[fe80::1]:8765", "127.0.0.1:8765",
+                "0.0.0.0:8765", "192.168.2.28"):
+        reg.touch("abcdef0a", "192.168.2.44:9000", bad)
+        assert reg.load("abcdef0a").active.last_local_addr == "192.168.2.28:8765", bad
+
+    reg.set_pending("abcdef0a", ConfigPayload(city="Madrid"))
+    reg.maybe_promote("abcdef0a", 2, False)
+    assert reg.load("abcdef0a").active.last_local_addr == "192.168.2.28:8765"
+
+    reg.replace_active("abcdef0a", ConfigPayload(broker_url="u", psk_hex="aa" * 32))
+    assert reg.load("abcdef0a").active.last_local_addr == "192.168.2.28:8765"

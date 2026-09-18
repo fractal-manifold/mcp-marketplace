@@ -9,16 +9,14 @@ It is the spiritual successor to `service-go/` inside the device repo: same
 HMAC-authenticated `GET /credentials` endpoint, same OAuth-token-from-disk
 behaviour, same wire protocol — but with three additions:
 
-- **Lives with your Claude Code session.** Registered as an MCP server in
-  `.mcp.json` (or `~/.claude.json`), Claude Code spawns it on session start
-  and reaps it on session end. No systemd unit required.
-- **Multi-session safe.** Several Claude Code sessions can run at once; the
-  first one wins the TCP port, the rest sit silently as followers and take
-  over within ~5 s if the leader exits.
-- **Coexists with an existing daemon.** If you already have `service-go`
-  running as a systemd user unit, `tokenmonitor-mcp` notices the busy port and
-  stays in follower mode permanently — your existing setup keeps serving
-  the device, no migration required.
+- **Lives with your AI-client sessions.** Every Codex, Claude Code or Agy
+  CLI/UI MCP connection holds a renewable lease for one detached broker
+  daemon. No systemd unit is required.
+- **One broker process.** All stdio adapters share a cross-runtime singleton;
+  they never contain a second listener or broker worker. A live adapter
+  restarts the daemon after a crash.
+- **Stops when unused.** The daemon exits shortly after the last lease is
+  removed, and reaps stale leases left by clients killed without cleanup.
 
 ## Install
 
@@ -155,9 +153,8 @@ level = "INFO"
 ## Register with MCP-aware CLIs
 
 `tokenmonitor-mcp` speaks stdio MCP, so any MCP-aware CLI can launch it as a
-subprocess. The leader-election in the binary means it is safe to register
-it in several CLIs at once — the first instance to bind `:8765` becomes the
-broker, the rest stay as silent followers.
+subprocess. It is safe to register it in several CLIs at once: every process is
+a lightweight stdio adapter and all of them lease the same detached broker.
 
 In every command below, pass an **absolute path** (`$(command -v tokenmonitor-mcp)`)
 rather than relying on the CLI inheriting your shell `PATH` — Codex and
@@ -242,32 +239,27 @@ This drops the extension under `~/.gemini/antigravity/extensions/`
 `agy` afterwards so it picks up the new extension. See `website/plugin.html`
 for the end-user install flow.
 
-## Coexistence with an existing broker
+## Migrating from an existing broker
 
-If `service-go` (or any other broker) is already serving on port 8765,
-`tokenmonitor-mcp` will detect that on every retry and stay as a quiet follower:
-
-```text
-tokenmonitor-mcp leader: 0.0.0.0:8765 busy, running as follower (probing every 5s)
-```
-
-That is fine — your device keeps talking to the old daemon. When you're
-ready to migrate:
+An old `service-go` process does not participate in the singleton lock. Disable
+it before using the session-owned daemon:
 
 ```sh
 systemctl --user stop tokenmonitor-service
 systemctl --user disable tokenmonitor-service
 ```
 
-Within ~5 s, the next session's `tokenmonitor-mcp` will promote itself to leader and
-take over with zero device-side configuration changes.
+The live session supervisor retries every five seconds and starts the shared
+daemon once the legacy port is released, with no device-side configuration
+change.
 
 ## Standalone mode (no Claude Code)
 
-If you want the broker up 24/7 even when no Claude Code session is open:
+For an intentional 24/7 broker with no AI-client session, use the explicit
+persistent mode:
 
 ```sh
-tokenmonitor-mcp --daemon
+tokenmonitor-mcp --persistent-daemon
 ```
 
 Drop something like this in `~/.config/systemd/user/tokenmonitor-mcp.service`:
@@ -278,7 +270,7 @@ Description=TokenMonitor credential broker
 After=network-online.target
 
 [Service]
-ExecStart=%h/.local/bin/tokenmonitor-mcp --daemon
+ExecStart=%h/.local/bin/tokenmonitor-mcp --persistent-daemon
 Restart=on-failure
 RestartSec=5
 
@@ -286,9 +278,8 @@ RestartSec=5
 WantedBy=default.target
 ```
 
-Then `systemctl --user enable --now tokenmonitor-mcp`. Your Claude Code sessions
-will still spawn `tokenmonitor-mcp` in stdio mode and will simply observe the
-daemon's port (follower mode, no-op).
+Then `systemctl --user enable --now tokenmonitor-mcp`. The global daemon lock
+prevents session-owned daemons from starting alongside this explicit service.
 
 ## MCP tools
 
@@ -300,7 +291,7 @@ diagnostic questions about your wall monitor.
 |-------------------------------|--------------|
 | `tokenmonitor_status`         | Snapshot: leader/follower role, since when, last ESP32 request (time, remote, HTTP status), request count. |
 | `tokenmonitor_health`         | End-to-end check: credentials file readable + unexpired, broker reachable via a self-signed self-ping, observed traffic in the last window. Returns PASS/FAIL per component. |
-| `tokenmonitor_recent_logs`    | Tail of the in-memory broker log (default 50 lines, max 500). Shows auth rejections, peer IPs, role transitions. |
+| `tokenmonitor_recent_logs`    | Tail of the shared daemon log (default 50 lines, max 500). Shows auth rejections, peer IPs and lifecycle events. |
 | `tokenmonitor_provision_hint` | The laptop's LAN IPv4 addresses + the configured port, formatted as `http://…` URLs to paste into the device's captive portal. |
 | `tokenmonitor_list_devices`   | Every device in the local registry, with active config version, whether a pending update is queued, last seen, providers enabled. |
 | `tokenmonitor_register_device`| Register an existing device — needed once for any device originally provisioned through the captive portal. Args: `device_id` (8 hex), `broker_url`, `psk_hex` (64 hex), optional `city`/`br_day`/`br_night`/`vol`. |
@@ -404,8 +395,9 @@ via `tokenmonitor_discover_devices` + `tokenmonitor_provision`.
 
 | Flag         | Behaviour                                                              |
 |--------------|------------------------------------------------------------------------|
-| *(none)*     | MCP-stdio + leader-elected broker. The mode Claude Code uses.          |
-| `--daemon`   | Standalone broker. Bind unconditionally, no probe loop.                |
+| *(none)*     | MCP stdio adapter + renewable lease for the shared broker daemon.      |
+| `--daemon`   | Broker daemon that exits after the last session lease disappears.      |
+| `--persistent-daemon` | Explicit always-on broker; intended for a supervisor.         |
 | `--once`     | Read & validate the credentials file, print a one-line OK/expired summary, exit. |
 | `--status`   | Probe the local broker and print a status JSON. Useful for scripting.  |
 | `--config`   | Override the config file location.                                     |
@@ -413,7 +405,8 @@ via `tokenmonitor_discover_devices` + `tokenmonitor_provision`.
 
 ## Smoke tests
 
-After `tokenmonitor-mcp --daemon` is running:
+After `tokenmonitor-mcp --persistent-daemon` is running (or while any normal
+MCP session holds the session-owned daemon alive):
 
 ```sh
 tokenmonitor-mcp --once
