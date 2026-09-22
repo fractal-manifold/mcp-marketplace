@@ -66,10 +66,18 @@ per version — a fresh `npm install` / venv / `go build`). That run is
 slower; subsequent launches are a cache hit. The launcher logs which
 runtime it picked to stderr (`tokenmonitor-mcp launcher: using <runtime> (…)`).
 
+Each Codex, Claude Code or Agy CLI/UI connection then creates a renewable
+session lease. All connections share exactly one detached broker daemon across
+the three runtimes. The daemon is restarted if it crashes and exits shortly
+after the final lease disappears; stale leases from killed clients expire
+automatically. Runtime state and daemon logs live under
+`$XDG_RUNTIME_DIR/tokenmonitor/` when available, otherwise
+`$XDG_CACHE_HOME/tokenmonitor/runtime/`.
+
 ### Advanced: standalone / PATH mode
 
-If you would rather run a globally-installed binary (e.g. a systemd
-daemon shared across sessions), the same `tokenmonitor-mcp` launcher auto-detects
+If you would rather run a globally-installed binary, the same
+`tokenmonitor-mcp` launcher auto-detects
 "PATH mode" whenever it is run from outside the plugin and finds a
 `tokenmonitor-mcp-go`, `tokenmonitor-mcp-py` or `tokenmonitor-mcp-js` on your `PATH`. There are no
 longer published packages for these — build one from the bundled source
@@ -102,12 +110,12 @@ the authoritative schemas):
 | `tokenmonitor_usb_scan`       | Enumerate TokenMonitor devices on the serial bus, with a match tier per port. **Linux + macOS** (sysfs / `ioreg`); Windows enumeration is not yet implemented. |
 | `tokenmonitor_usb_provision`  | Provision or reconfigure a device over the USB cable: WiFi, broker URL and PSK in one payload, independent of the LAN. |
 
-## Coexistence with `service-go`
+## Migrating from `service-go`
 
-If you still have the older `service-go` systemd unit running, the
-plugin's `tokenmonitor-mcp` arrives as a quiet follower (port 8765 is busy) and
-the device keeps talking to the old daemon. Stop the daemon to let the
-plugin take over within ~5 s.
+Disable an older `service-go` systemd unit before installing this release. A
+pre-existing process does not participate in the singleton lock and can keep
+port 8765 occupied; the session supervisor will retry until that legacy process
+is stopped.
 
 ## Runtime parity
 

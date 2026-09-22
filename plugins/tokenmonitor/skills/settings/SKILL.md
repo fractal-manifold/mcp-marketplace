@@ -1,6 +1,6 @@
 ---
 name: settings
-description: tokenmonitor plugin — remotely change any on-device setting the Settings panel exposes (city, day / night brightness, alert volume, providers and their modes, auto-rotation, theme, virtual pet, custom panel, broker URL, passphrase) on a TokenMonitor device. Equivalent to tapping the gear on the dashboard and editing a row, but driven from Claude Code via the control plane. Use this when the user says "set the wall monitor city to Madrid", "lower the night brightness", "mute the alerts", "disable Codex on device X", "rotate providers every 60 s", "change/rename/hide the pet", "rotate the broker passphrase", "change the broker URL", "enable/disable the custom (swipe-up) panel", "change what the panel shows", or any similar reconfiguration of an already-provisioned device.
+description: tokenmonitor plugin — remotely change any on-device setting the Settings panel exposes (city, day / night brightness, alert volume, providers and their modes, auto-rotation, theme, virtual pet, custom panel, passphrase) on a TokenMonitor device. Equivalent to tapping the gear on the dashboard and editing a row, but driven from Claude Code via the control plane. Use this when the user says "set the wall monitor city to Madrid", "lower the night brightness", "mute the alerts", "disable Codex on device X", "rotate providers every 60 s", "change/rename/hide the pet", "rotate the broker passphrase", "move the device to another broker", "enable/disable the custom (swipe-up) panel", "change what the panel shows", or any similar reconfiguration of an already-provisioned device.
 ---
 
 # /tokenmonitor:settings
@@ -73,7 +73,9 @@ where Display only changes how the existing pages are drawn:
   the named animal to its number, or pick the closest / ask when the user names
   a species that isn't in the list), `pet_name`.
 - **Network** — `city` (**run the geocoding pre-check below first**),
-  `broker_url`, `psk_hex`.
+  `psk_hex`. There is **no `broker_url`**: the device finds its broker by mDNS
+  on its own subnet and only talks to the one that can prove the pairing, so
+  the address is not a setting anyone can push (see step 4).
 - **Audio** — `vol`.
 
 Pet and panel settings are **device-owned**: the user can also change them on
@@ -155,14 +157,23 @@ provider, suggest turning autorotation on if it is currently off.
    `tokenmonitor_list_devices` after ~5 min to confirm `pending_changes` no
    longer mentions `psk_hex (key rotation)`.
 
-### 4. Special case — broker_url change
+### 4. Special case — moving a device to another broker
 
-This is a *move-to-another-broker* operation. Confirm with the user that the
-new broker is reachable from the device's network, or the candidate fails to
-probe and the device rolls back. If the new URL belongs to a *different*
-machine, that machine's registry also needs a matching entry — suggest running
-`tokenmonitor_register_device` there first with the same `device_id` and
-`psk_hex`.
+There is no broker URL to set. The device discovers its broker by mDNS on
+whatever subnet it lands on and adopts the one that proves the pairing, so
+"which broker" is decided by **which registry holds this device's PSK**, not by
+an address.
+
+To move a device to another machine: run `tokenmonitor_register_device` on the
+new machine with the same `device_id` and `psk_hex`, run that broker on the
+device's network, and stop the old one (two brokers on the same LAN both
+holding the PSK is ambiguous — whichever answers the probe first wins). No
+reboot and no pending change is involved; the device re-resolves within ~30 s.
+
+If the user asks to "change the broker URL", explain this rather than looking
+for a field — and if what they actually want is a broker on a *different*
+network, that is not supported: with no pinned address, a broker that is not on
+the device's own L2 cannot be found.
 
 ### 5. Queue the change
 
@@ -178,7 +189,7 @@ the user "already set to <value>" and stop.
 > (~40 s end to end) or roll back automatically if it can't confirm three
 > healthy fetches within 5 minutes.
 
-**Almost nothing needs a reboot.** Only a change to `broker_url`, `psk_hex` or
+**Almost nothing needs a reboot.** Only a change to `psk_hex` or
 WiFi reboots the device (it has to re-establish the very channel it is being
 reconfigured through), plus a promote that arms an OTA. `theme_mode`,
 providers, autorotate, `br_day`, `br_night`, `vol`, `city` and the pet fields
@@ -202,7 +213,7 @@ will not show the device's promote lines.
   must configure `~/.config/tokenmonitor/devices/` and restart
   `tokenmonitor-mcp`.
 - **`pending_changes` never drains** — usually the candidate fails to probe
-  (wrong `broker_url` or `psk_hex`). Check `tokenmonitor_device_logs` for
+  (wrong `psk_hex`, or the broker is not reachable on the device's network). Check `tokenmonitor_device_logs` for
   `candidate probe transport failure` — that is the string the firmware
   actually emits; there is no "candidate probe failed" line to grep for. The
   device rolls back after 5 minutes.

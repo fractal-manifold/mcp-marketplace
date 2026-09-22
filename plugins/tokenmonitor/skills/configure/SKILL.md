@@ -144,16 +144,24 @@ space.
 
 ### 3. Choose the config to push
 
-**Resolve the broker URL first, before asking the user anything else** — if the
-broker isn't reachable there is no point collecting preferences.
+**Check the broker is reachable on the LAN first, before asking the user
+anything else** — if it isn't, there is no point collecting preferences.
 
-- **broker_url** — run `tokenmonitor_provision_hint` for the laptop's
-  non-loopback IPv4 + port, and pick the first entry on the same `/24` as the
-  device's IP (so the device isn't pointed at an interface it can't reach). If
-  the hint warns the broker is bound to `127.0.0.1`, **stop** and tell the user
-  to set `[server] bind = "0.0.0.0"` in
-  `~/.config/tokenmonitor/tokenmonitor.toml` and restart the broker. (Legacy
-  `service.toml` is still read, but `tokenmonitor.toml` is primary.)
+- **broker_url** — the device does not need one: it finds its broker by mDNS on
+  its own subnet and only talks to the one that can prove the pairing, so a
+  DHCP lease change never strands it. Still run `tokenmonitor_provision_hint`,
+  because it answers the question that *does* matter: if it warns the broker is
+  bound to `127.0.0.1`, **stop** and tell the user to set
+  `[server] bind = "0.0.0.0"` in `~/.config/tokenmonitor/tokenmonitor.toml` and
+  restart the broker — a loopback-bound broker publishes no mDNS advertisement
+  and is invisible to the device. (Legacy `service.toml` is still read, but
+  `tokenmonitor.toml` is primary.)
+
+  You may pass `broker_url` as a **cache seed** — the first entry from the hint
+  on the same `/24` as the device's IP — which saves the device one mDNS query
+  on first boot. It is not required and it is not authoritative: the device
+  drops it the moment it stops working and replaces it with whatever it
+  discovers.
 
 - **psk_hex** — **DO NOT ask the user and do not pass it.** Omitted, the broker
   mints a fresh 32-byte random PSK for a device it has never seen, and
@@ -229,10 +237,12 @@ needed from the user.
 ### 5. Confirm
 
 The device reboots (~3 s). After ~15 s, suggest `tokenmonitor_list_devices` to
-confirm it appears with the expected `active_broker_url` and a recent
-`last_seen`. If `last_seen` is still empty after 60 s the device is not
-reaching the broker — check the laptop's firewall, re-check the chosen
-broker_url, or look for 401s (PSK mismatch) in `tokenmonitor_recent_logs`.
+confirm it appears with a recent `last_seen`. If `last_seen` is still empty
+after 60 s the device is not reaching the broker — and since it finds the broker
+by mDNS, the likely causes are: the laptop's firewall; a broker bound to
+loopback (no advertisement); an AP with client isolation, which blocks the
+multicast (the device shows "No broker on this network"); or a PSK mismatch,
+which shows up as 401s in `tokenmonitor_recent_logs`.
 
 ### 6. Tell the user what they can tune later
 
@@ -242,7 +252,7 @@ long-press-the-mascot route is gone) and the **`/tokenmonitor:settings`** skill.
 Cover: city; separate day/night brightness; alert volume or mute; which
 providers are on and each one's mode (Auto / Subscription / API key);
 auto-rotation when 2+ providers are on; the virtual pet (show, species, name);
-theme (Day / Night / Auto); and — advanced, rarely needed — broker URL and
+theme (Day / Night / Auto); and — advanced, rarely needed — the
 passphrase. If the user voices any of these in the same breath, apply them
 right away with `tokenmonitor_set_device_pending` instead of making them ask
 again.
