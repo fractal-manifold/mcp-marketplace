@@ -21,13 +21,12 @@ package mcp
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -70,7 +69,7 @@ func registerDiscoveryTools(s *server.MCPServer, d Deps) {
 
 	s.AddTool(
 		mcp.NewTool("tokenmonitor_provision",
-			mcp.WithDescription("Send the initial config to a device that is currently in BOOT_NEEDS_CONFIG. Requires the 6-digit pairing code the user reads off the device's screen, plus the broker URL and PSK hex you want the device to start using. On success the device persists the config to NVS and reboots into BOOT_READY. If broker_url + psk_hex are supplied, this tool also registers the device in the local tokenmonitor-mcp registry so subsequent control-plane polls (/device/<id>/sync) are recognised."),
+			mcp.WithDescription("Pair a device that is waiting for its initial config (BOOT_NEEDS_CONFIG, or pairing mode) with this broker. Requires the 6-digit pairing code the user reads off the device's screen. ENROLMENT: a device this registry already knows is re-sent its own PSK. A device it does not know is paired — given a PSK (psk_hex if supplied, else a freshly generated one) and recorded in the local tokenmonitor-mcp registry so its control-plane polls (/device/<id>/sync) are recognised — only when the call says so: enroll=true, psk_hex or broker_url. For a first pairing pass enroll=true. Without one of those the call is refused before anything is sent, because the new PSK would replace whatever the device holds and nothing on the LAN says whether it is paired with another broker. enroll=false changes settings only. Whenever a PSK is pushed and broker_url was omitted, this host's address on the route to the device is sent with it and reported as broker_url_seeded: firmware 1.0.0 or newer finds the broker by mDNS and keeps it as a cache seed, older firmware cannot pair without it. On success the device persists the config to NVS and reboots. The result's `enrolled` says whether the registry now holds the device with the PSK that was pushed; if a PSK was generated but could not be recorded, the result carries psk_hex and a note so the device can be recovered with tokenmonitor_register_device."),
 			mcp.WithString("device_id", mcp.Required(),
 				mcp.Description("8 lowercase hex chars from the device screen or tokenmonitor_discover_devices output.")),
 			mcp.WithString("provision_url", mcp.Required(),
@@ -78,9 +77,10 @@ func registerDiscoveryTools(s *server.MCPServer, d Deps) {
 			mcp.WithString("pairing_code", mcp.Required(),
 				mcp.Description("6-digit code shown on the device's screen.")),
 			mcp.WithString("broker_url",
-				mcp.Description("HTTP(S) URL of the tokenmonitor-mcp broker the device should poll. Run tokenmonitor_provision_hint to learn the laptop's reachable URL on this LAN; do not assume a specific IP. If omitted, only the optional fields below are pushed.")),
+				mcp.Description("Optional: HTTP(S) URL of this broker, stored on the device as the first address to try and in the registry as the last-known address. Not needed to pair on firmware 1.0.0 or newer — the device resolves the broker by mDNS and re-resolves whenever the address changes. Required by older firmware, which cannot leave setup without one — so it is auto-seeded when omitted: whenever a PSK is pushed, this host's address on the route to the device is sent and reported as broker_url_seeded. If you pass one, take it from tokenmonitor_provision_hint; do not assume a specific IP. Passing one also counts as asking to pair a device this registry does not know.")),
 			mcp.WithString("psk_hex",
-				mcp.Description("64-hex PSK the device should sign requests with.")),
+				mcp.Description("64-hex PSK the device should sign requests with. Optional: when omitted, the PSK this registry already holds for the device is reused, else a fresh one is generated if the call pairs the device (see enroll).")),
+			mcp.WithBoolean("enroll", mcp.Description("Whether to pair the device with this broker: push a PSK and record the device in the local registry. Omit it to let the tool decide from what it knows (see the tool description): a device this registry already knows is re-sent its own PSK, and a device it does not know is paired only when that is clearly meant — otherwise the call is refused before anything is written. true pairs the device here regardless, replacing any PSK it holds: use it for a first pairing, or to move a device over from another broker. false changes settings only, leaving the device's PSK and the registry untouched: use it for a WiFi-only or settings-only change on a device paired with a DIFFERENT broker. false cannot be combined with psk_hex.")),
 			mcp.WithString("city", mcp.Description("Optional city for ambient weather.")),
 			mcp.WithNumber("br_day", mcp.Description("Daytime brightness 10..100.")),
 			mcp.WithNumber("br_night", mcp.Description("Nighttime brightness 5..100.")),
@@ -218,42 +218,34 @@ func handleProvision(d Deps) server.ToolHandlerFunc {
 		}
 
 		brokerURL := strings.TrimSpace(req.GetString("broker_url", ""))
-		pskHex := strings.ToLower(strings.TrimSpace(req.GetString("psk_hex", "")))
-		pskGenerated := false
-		pskReused := false
-		if pskHex != "" {
-			if len(pskHex) != 64 {
-				return mcp.NewToolResultError("psk_hex must be 64 hex chars"), nil
-			}
-			if _, err := hex.DecodeString(pskHex); err != nil {
-				return mcp.NewToolResultError("psk_hex is not valid hex"), nil
-			}
-		} else if brokerURL != "" {
-			// No PSK supplied. If this device already has an active PSK in
-			// the registry (a benign re-provision — not a fresh device),
-			// REUSE it and re-push it so the two never drift: rotating the
-			// key on every reconfigure risks desyncing a device whose push
-			// silently fails. Only a genuinely new device mints a fresh
-			// 32-byte random PSK — strictly stronger than the old
-			// SHA-256(passphrase) derivation, secret staying machine-only
-			// (broker registry + device NVS).
-			existing := ""
-			if d.Registry != nil {
-				if dev, err := d.Registry.Load(deviceID); err == nil && dev != nil {
-					existing = dev.Active.PSKHex
+		callerURL := brokerURL != ""
+		if _, errRes := explicitPSK(req); errRes != nil {
+			return errRes, nil
+		}
+		// /info and the mDNS TXT carry no has_psk, so the LAN never knows
+		// whether the device already holds a key: nil, "unknown".
+		pskHex, pskGenerated, pskReused, errText := resolveEnrolPSK(d, req, deviceID, nil)
+		if errText != "" {
+			return mcp.NewToolResultError(errText), nil
+		}
+		// A PSK with no address strands firmware older than 1.0.0 on "Waiting
+		// for setup": it cannot find the broker by itself. So an enrolment
+		// with no broker_url is given the one address the device can
+		// demonstrably reach — ours, on the route to it. On 1.0.0+ that is
+		// just a cache seed.
+		seeded := ""
+		if pskHex != "" && brokerURL == "" {
+			if u, err := url.Parse(provisionURL); err == nil && u.Hostname() != "" {
+				port := u.Port()
+				if port == "" {
+					port = "80"
 				}
+				seeded = seedURLTowards(d, net.JoinHostPort(u.Hostname(), port))
 			}
-			if existing != "" {
-				pskHex = existing
-				pskReused = true
-			} else {
-				b := make([]byte, 32)
-				if _, err := rand.Read(b); err != nil {
-					return mcp.NewToolResultErrorFromErr("psk gen", err), nil
-				}
-				pskHex = hex.EncodeToString(b)
-				pskGenerated = true
+			if seeded == "" {
+				return mcp.NewToolResultError(errNoSeedLAN), nil
 			}
+			brokerURL = seeded
 		}
 
 		payload := provisionPayload{
@@ -335,29 +327,59 @@ func handleProvision(d Deps) server.ToolHandlerFunc {
 				DialContext: (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
 			},
 		}
-		resp, err := client.Do(httpReq)
-		if err != nil {
+		// postFailed reports a POST that did not complete — refused, timed out,
+		// or cut off part-way through the answer.
+		postFailed := func(err error) (*mcp.CallToolResult, error) {
+			if pskGenerated {
+				// The request may have reached the device before the
+				// connection died (it reboots right after applying), so the
+				// minted PSK may be live with no copy anywhere on this host.
+				// Hand it back rather than lose it with the error.
+				return mcp.NewToolResultJSON(struct {
+					OK             bool   `json:"ok"`
+					Error          string `json:"error"`
+					OutcomeUnknown bool   `json:"outcome_unknown"`
+					PSKHex         string `json:"psk_hex"`
+					Note           string `json:"note"`
+				}{Error: "POST /provision: " + err.Error(), OutcomeUnknown: true, PSKHex: pskHex, Note: notePSKUnknown})
+			}
 			return mcp.NewToolResultErrorFromErr("POST /provision", err), nil
 		}
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			return postFailed(err)
+		}
 		defer resp.Body.Close()
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return postFailed(err)
+		}
 
 		if resp.StatusCode != http.StatusOK {
-			return mcp.NewToolResultJSON(struct {
+			rejected := struct {
 				OK         bool   `json:"ok"`
 				HTTPStatus int    `json:"http_status"`
 				Body       string `json:"body"`
-			}{OK: false, HTTPStatus: resp.StatusCode, Body: string(respBody)})
+				PSKHex     string `json:"psk_hex,omitempty"`
+				Note       string `json:"note,omitempty"`
+			}{OK: false, HTTPStatus: resp.StatusCode, Body: string(respBody)}
+			// A 4xx is a refusal before anything was stored. A 5xx is a failed
+			// write, and those can leave a partial config behind
+			// (PROVISION_WIRE §3) — the minted PSK may be part of it.
+			if pskGenerated && resp.StatusCode >= 500 {
+				rejected.PSKHex = pskHex
+				rejected.Note = notePSKMaybeLive
+			}
+			return mcp.NewToolResultJSON(rejected)
 		}
 
-		// Mirror the freshly-provisioned config into the local registry
-		// so /device/<id>/sync recognises the device on first poll. We
-		// only do this when the caller actually sent broker_url + psk_hex;
-		// a partial provision (e.g. only city) is meant for an already
-		// registered device.
-		var registryErr error
-		var registered, reregistered bool
-		if d.Registry != nil && brokerURL != "" && pskHex != "" {
+		// Mirror the enrolment into the local registry so /device/<id>/sync
+		// recognises the device on first poll. This keys on the PSK that was
+		// pushed, NOT on broker_url: the device finds the broker by mDNS, so
+		// an enrolment with no address is the normal case, not a partial one.
+		var registered, reregistered, enrolled bool
+		note := noRegistryNote(d, req, pskHex)
+		if d.Registry != nil && pskHex != "" {
 			reg := registry.ConfigPayload{
 				BrokerURL: brokerURL,
 				PSKHex:    pskHex,
@@ -393,25 +415,7 @@ func handleProvision(d Deps) server.ToolHandlerFunc {
 					Gemini: registry.ProviderModeFromBool(payload.Providers["gemini"]),
 				}
 			}
-			_, err := d.Registry.Register(deviceID, reg)
-			switch {
-			case err == nil:
-				registered = true
-			case strings.Contains(err.Error(), "already exists"):
-				// Device was re-provisioned (e.g. user wiped NVS and started
-				// over). The device has ALREADY applied the new broker_url+psk
-				// locally and proved presence with the pairing code, so converge
-				// the active config in place rather than queuing a pending the
-				// wiped device can neither decrypt nor promote. Preserves
-				// device-level metadata (serial, SKU, channel, …). See #8.
-				if _, perr := d.Registry.ReplaceActive(deviceID, reg); perr != nil {
-					registryErr = fmt.Errorf("re-register failed: %w", perr)
-				} else {
-					reregistered = true
-				}
-			default:
-				registryErr = err
-			}
+			registered, reregistered, enrolled, note = mirrorToRegistry(d, deviceID, reg, callerURL)
 		}
 
 		out := struct {
@@ -419,20 +423,29 @@ func handleProvision(d Deps) server.ToolHandlerFunc {
 			DeviceID     string `json:"device_id"`
 			Registered   bool   `json:"registered"`
 			Reregistered bool   `json:"reregistered,omitempty"`
+			Enrolled     bool   `json:"enrolled"`
 			PSKGenerated bool   `json:"psk_generated,omitempty"`
 			PSKReused    bool   `json:"psk_reused,omitempty"`
+			PSKHex       string `json:"psk_hex,omitempty"`
+			Seeded       string `json:"broker_url_seeded,omitempty"`
 			Note         string `json:"note,omitempty"`
 			DeviceResp   any    `json:"device_response,omitempty"`
 		}{
+			Seeded:       seeded,
 			OK:           true,
 			DeviceID:     deviceID,
 			Registered:   registered,
 			Reregistered: reregistered,
+			Enrolled:     enrolled,
 			PSKGenerated: pskGenerated,
 			PSKReused:    pskReused,
+			Note:         note,
 		}
-		if registryErr != nil {
-			out.Note = "device provisioned but registry write failed: " + registryErr.Error()
+		if pskGenerated && !enrolled {
+			// The device now signs with a key that exists nowhere on this
+			// host. Hand it back, or the only way out is a factory reset.
+			out.PSKHex = pskHex
+			out.Note = joinNotes(note, notePSKUnrecorded)
 		}
 		var parsed map[string]any
 		if json.Unmarshal(respBody, &parsed) == nil {

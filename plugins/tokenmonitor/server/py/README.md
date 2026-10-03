@@ -1,7 +1,9 @@
 # tokenmonitor-mcp-py
 
 Python port of `tokenmonitor-mcp` with byte-exact parity to the Go reference
-impl on every wire and storage contract documented under `../compat/`.
+impl on every wire and storage contract documented under `compat/` at the
+root of the TokenMonitor repository (the plugin vendors only
+`../compat/tool-schemas.json` from it).
 
 ## Install
 
@@ -22,7 +24,7 @@ tokenmonitor-mcp-py               # MCP stdio + lease for the shared daemon
 ```
 
 Config lives at `~/.config/tokenmonitor/tokenmonitor.toml`; the schema
-matches the Go impl (see `../compat/`). You don't have to create it — the first
+matches the Go impl (see the repository-root `compat/`). You don't have to create it — the first
 start writes a working default there (0600, random `psk_passphrase`) rather than
 exiting, so a fresh install still reaches MCP "ready". A config that exists but
 carries no PSK gets a generated fallback key in a `psk` sidecar beside it rather
@@ -40,5 +42,7 @@ pip install -e . pytest pytest-asyncio
 pytest
 ```
 
-Tests validate against the shared vectors in `../compat/vectors/` and
-the goldens in `../compat/registry/golden/`.
+Tests validate against the shared vectors in `compat/vectors/` and the goldens
+in `compat/registry/golden/`, both at the root of the TokenMonitor repository
+(found by walking up from the test file; those tests skip in a standalone
+checkout of the plugin).

@@ -2,10 +2,10 @@
 // go/internal/mcp/usb.go EXACTLY. USB is the developer / rescue /
 // reconfiguration path (the consumer path stays SoftAP + LAN).
 
-import { randomBytes } from "node:crypto";
-
 import { validDeviceID, providerModeFromBool } from "../registry/store.js";
+import { resolveEnrolPSK, explicitPSK, noRegistryNote, mirrorToRegistry, joinNotes, fwFindsBrokerAlone, seedURLFromHint, NOTE_PSK_UNRECORDED, NOTE_PSK_MAYBE_LIVE, NOTE_PSK_UNKNOWN } from "./enrol.js";
 import { enumerate, EnumerateUnsupportedError } from "../usbprov/enum.js";
+import { PAYLOAD_MAX } from "../usbprov/frame.js";
 import { resolve as resolvePorts, registryMatches } from "../usbprov/scan.js";
 import { TIER_PROBE } from "../usbprov/usbids.js";
 import { LeaseClient, anySignal } from "../usbprov/leaseclient.js";
@@ -44,11 +44,14 @@ function registeredSKUs(deps) {
 }
 
 // brokerBaseURL is the loopback URL of this host's broker, for the lease
-// client (a 0.0.0.0/"" bind is dialled as 127.0.0.1).
+// client. The lease endpoints are loopback-only (they reject any non-loopback
+// peer REGARDLESS of the broker's bind), so this must ALWAYS dial 127.0.0.1 —
+// never the configured LAN bind, whose self-connection would present a
+// non-loopback source and be rejected 403. A broker bound to 0.0.0.0 also
+// listens on loopback; one bound only to a specific LAN IP is simply
+// unreachable here, and openLeased then falls back to a direct exclusive open.
 function brokerBaseURL(deps) {
-  let host = deps.cfg.server.bind;
-  if (host === "0.0.0.0" || !host) host = "127.0.0.1";
-  return `http://${host}:${deps.cfg.server.port}`;
+  return `http://127.0.0.1:${deps.cfg.server.port}`;
 }
 
 function leaseAndOpen(deps, port, signal) {
@@ -102,6 +105,7 @@ export async function handleUSBScan(deps, args) {
         e.device_id = dev.deviceID;
         if (dev.fw) e.fw = dev.fw;
         if (dev.state) e.state = dev.state;
+        if (dev.hasPSK !== undefined) e.has_psk = dev.hasPSK;
         if (dev.sku) e.sku = dev.sku;
       } catch (perr) {
         e.probe_error = perr.message;
@@ -121,13 +125,19 @@ async function probePort(deps, port, timeoutMs) {
     const sessSignal = anySignal([lp.lostSignal]);
     const to = defaultTimeouts();
     to.helloResp = timeoutMs;
+    // A scan sends exactly ONE bounded HELLO (PROVISION_WIRE §5). The default
+    // 5 tries would cost 5×timeout per silent port — a single non-TokenMonitor
+    // ESP32 devkit on the desk would then blow the 10s Codex tool budget.
+    to.helloTries = 1;
     return await identify(lp.handle.conn, to, sessSignal);
   } finally {
     lp.close();
   }
 }
 
-export async function handleUSBProvision(deps, args) {
+// candidates are the provision hint's URLs (server.js owns the interface
+// walk), used to seed a broker_url for firmware that cannot find the broker.
+export async function handleUSBProvision(deps, args, candidates = []) {
   // The cable is the physical-presence proof, so the device's serial transport
   // never demands a code. Accept an absent one; still reject a malformed one,
   // because a caller that bothered to pass a code has the device's screen in
@@ -147,12 +157,6 @@ export async function handleUSBProvision(deps, args) {
     try {
       ports = enumerate();
     } catch (e) {
-      if (e instanceof EnumerateUnsupportedError) {
-        return {
-          error:
-            "USB provisioning is not supported on this OS yet (Linux and macOS are supported; Windows is deferred). Use SoftAP + LAN provisioning instead.",
-        };
-      }
       return { error: `usb enumerate: ${e.message}` };
     }
     const matches = registryMatches(resolvePorts(ports, registeredSKUs(deps)));
@@ -170,111 +174,185 @@ export async function handleUSBProvision(deps, args) {
   }
 
   // Build the PROVISION payload — the SAME JSON POST /provision accepts.
-  const built = buildUSBPayload(deps, args, code, expectID);
+  // This is everything the arguments alone decide; the PSK and a seeded
+  // broker_url are added once the device has said who it is (below).
+  const built = buildUSBPayload(args, code);
   if (built.error) return { error: built.error };
-  const { payload, pskHex, pskGenerated, pskReused } = built;
+  const base = built.payload;
 
-  const body = Buffer.from(JSON.stringify(payload), "utf8");
+  // Validate the encoded size HERE, before leasing or opening anything. An
+  // over-cap payload fails inside the PROVISION send, which is reported as
+  // outcome-unknown — but zero bytes have left the host, so it is a pure
+  // client-side error.
+  const baseLen = encodePayload(base).length;
+  if (baseLen > PAYLOAD_MAX) return { error: payloadTooBig(baseLen) };
 
   let lp;
   try {
     lp = await leaseAndOpen(deps, port, undefined);
   } catch (e) {
     if (e instanceof LeaseBusyError) {
-      return { ok: false, error: "the serial port is leased by another provisioning session; retry shortly" };
+      return { error: "the serial port is leased by another provisioning session; retry shortly" };
     }
     if (e instanceof PortBusyError) {
-      return { ok: false, error: "the serial port is held by another process; close other serial monitors and retry" };
+      return { error: "the serial port is held by another process; close other serial monitors and retry" };
     }
-    return { ok: false, error: `open serial port: ${e.message}` };
+    return { error: `open serial port: ${e.message}` };
   }
 
+  // What may be sent depends on the HELLO_RESP — which device this is, whether
+  // it already holds a PSK, whether its firmware can find the broker without
+  // an address — so the payload is finished inside the session, after the
+  // handshake and before any PROVISION write.
+  let fin = null;
   let res;
   try {
     const sessSignal = anySignal([lp.lostSignal]);
-    res = await runProvision(lp.handle.conn, { provisionJSON: body, expectDeviceID: expectID, signal: sessSignal });
+    res = await runProvision(lp.handle.conn, {
+      expectDeviceID: expectID,
+      finalize: (dev) => {
+        // A re-handshake (pre-PROVISION reset recovery) must resend the same
+        // bytes — in particular the same minted PSK.
+        if (fin && fin.deviceID === dev.deviceID) return fin.body;
+        const f = finalizeUSBPayload(deps, args, base, dev, candidates);
+        if (f.error) throw new USBRefusal(f.error);
+        fin = f;
+        return f.body;
+      },
+      signal: sessSignal,
+    });
   } catch (runErr) {
-    return usbProvisionErrorReport(runErr);
+    if (runErr instanceof USBRefusal) return { error: runErr.message };
+    return usbProvisionErrorReport(runErr, fin?.pskHex ?? "", fin?.pskGenerated ?? false);
   } finally {
     lp.close();
   }
 
-  // The device applied and returned a RESULT. Its device_id is authoritative.
+  return usbProvisionReport(deps, res, fin, noRegistryNote(deps, args, fin.pskHex));
+}
+
+// USBRefusal is a decision NOT to provision, taken after the handshake and
+// before any PROVISION write. It surfaces as a plain tool error.
+class USBRefusal extends Error {}
+
+// encodePayload is the PROVISION body, byte for byte what Go's json.Marshal
+// produces: JSON.stringify is already compact and leaves non-ASCII as UTF-8,
+// but Go additionally writes the five characters < > & U+2028 U+2029 as
+// \\uXXXX. They can only occur inside strings, so a plain replace is safe.
+// Without it a city like "Tom & Jerry" would put different bytes (and a
+// different size) on the wire than the Go runtime.
+const GO_JSON_ESCAPES = { "<": "\\u003c", ">": "\\u003e", "&": "\\u0026", "\u2028": "\\u2028", "\u2029": "\\u2029" };
+export function encodePayload(payload) {
+  return Buffer.from(JSON.stringify(payload).replace(/[<>&\u2028\u2029]/g, (c) => GO_JSON_ESCAPES[c]), "utf8");
+}
+
+function payloadTooBig(n) {
+  return `provisioning payload is ${n} bytes, over the ${PAYLOAD_MAX}-byte device limit; shorten fields such as city`;
+}
+
+// finalizeUSBPayload completes the payload for the device that answered the
+// HELLO: the PSK (resolveEnrolPSK, with the device's own has_psk as evidence)
+// and, for firmware that cannot find the broker by itself, a broker_url.
+// candidates are the provision hint's URLs. Returns { deviceID, payload, body,
+// pskHex, pskGenerated, pskReused, callerURL, seeded } or { error } — a
+// refusal: nothing has been written and nothing will be.
+export function finalizeUSBPayload(deps, args, base, dev, candidates) {
+  const callerURL = !!base.broker_url;
+  const psk = resolveEnrolPSK(deps, args, dev.deviceID, dev.hasPSK);
+  if (psk.error) return { error: psk.error };
+  let brokerURL = base.broker_url || "";
+  let seeded = "";
+  // A PSK with no address strands firmware older than 1.0.0 on "Waiting for
+  // setup". Over the cable there is no route to read an address off, so the
+  // provision hint is used — but only when it names exactly one.
+  if (psk.pskHex && !callerURL && !fwFindsBrokerAlone(dev.fw)) {
+    const seed = seedURLFromHint(dev.fw, candidates);
+    if (seed.error) return { error: seed.error };
+    seeded = seed.url;
+    brokerURL = seeded;
+  }
+  // Same key order as the Go struct, so the bytes on the wire are identical.
+  const payload = {};
+  if ("pairing_code" in base) payload.pairing_code = base.pairing_code;
+  if (brokerURL) payload.broker_url = brokerURL;
+  if (psk.pskHex) payload.psk_hex = psk.pskHex;
+  for (const [k, v] of Object.entries(base)) {
+    if (k !== "pairing_code" && k !== "broker_url" && k !== "psk_hex") payload[k] = v;
+  }
+  const body = encodePayload(payload);
+  if (body.length > PAYLOAD_MAX) return { error: payloadTooBig(body.length) };
+  return { deviceID: dev.deviceID, payload, body, pskHex: psk.pskHex, pskGenerated: psk.pskGenerated, pskReused: psk.pskReused, callerURL, seeded };
+}
+
+// usbProvisionReport turns a received RESULT into the tool result. A RESULT is
+// only the device ANSWERING — success and error alike arrive as one
+// (PROVISION_WIRE §3) — so top-level ok is the device's own `ok`, and the
+// registry is mirrored only when the device says it applied the payload.
+export function usbProvisionReport(deps, res, fin, note = "") {
+  const { pskHex, pskGenerated, pskReused } = fin;
+  // The device_id echoed in HELLO_RESP is authoritative — use it for the
+  // registry mirror below.
   const deviceID = res.device.deviceID;
   let deviceResp;
   try {
-    deviceResp = JSON.parse(res.resultJSON.toString("utf8"));
+    const parsed = JSON.parse(res.resultJSON.toString("utf8"));
+    // Only surface an object, like Go's map[string]any unmarshal — a bare
+    // array/string/number RESULT is dropped rather than echoed.
+    deviceResp = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : undefined;
   } catch {
     deviceResp = undefined;
   }
+  const applied = deviceResp !== undefined && deviceResp.ok === true;
 
-  const out = { ok: true, device_id: deviceID, registered: false };
+  const out = { ok: applied };
+  if (!applied) {
+    const msg = deviceResp?.error;
+    out.error = typeof msg === "string" && msg ? msg : "device rejected the provisioning payload";
+  }
+  out.device_id = deviceID;
+  out.registered = false;
+  out.enrolled = false;
   if (res.device.sku) out.sku = res.device.sku;
   if (res.device.fw) out.fw = res.device.fw;
   if (pskGenerated) out.psk_generated = true;
   if (pskReused) out.psk_reused = true;
+  if (fin.seeded) out.broker_url_seeded = fin.seeded;
   if (deviceResp !== undefined) out.device_response = deviceResp;
-
-  // Mirror into the registry only when broker_url + psk were pushed and the
-  // device_id is well-formed.
-  if (deps.registry && payload.broker_url && pskHex && validDeviceID(deviceID)) {
-    const m = mirrorToRegistry(deps, deviceID, payload, pskHex);
-    if (m.registered) out.registered = true;
-    if (m.reregistered) out.reregistered = true;
-    if (m.note) out.note = m.note;
+  if (!applied) {
+    if (pskGenerated) {
+      out.psk_hex = pskHex;
+      out.note = NOTE_PSK_MAYBE_LIVE;
+    }
+    return out;
   }
 
+  // Mirror the enrolment into the registry whenever a PSK was pushed and the
+  // device_id is well-formed — with or without a broker_url. enroll=false
+  // pushed none and leaves the registry untouched.
+  if (deps.registry && pskHex && validDeviceID(deviceID)) {
+    const m = mirrorToRegistry(deps, deviceID, usbRegistryPayload(fin.payload, pskHex), fin.callerURL);
+    out.registered = m.registered;
+    if (m.reregistered) out.reregistered = true;
+    out.enrolled = m.enrolled;
+    note = m.note;
+  }
+  if (pskGenerated && !out.enrolled) {
+    out.psk_hex = pskHex;
+    note = joinNotes(note, NOTE_PSK_UNRECORDED);
+  }
+  if (note) out.note = note;
   return out;
 }
 
-// buildUSBPayload assembles the PROVISION JSON from the tool args, including the
-// WiFi pair and PSK reuse/gen. Returns { payload, pskHex, pskGenerated,
-// pskReused } or { error }.
-export function buildUSBPayload(deps, args, code, expectID) {
+// buildUSBPayload assembles the part of the PROVISION JSON the tool args alone
+// decide, including the WiFi pair. An explicit psk_hex is validated here; which
+// PSK is finally sent is finalizeUSBPayload's call. Returns { payload } or
+// { error }.
+export function buildUSBPayload(args, code) {
   const brokerURL = String(args.broker_url ?? "").trim();
-  let pskHex = String(args.psk_hex ?? "").trim().toLowerCase();
-  let pskGenerated = false;
-  let pskReused = false;
-  if (pskHex) {
-    if (pskHex.length !== 64) return { error: "psk_hex must be 64 hex chars" };
-    if (!/^[0-9a-f]{64}$/.test(pskHex)) return { error: "psk_hex is not valid hex" };
-  } else if (brokerURL && expectID) {
-    // No PSK supplied but a broker is being (re)set: reuse the device's
-    // existing registry PSK so the two never drift, else mint a fresh one.
-    let existing = "";
-    if (deps.registry) {
-      try {
-        existing = deps.registry.load(expectID)?.active?.payload?.psk_hex || "";
-      } catch {
-        /* NotFound → new device */
-      }
-    }
-    if (existing) {
-      pskHex = existing;
-      pskReused = true;
-    } else {
-      // Registry-less (legacy global-PSK) mode cannot persist a minted
-      // per-device PSK — it would be lost the instant this call returns and
-      // orphan the device (it signs with a key nobody has). Require an
-      // explicit psk_hex there instead of silently generating one.
-      if (!deps.registry) {
-        return {
-          error:
-            "setting broker_url over USB without a device registry needs an explicit psk_hex (a generated PSK cannot be persisted here and would orphan the device)",
-        };
-      }
-      pskHex = randomBytes(32).toString("hex");
-      pskGenerated = true;
-    }
-  }
-  // A broker_url with no PSK to sign with is a dead config: it can only be
-  // resolved when we know which device this is.
-  if (brokerURL && !pskHex) {
-    return {
-      error:
-        "setting broker_url over USB needs device_id (so the device's PSK can be reused/derived) or an explicit psk_hex",
-    };
-  }
+  const psk = explicitPSK(args);
+  if (psk.error) return { error: psk.error };
+  const { pskHex } = psk;
 
   const payload = {};
   if (code) payload.pairing_code = code;
@@ -301,13 +379,15 @@ export function buildUSBPayload(deps, args, code, expectID) {
   const hasAnti = "provider_antigravity" in args;
   const hasGemini = "provider_gemini" in args;
   if (hasClaude || hasCodex || hasAnti || hasGemini) {
+    // Emit the current "antigravity" wire key (PROVISION_WIRE §3). Every
+    // firmware with a serial transport accepts it (the rename predates the
+    // transport). Keys go in sorted order — the order Go's json.Marshal gives
+    // a map — so all three runtimes put the same bytes on the wire.
     const p = {
+      antigravity: hasAnti ? !!args.provider_antigravity : !!args.provider_gemini,
       claude: !!args.provider_claude,
       codex: !!args.provider_codex,
     };
-    // Antigravity (formerly Gemini): prefer the new arg, fall back to the
-    // deprecated provider_gemini. Internal key stays "gemini".
-    p.gemini = hasAnti ? !!args.provider_antigravity : !!args.provider_gemini;
     payload.providers = p;
   }
 
@@ -324,31 +404,42 @@ export function buildUSBPayload(deps, args, code, expectID) {
   if (hasSSID) {
     const ssid = String(args.wifi_ssid ?? "");
     const pass = String(args.wifi_pass ?? "");
-    if (ssid === "") return { error: "wifi_ssid must be 1..32 bytes" };
+    // Length is in UTF-8 BYTES, not code points (PROVISION_WIRE §7): the
+    // schema's maxLength counts characters, so a 32-CHARACTER SSID of multibyte
+    // glyphs passes it and is then rejected by firmware as BODY_BAD_WIFI after
+    // a whole lease + serial session was spent.
+    if (ssid === "" || Buffer.byteLength(ssid, "utf8") > 32) {
+      return { error: "wifi_ssid must be 1..32 bytes (UTF-8 bytes, not characters)" };
+    }
+    if (Buffer.byteLength(pass, "utf8") > 64) {
+      return { error: "wifi_pass must be at most 64 bytes (UTF-8 bytes, not characters)" };
+    }
     payload.wifi_ssid = ssid;
     payload.wifi_pass = pass;
   }
 
-  return { payload, pskHex, pskGenerated, pskReused };
+  return { payload };
 }
 
 function numPresent(v) {
   return v != null && v !== "" && Number.isFinite(Number(v));
 }
 
-// mirrorToRegistry converges the local registry to the just-applied config,
-// matching provisionTool's register→replaceActive fallback.
-function mirrorToRegistry(deps, deviceID, payload, pskHex) {
+// usbRegistryPayload lifts the just-applied USB payload into the registry's
+// config shape, matching provisionTool's lift.
+function usbRegistryPayload(payload, pskHex) {
   const regModes = payload.providers
     ? {
         claude: providerModeFromBool(!!payload.providers.claude),
         codex: providerModeFromBool(!!payload.providers.codex),
-        gemini: providerModeFromBool(!!payload.providers.gemini),
+        // The USB payload carries the "antigravity" wire key; the registry's
+        // internal name for that provider is still gemini.
+        gemini: providerModeFromBool(!!payload.providers.antigravity),
       }
     : null;
-  const regPayload = {
+  return {
     version: 0,
-    broker_url: payload.broker_url,
+    broker_url: payload.broker_url || "",
     psk_hex: pskHex,
     city: payload.city || "",
     br_day: payload.br_day || 0,
@@ -362,28 +453,27 @@ function mirrorToRegistry(deps, deviceID, payload, pskHex) {
     pet_enabled: "pet_enabled" in payload ? payload.pet_enabled : null,
     panel_enabled: null,
   };
-  try {
-    deps.registry.register(deviceID, regPayload);
-    return { registered: true };
-  } catch (e) {
-    if (/already exists/.test(e.message)) {
-      try {
-        deps.registry.replaceActive(deviceID, regPayload);
-        return { reregistered: true };
-      } catch (e2) {
-        return { note: `device provisioned but registry re-register failed: ${e2.message}` };
-      }
-    }
-    return { note: `device provisioned but registry write failed: ${e.message}` };
-  }
 }
 
 // usbProvisionErrorReport maps a session error to a structured tool result. The
 // outcome-unknown case is called out explicitly so the model does NOT blindly
 // re-run.
-export function usbProvisionErrorReport(err) {
+//
+// pskHex/pskGenerated surface a freshly-minted PSK on the outcome-unknown path:
+// the device MAY have committed it, but the registry was NOT updated (we don't
+// know it applied), so without this the device could end up signing with a key
+// nobody on the host has. A reused/existing PSK is already persisted, so it is
+// not echoed.
+export function usbProvisionErrorReport(err, pskHex = "", pskGenerated = false) {
   const rep = { ok: false, error: err.message };
-  if (err instanceof OutcomeUnknownError) rep.outcome_unknown = true;
-  else if (err instanceof DeviceMismatchError) rep.device_mismatch = true;
+  if (err instanceof OutcomeUnknownError) {
+    rep.outcome_unknown = true;
+    if (pskGenerated) {
+      rep.psk_hex = pskHex;
+      rep.note = NOTE_PSK_UNKNOWN;
+    }
+  } else if (err instanceof DeviceMismatchError) {
+    rep.device_mismatch = true;
+  }
   return rep;
 }

@@ -39,7 +39,12 @@ class FakeDevice:
         send_ack: bool = True,
         result_mode: str = "normal",  # normal | drop_all | drop_first
         drop_hello_resp: int = 0,
+        fw_version: str = "1.0.2",
+        has_psk: bool | None = None,  # None = the firmware predates has_psk and omits it
     ) -> None:
+        self.fw_version = fw_version
+        self.has_psk = has_psk
+        self.last_payload: bytes | None = None
         self.device_id = device_id
         self.proto_ver = proto_ver
         self.nonce = nonce
@@ -97,14 +102,17 @@ class FakeDevice:
             if self.drop_hello_resp > 0:
                 self.drop_hello_resp -= 1
                 return
-            desc = json.dumps(
-                {
-                    "device_id": self.device_id,
-                    "sku": "S1",
-                    "fw": "1.2.3",
-                    "state": "BOOT_NEEDS_CONFIG",
-                    "proto_ver": self.proto_ver,
-                }
+            # The HELLO_RESP body byte for byte as transport_serial.c's
+            # op_describe formats it. Note the key is fw_version, and `state`
+            # is the session's done latch ("needs_config" on every HELLO,
+            # paired or not).
+            psk = ""
+            if self.has_psk is not None:
+                psk = ',"has_psk":true' if self.has_psk else ',"has_psk":false'
+            desc = (
+                f'{{"device_id":"{self.device_id}","fw_version":"{self.fw_version}",'
+                f'"serial":"TM-S1-DEV-2609-{self.device_id}","sku":"S1","serial_factory":false,'
+                f'"state":"needs_config","proto_ver":{self.proto_ver}{psk}}}'
             ).encode("utf-8")
             self._emit(encode(MSG_HELLO_RESP, f.seq, self.nonce, desc))
         elif f.type == MSG_SESSION_BEGIN:
@@ -114,6 +122,7 @@ class FakeDevice:
             if f.nonce != self.nonce:
                 return
             self.provision_recv += 1
+            self.last_payload = bytes(f.payload)
             cached = self._result_cache.get(f.seq)
             if cached is not None:
                 # Retransmission: replay cache, do NOT re-apply. drop_all models a
@@ -169,6 +178,58 @@ def test_device_id_mismatch_writes_nothing():
             ),
         )
     assert dev.provision_recv == 0 and dev.apply_count == 0
+
+
+def test_hello_resp_as_firmware_sends_it():
+    # The firmware has always called the version field fw_version; hosts that
+    # read only "fw" saw every device as version-less. has_psk is optional and
+    # three-valued: absent means unknown, never false.
+    for fw, has_psk in [("0.11.0", None), ("0.12.0", None), ("1.0.1", None), ("1.0.2", False), ("1.0.2", True)]:
+        dev = FakeDevice(fw_version=fw, has_psk=has_psk)
+        res = ses.run_provision(dev, ses.ProvisionOpts(provision_json=b"{}", timeouts=_fast_timeouts()))
+        d = res.device
+        assert d.fw == fw and d.sku == "S1" and d.state == "needs_config"
+        assert d.has_psk is has_psk
+
+
+def test_finalize_builds_the_payload_from_the_hello_resp():
+    dev = FakeDevice(fw_version="0.12.0")
+    ses.run_provision(
+        dev,
+        ses.ProvisionOpts(
+            provision_json=b'{"never":"sent"}',
+            finalize=lambda d: json.dumps({"for": d.device_id, "fw": d.fw}).encode(),
+            timeouts=_fast_timeouts(),
+        ),
+    )
+    assert json.loads(dev.last_payload) == {"for": "03abcdef", "fw": "0.12.0"}
+
+
+def test_finalize_refusal_aborts_before_write():
+    class Refused(Exception):
+        pass
+
+    def _refuse(d):
+        raise Refused("not this device")
+
+    dev = FakeDevice()
+    with pytest.raises(Refused):
+        ses.run_provision(dev, ses.ProvisionOpts(finalize=_refuse, timeouts=_fast_timeouts()))
+    assert dev.provision_recv == 0 and dev.apply_count == 0
+
+
+def test_hello_resp_wrong_typed_has_psk_is_noise():
+    f = _hello_resp_frame(0x1111, 0, {"device_id": "03abcdef", "proto_ver": 1, "has_psk": "yes"})
+    assert ses._parse_hello_resp(f, 0) is None
+    f = _hello_resp_frame(0x1111, 0, {"device_id": "03abcdef", "proto_ver": 1, "fw": "1.0.0"})
+    assert ses._parse_hello_resp(f, 0).fw == "1.0.0"  # the documented-but-never-sent alias
+    # A JSON null string field is the zero value, as in Go and JS — not noise.
+    f = _hello_resp_frame(
+        0x1111, 0,
+        {"device_id": "03abcdef", "proto_ver": 1, "sku": None, "fw_version": None, "state": None},
+    )
+    d = ses._parse_hello_resp(f, 0)
+    assert d is not None and d.sku == "" and d.fw == "" and d.state == ""
 
 
 def test_hello_retry_recovers():

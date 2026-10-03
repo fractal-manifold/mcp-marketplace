@@ -146,16 +146,29 @@ func TestValidDeviceID(t *testing.T) {
 	}
 }
 
-func TestRegister_RequiresPSKAndURL(t *testing.T) {
+func TestRegister_RequiresPSKOnly(t *testing.T) {
 	r := newReg(t)
 	if _, err := r.Register(testID, ConfigPayload{BrokerURL: "x"}); err == nil {
 		t.Fatal("expected error without psk")
 	}
-	if _, err := r.Register(testID, ConfigPayload{PSKHex: testPSK}); err == nil {
-		t.Fatal("expected error without broker_url")
-	}
 	if _, err := r.Register(testID, ConfigPayload{PSKHex: "short", BrokerURL: "x"}); err == nil {
 		t.Fatal("expected error on bad psk length")
+	}
+	// broker_url is optional: the device resolves its broker by mDNS, so a
+	// record with a PSK and no address is a complete enrolment — and it must
+	// survive the TOML round trip and a later in-place replace.
+	if _, err := r.Register(testID, ConfigPayload{PSKHex: testPSK}); err != nil {
+		t.Fatalf("register without broker_url: %v", err)
+	}
+	dev, err := r.Load(testID)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if dev.Active.PSKHex != testPSK || dev.Active.BrokerURL != "" {
+		t.Errorf("round trip: psk=%q broker_url=%q", dev.Active.PSKHex, dev.Active.BrokerURL)
+	}
+	if _, err := r.ReplaceActive(testID, ConfigPayload{PSKHex: testPSK}); err != nil {
+		t.Fatalf("replace without broker_url: %v", err)
 	}
 }
 
@@ -434,8 +447,10 @@ func TestReplaceActive_ConvergesAndPreservesMetadata(t *testing.T) {
 	if dev.Active.PSKHex != newPSK || dev.Active.BrokerURL != "http://new" || dev.Active.City != "Sevilla" {
 		t.Errorf("Active not replaced: %+v", dev.Active.ConfigPayload)
 	}
-	if dev.Active.Version != 1 {
-		t.Errorf("Active.Version = %d, want 1", dev.Active.Version)
+	// The version is carried forward (the withdrawn pending was v2), never
+	// reset: a device that kept its NVS still knows the old numbers.
+	if dev.Active.Version != 2 {
+		t.Errorf("Active.Version = %d, want 2 (carried forward)", dev.Active.Version)
 	}
 	if dev.Channel != "dev" {
 		t.Errorf("device metadata (channel) lost: %q, want dev", dev.Channel)
@@ -445,8 +460,57 @@ func TestReplaceActive_ConvergesAndPreservesMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SetPending after replace: %v", err)
 	}
-	if dev.Pending == nil || dev.Pending.Version != 2 {
+	if dev.Pending == nil || dev.Pending.Version != 3 {
 		t.Errorf("post-replace pending version wrong: %+v", dev.Pending)
+	}
+}
+
+// A pending version number, once it may have been handed to a device, is never
+// used again for different content: undoing a queued pending leaves a no-op
+// pending under a new number instead of withdrawing it.
+func TestSetPending_NeverReusesAVersion(t *testing.T) {
+	r := newReg(t)
+	if _, err := r.Register(testID, ConfigPayload{PSKHex: testPSK, BrokerURL: "http://x", City: "Madrid"}); err != nil {
+		t.Fatal(err)
+	}
+	dev, _ := r.SetPending(testID, ConfigPayload{BrokerURL: "http://y"}) // v2, may reach the device
+	if dev.Pending == nil || dev.Pending.Version != 2 {
+		t.Fatalf("staging: %+v", dev.Pending)
+	}
+	dev, _ = r.SetPending(testID, ConfigPayload{BrokerURL: "http://x"}) // undo
+	if dev.Pending == nil || dev.Pending.Version != 3 || dev.Pending.BrokerURL != "http://x" {
+		t.Fatalf("an undone pending must stay queued under a new version: %+v", dev.Pending)
+	}
+	dev, _ = r.SetPending(testID, ConfigPayload{City: "Paris"}) // something else
+	if dev.Pending == nil || dev.Pending.Version != 4 {
+		t.Fatalf("version 2 must not come back: %+v", dev.Pending)
+	}
+	// An ack of a retired number promotes nothing; the live one does.
+	for _, old := range []uint32{2, 3} {
+		if promoted, _ := r.MaybePromote(testID, old, false); promoted {
+			t.Fatalf("an ack of retired version %d must not promote", old)
+		}
+	}
+	if promoted, _ := r.MaybePromote(testID, 4, false); !promoted {
+		t.Fatal("the live pending must promote")
+	}
+	// An undone pending, left alone, is delivered and promoted as a no-op.
+	r.SetPending(testID, ConfigPayload{City: "Roma"})  // v5
+	r.SetPending(testID, ConfigPayload{City: "Paris"}) // v6, equals active
+	if promoted, _ := r.MaybePromote(testID, 6, false); !promoted {
+		t.Fatal("the no-op pending must promote")
+	}
+	if dev, _ = r.Load(testID); dev.Active.Version != 6 || dev.Pending != nil || dev.Active.City != "Paris" {
+		t.Fatalf("after the no-op promote: %+v", dev.Active)
+	}
+	// A re-provision carries the highest number forward too, pending included.
+	r.SetPending(testID, ConfigPayload{City: "Oslo"}) // v7
+	dev, _ = r.ReplaceActive(testID, ConfigPayload{PSKHex: newPSK, BrokerURL: "http://z"})
+	if dev.Active.Version != 7 || dev.Pending != nil {
+		t.Fatalf("replace: active %d pending %+v", dev.Active.Version, dev.Pending)
+	}
+	if dev, _ = r.SetPending(testID, ConfigPayload{City: "Lima"}); dev.Pending == nil || dev.Pending.Version != 8 {
+		t.Fatalf("after replace: %+v", dev.Pending)
 	}
 }
 

@@ -2,8 +2,6 @@ package mcp
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,7 +23,7 @@ import (
 func registerUSBTools(s *server.MCPServer, d Deps) {
 	s.AddTool(
 		mcp.NewTool("tokenmonitor_usb_scan",
-			mcp.WithDescription("Enumerate TokenMonitor devices reachable over a USB cable and classify each by identity tier. Returns one entry per serial port with its vid/pid, iSerial, tier (registry-match | probe | shared) and - for enrolled or probed units - device_id/sku/fw/state. A `probe`-tier Espressif port (shared by every ESP32-S3/C3/C6) receives ONE bounded HELLO only during this user-initiated scan; `shared` generic-bridge ports are listed but never written to. Never auto-selects a `probe` or `shared` port. USB is the developer / rescue / reconfiguration path; the consumer path stays SoftAP + LAN (WSL2 without usbipd-win cannot see the device)."),
+			mcp.WithDescription("Enumerate TokenMonitor devices reachable over a USB cable and classify each by identity tier. Returns one entry per serial port with its vid/pid, iSerial, tier (registry-match | probe | shared) and - for enrolled or probed units - device_id/sku/fw/state. A probed unit also reports has_psk when its firmware sends it: true means the device already holds a PSK (it is paired with some broker), false that it holds none, and an absent has_psk means unknown, never false. A `probe`-tier Espressif port (shared by every ESP32-S3/C3/C6) receives ONE bounded HELLO only during this user-initiated scan; `shared` generic-bridge ports are listed but never written to. Never auto-selects a `probe` or `shared` port. USB is the developer / rescue / reconfiguration path; the consumer path stays SoftAP + LAN (WSL2 without usbipd-win cannot see the device)."),
 			mcp.WithNumber("timeout_seconds",
 				mcp.Min(1), mcp.Max(10), mcp.DefaultNumber(3),
 				mcp.Description("Per-port HELLO probe window in seconds (1..10, default 3). Kept well under the MCP tool budget (30s in Claude, 10s in Codex)."),
@@ -36,7 +34,7 @@ func registerUSBTools(s *server.MCPServer, d Deps) {
 
 	s.AddTool(
 		mcp.NewTool("tokenmonitor_usb_provision",
-			mcp.WithDescription("Configure or reconfigure a device over a USB cable, independent of the network. No pairing code is needed: the cable is the physical-presence proof, so pairing_code is optional and the device ignores it on this transport. Runs the SLIP+CRC32 serial session (HELLO -> SESSION_BEGIN -> PROVISION -> BYE) behind a leader-mediated port lease so it never collides with the broker's serial log tailer. Carries the config fields the provisioning core applies (broker_url, psk_hex, city, brightness, volume, theme, pet, providers) plus the optional WiFi pair wifi_ssid + wifi_pass, so partial payloads are allowed: sending only city preserves the broker URL and PSK, and the headline flow sends only wifi_ssid + wifi_pass to point the device at the same WiFi the computer is on (prefill wifi_ssid from the host's current network; ask the user for the password). WiFi credentials go into the device's multi-network remembered-networks store, so a USB-configured device roams like any other. On success the device persists to NVS and reboots. If broker_url + psk_hex are supplied, also registers/updates the device in the local registry. See compat/PROVISION_WIRE.md."),
+			mcp.WithDescription("Configure or reconfigure a device over a USB cable, independent of the network. No pairing code is needed: the cable is the physical-presence proof, so pairing_code is optional and the device ignores it on this transport. Runs the SLIP+CRC32 serial session (HELLO -> SESSION_BEGIN -> PROVISION -> BYE) behind a leader-mediated port lease so it never collides with the broker's serial log tailer. Carries the config fields the provisioning core applies (broker_url, psk_hex, city, brightness, volume, theme, pet, providers) plus the optional WiFi pair wifi_ssid + wifi_pass; every field is optional and an omitted one is left unchanged on the device. The headline flow sends only wifi_ssid + wifi_pass to point the device at the same WiFi the computer is on (prefill wifi_ssid from the host's current network; ask the user for the password). WiFi credentials go into the device's multi-network remembered-networks store, so a USB-configured device roams like any other.\n\nENROLMENT: the device identifies itself in the serial handshake, and what is pushed is decided from that before anything is written. A device this registry already knows is re-sent its own PSK, which changes nothing. A device it does not know is paired with this broker — given a PSK (psk_hex if supplied, else a freshly generated one) and recorded in the local registry — when it reports that it holds no PSK (has_psk=false, so a first pairing needs no extra argument), or when the call says so with enroll=true or psk_hex, or, on firmware too old to report has_psk, with broker_url. Otherwise the call is refused with nothing written: a device holding a PSK this registry has never seen is paired with another broker, and a new key would break that. enroll=false changes settings only — the WiFi-only call for a device paired elsewhere. Firmware older than 1.0.0 cannot find the broker without an address: when a PSK is pushed to it and broker_url was omitted, the one address tokenmonitor_provision_hint lists is sent with it and reported as broker_url_seeded, and the call is refused if the hint has several or none.\n\nOn success the device persists to NVS and reboots. Top-level ok mirrors the device's own answer, and a device-side error writes nothing to the registry. See compat/PROVISION_WIRE.md."),
 			mcp.WithString("port",
 				mcp.Description("Serial port path from tokenmonitor_usb_scan (e.g. /dev/ttyACM0, /dev/cu.usbmodemXXXX, COM3). Optional ONLY when exactly one registry-match device is present; otherwise required, because a probe/shared port is never auto-selected.")),
 			mcp.WithString("device_id",
@@ -46,10 +44,11 @@ func registerUSBTools(s *server.MCPServer, d Deps) {
 				mcp.Pattern("^[0-9]{6}$"),
 				mcp.Description("6-digit code shown on the device's screen. OPTIONAL over USB: plugging the cable in is itself the physical-presence proof, so the device does not require a code on the serial transport and ignores one sent anyway. Supply it only if you have it. The LAN transport (tokenmonitor_provision) still requires it. Never logged.")),
 			mcp.WithString("broker_url",
-				mcp.Description("HTTP(S) URL of the tokenmonitor-mcp broker the device should poll. Run tokenmonitor_provision_hint to learn the laptop's reachable URL on this LAN; do not assume a specific IP. If omitted, only the optional fields below are pushed.")),
+				mcp.Description("Optional: HTTP(S) URL of this broker, stored on the device as the first address to try and in the registry as the last-known address. Not needed to pair on firmware 1.0.0 or newer — the device resolves the broker by mDNS and re-resolves whenever the address changes. Required by older firmware, which cannot leave setup without one — so it is auto-seeded when omitted: when a PSK is pushed to firmware older than 1.0.0, the one address tokenmonitor_provision_hint lists is sent and reported as broker_url_seeded, and the call is refused before anything is written if the hint has several or none. If you pass one, take it from tokenmonitor_provision_hint; do not assume a specific IP. On firmware that does not report has_psk, passing one also counts as asking to pair a device this registry does not know.")),
 			mcp.WithString("psk_hex",
 				mcp.Pattern("^[0-9a-f]{64}$"),
-				mcp.Description("64-hex PSK the device should sign requests with.")),
+				mcp.Description("64-hex PSK the device should sign requests with. Optional: when omitted, the PSK this registry already holds for the device is reused, else a fresh one is generated if the call pairs the device (see enroll).")),
+			mcp.WithBoolean("enroll", mcp.Description("Whether to pair the device with this broker: push a PSK and record the device in the local registry. Omit it to let the tool decide from what it knows (see the tool description): a device this registry already knows is re-sent its own PSK, and a device it does not know is paired only when that is clearly meant — otherwise the call is refused before anything is written. true pairs the device here regardless, replacing any PSK it holds: use it for a first pairing, or to move a device over from another broker. false changes settings only, leaving the device's PSK and the registry untouched: use it for a WiFi-only or settings-only change on a device paired with a DIFFERENT broker. false cannot be combined with psk_hex.")),
 			mcp.WithString("city", mcp.Description("Optional city for ambient weather.")),
 			mcp.WithNumber("br_day", mcp.Min(10), mcp.Max(100), mcp.Description("Daytime brightness 10..100.")),
 			mcp.WithNumber("br_night", mcp.Min(5), mcp.Max(100), mcp.Description("Nighttime brightness 5..100.")),
@@ -115,6 +114,7 @@ type scanPortOut struct {
 	SKU        string `json:"sku,omitempty"`
 	FW         string `json:"fw,omitempty"`
 	State      string `json:"state,omitempty"`
+	HasPSK     *bool  `json:"has_psk,omitempty"`
 	ProbeError string `json:"probe_error,omitempty"`
 }
 
@@ -164,6 +164,7 @@ func handleUSBScan(d Deps) server.ToolHandlerFunc {
 					e.DeviceID = dev.DeviceID
 					e.FW = dev.FW
 					e.State = dev.State
+					e.HasPSK = dev.HasPSK
 					if dev.SKU != "" {
 						e.SKU = dev.SKU
 					}
@@ -265,22 +266,21 @@ func handleUSBProvision(d Deps) server.ToolHandlerFunc {
 		// Build the PROVISION payload — the SAME JSON POST /provision accepts, so
 		// the device shares all validation with the HTTP path. Pointer/omitempty
 		// fields stay absent when unset (the device treats absent as "no change").
-		payload, pskHex, pskGenerated, pskReused, errRes := buildUSBPayload(d, req, code, expectID)
+		// This is everything the arguments alone decide; the PSK and a seeded
+		// broker_url are added once the device has said who it is (below).
+		base, errRes := buildUSBPayload(req, code)
 		if errRes != nil {
 			return errRes, nil
-		}
-
-		body, err := json.Marshal(payload)
-		if err != nil {
-			return mcp.NewToolResultErrorFromErr("encode", err), nil
 		}
 		// Validate the encoded size HERE, before leasing or opening anything. An
 		// over-cap payload fails inside the PROVISION send, which wraps the error
 		// as ErrOutcomeUnknown — but zero bytes have left the host, so it is a pure
 		// client-side error. Reporting it as outcome-unknown would wrongly tell the
 		// caller the device might have applied it and to not retry.
-		if len(body) > usbprov.PayloadMax {
-			return mcp.NewToolResultError(fmt.Sprintf("provisioning payload is %d bytes, over the %d-byte device limit; shorten fields such as city", len(body), usbprov.PayloadMax)), nil
+		if body, err := json.Marshal(base); err != nil {
+			return mcp.NewToolResultErrorFromErr("encode", err), nil
+		} else if len(body) > usbprov.PayloadMax {
+			return mcp.NewToolResultError(payloadTooBig(len(body))), nil
 		}
 
 		// Lease + open + run the serial session.
@@ -299,104 +299,175 @@ func handleUSBProvision(d Deps) server.ToolHandlerFunc {
 		sessCtx, cancel := sessionContext(ctx, lp)
 		defer cancel()
 
+		// What may be sent depends on the HELLO_RESP — which device this is,
+		// whether it already holds a PSK, whether its firmware can find the
+		// broker without an address — so the payload is finished inside the
+		// session, after the handshake and before any PROVISION write.
+		candidates := hintURLs(d)
+		var fin usbFinal
 		res, runErr := usbprov.RunProvision(sessCtx, lp.Handle.Conn, usbprov.ProvisionOpts{
-			ProvisionJSON:  body,
 			ExpectDeviceID: expectID,
+			Finalize: func(dev usbprov.DeviceInfo) ([]byte, error) {
+				// A re-handshake (pre-PROVISION reset recovery) must resend the
+				// same bytes — in particular the same minted PSK.
+				if fin.body != nil && fin.deviceID == dev.DeviceID {
+					return fin.body, nil
+				}
+				f, errText := finalizeUSBPayload(d, req, base, dev, candidates)
+				if errText != "" {
+					return nil, usbRefusal(errText)
+				}
+				fin = f
+				return f.body, nil
+			},
 		})
 		if runErr != nil {
-			return mcp.NewToolResultJSON(usbProvisionErrorReport(runErr, pskHex, pskGenerated))
+			var refused usbRefusal
+			if errors.As(runErr, &refused) {
+				return mcp.NewToolResultError(string(refused)), nil
+			}
+			return mcp.NewToolResultJSON(usbProvisionErrorReport(runErr, fin.pskHex, fin.pskGenerated))
 		}
 
-		// The device applied and returned a RESULT. Its device_id is authoritative
-		// (echoed in HELLO_RESP) — use it for the registry mirror below.
-		deviceID := res.Device.DeviceID
-		var deviceResp map[string]any
-		_ = json.Unmarshal(res.ResultJSON, &deviceResp)
-
-		out := struct {
-			OK           bool           `json:"ok"`
-			DeviceID     string         `json:"device_id"`
-			SKU          string         `json:"sku,omitempty"`
-			FW           string         `json:"fw,omitempty"`
-			Registered   bool           `json:"registered"`
-			Reregistered bool           `json:"reregistered,omitempty"`
-			PSKGenerated bool           `json:"psk_generated,omitempty"`
-			PSKReused    bool           `json:"psk_reused,omitempty"`
-			Note         string         `json:"note,omitempty"`
-			DeviceResp   map[string]any `json:"device_response,omitempty"`
-		}{
-			OK:           true,
-			DeviceID:     deviceID,
-			SKU:          res.Device.SKU,
-			FW:           res.Device.FW,
-			PSKGenerated: pskGenerated,
-			PSKReused:    pskReused,
-			DeviceResp:   deviceResp,
-		}
-
-		// Mirror into the registry only when broker_url + psk were pushed and the
-		// device_id is well-formed (a partial provision — e.g. only WiFi — targets
-		// an already-enrolled device and leaves the registry untouched).
-		if d.Registry != nil && payload.BrokerURL != "" && pskHex != "" && registry.ValidDeviceID(deviceID) {
-			registered, reregistered, note := mirrorToRegistry(d, deviceID, payload, pskHex)
-			out.Registered = registered
-			out.Reregistered = reregistered
-			out.Note = note
-		}
-
-		return mcp.NewToolResultJSON(out)
+		return mcp.NewToolResultJSON(usbProvisionReport(d, res, fin, noRegistryNote(d, req, fin.pskHex)))
 	}
 }
 
-// buildUSBPayload assembles the PROVISION JSON from the tool args, including the
-// WiFi pair. It mirrors handleProvision's field handling plus PSK reuse/gen, and
-// enforces the wifi_ssid⇄wifi_pass togetherness rule (a bare wifi_ssid is an
-// error, and an OMITTED wifi_pass while wifi_ssid is present is NOT an open
-// network — only an explicit empty string is).
-func buildUSBPayload(d Deps, req mcp.CallToolRequest, code, expectID string) (usbProvisionPayload, string, bool, bool, *mcp.CallToolResult) {
+// usbRefusal is a decision NOT to provision, taken after the handshake and
+// before any PROVISION write. It surfaces as a plain tool error.
+type usbRefusal string
+
+func (r usbRefusal) Error() string { return string(r) }
+
+func payloadTooBig(n int) string {
+	return fmt.Sprintf("provisioning payload is %d bytes, over the %d-byte device limit; shorten fields such as city", n, usbprov.PayloadMax)
+}
+
+// usbFinal is the payload as it actually goes on the wire, with what was
+// decided on the way.
+type usbFinal struct {
+	deviceID     string
+	payload      usbProvisionPayload
+	body         []byte
+	pskHex       string
+	pskGenerated bool
+	pskReused    bool
+	callerURL    bool   // the caller supplied broker_url
+	seeded       string // the broker_url this host added, if any
+}
+
+// finalizeUSBPayload completes the payload for the device that answered the
+// HELLO: the PSK (resolveEnrolPSK, with the device's own has_psk as evidence)
+// and, for firmware that cannot find the broker by itself, a broker_url.
+// candidates are the provision hint's URLs. A non-empty errText is a refusal:
+// nothing has been written and nothing will be.
+func finalizeUSBPayload(d Deps, req mcp.CallToolRequest, base usbProvisionPayload, dev usbprov.DeviceInfo, candidates []string) (usbFinal, string) {
+	f := usbFinal{deviceID: dev.DeviceID, payload: base, callerURL: base.BrokerURL != ""}
+	var errText string
+	f.pskHex, f.pskGenerated, f.pskReused, errText = resolveEnrolPSK(d, req, dev.DeviceID, dev.HasPSK)
+	if errText != "" {
+		return usbFinal{}, errText
+	}
+	f.payload.PSKHex = f.pskHex
+	// A PSK with no address strands firmware older than 1.0.0 on "Waiting for
+	// setup". Over the cable there is no route to read an address off, so the
+	// provision hint is used — but only when it names exactly one.
+	if f.pskHex != "" && !f.callerURL && !fwFindsBrokerAlone(dev.FW) {
+		if f.seeded, errText = seedURLFromHint(dev.FW, candidates); errText != "" {
+			return usbFinal{}, errText
+		}
+		f.payload.BrokerURL = f.seeded
+	}
+	body, err := json.Marshal(f.payload)
+	if err != nil {
+		return usbFinal{}, "encode: " + err.Error()
+	}
+	if len(body) > usbprov.PayloadMax {
+		return usbFinal{}, payloadTooBig(len(body))
+	}
+	f.body = body
+	return f, ""
+}
+
+// usbProvisionOut is the usb_provision result once a RESULT frame came back.
+type usbProvisionOut struct {
+	OK           bool           `json:"ok"`
+	Error        string         `json:"error,omitempty"`
+	DeviceID     string         `json:"device_id"`
+	SKU          string         `json:"sku,omitempty"`
+	FW           string         `json:"fw,omitempty"`
+	Registered   bool           `json:"registered"`
+	Reregistered bool           `json:"reregistered,omitempty"`
+	Enrolled     bool           `json:"enrolled"`
+	PSKGenerated bool           `json:"psk_generated,omitempty"`
+	PSKReused    bool           `json:"psk_reused,omitempty"`
+	PSKHex       string         `json:"psk_hex,omitempty"`
+	Seeded       string         `json:"broker_url_seeded,omitempty"`
+	Note         string         `json:"note,omitempty"`
+	DeviceResp   map[string]any `json:"device_response,omitempty"`
+}
+
+// usbProvisionReport turns a received RESULT into the tool result. A RESULT is
+// only the device ANSWERING — success and error alike arrive as one
+// (PROVISION_WIRE §3) — so top-level ok is the device's own `ok`, and the
+// registry is mirrored only when the device says it applied the payload.
+func usbProvisionReport(d Deps, res *usbprov.ProvisionResult, fin usbFinal, note string) usbProvisionOut {
+	// The device_id echoed in HELLO_RESP is authoritative — use it for the
+	// registry mirror below.
+	deviceID := res.Device.DeviceID
+	var deviceResp map[string]any
+	_ = json.Unmarshal(res.ResultJSON, &deviceResp)
+	applied, _ := deviceResp["ok"].(bool)
+
+	out := usbProvisionOut{
+		OK:           applied,
+		DeviceID:     deviceID,
+		SKU:          res.Device.SKU,
+		FW:           res.Device.FW,
+		PSKGenerated: fin.pskGenerated,
+		PSKReused:    fin.pskReused,
+		Seeded:       fin.seeded,
+		DeviceResp:   deviceResp,
+	}
+	if !applied {
+		out.Error = "device rejected the provisioning payload"
+		if msg, _ := deviceResp["error"].(string); msg != "" {
+			out.Error = msg
+		}
+		if fin.pskGenerated {
+			out.PSKHex = fin.pskHex
+			out.Note = notePSKMaybeLive
+		}
+		return out
+	}
+
+	// Mirror the enrolment into the registry whenever a PSK was pushed and the
+	// device_id is well-formed — with or without a broker_url. enroll=false
+	// pushed none and leaves the registry untouched.
+	out.Note = note
+	if d.Registry != nil && fin.pskHex != "" && registry.ValidDeviceID(deviceID) {
+		out.Registered, out.Reregistered, out.Enrolled, out.Note =
+			mirrorToRegistry(d, deviceID, usbRegistryPayload(fin.payload, fin.pskHex), fin.callerURL)
+	}
+	if fin.pskGenerated && !out.Enrolled {
+		out.PSKHex = fin.pskHex
+		out.Note = joinNotes(out.Note, notePSKUnrecorded)
+	}
+	return out
+}
+
+// buildUSBPayload assembles the part of the PROVISION JSON the tool args alone
+// decide, including the WiFi pair. It mirrors handleProvision's field handling
+// and enforces the wifi_ssid⇄wifi_pass togetherness rule (a bare wifi_ssid is
+// an error, and an OMITTED wifi_pass while wifi_ssid is present is NOT an open
+// network — only an explicit empty string is). An explicit psk_hex is
+// validated here; which PSK is finally sent is finalizeUSBPayload's call.
+func buildUSBPayload(req mcp.CallToolRequest, code string) (usbProvisionPayload, *mcp.CallToolResult) {
 	args := req.GetArguments()
 	brokerURL := strings.TrimSpace(req.GetString("broker_url", ""))
-	pskHex := strings.ToLower(strings.TrimSpace(req.GetString("psk_hex", "")))
-	pskGenerated, pskReused := false, false
-	if pskHex != "" {
-		if len(pskHex) != 64 {
-			return usbProvisionPayload{}, "", false, false, mcp.NewToolResultError("psk_hex must be 64 hex chars")
-		}
-		if _, err := hex.DecodeString(pskHex); err != nil {
-			return usbProvisionPayload{}, "", false, false, mcp.NewToolResultError("psk_hex is not valid hex")
-		}
-	} else if brokerURL != "" && expectID != "" {
-		// No PSK supplied but a broker is being (re)set: reuse the device's
-		// existing registry PSK so the two never drift, else mint a fresh one.
-		existing := ""
-		if d.Registry != nil {
-			if dev, err := d.Registry.Load(expectID); err == nil && dev != nil {
-				existing = dev.Active.PSKHex
-			}
-		}
-		if existing != "" {
-			pskHex, pskReused = existing, true
-		} else {
-			// Registry-less (legacy global-PSK) mode cannot persist a minted
-			// per-device PSK — it would be lost the instant this call returns and
-			// orphan the device (it signs with a key nobody has). Require an
-			// explicit psk_hex there instead of silently generating one.
-			if d.Registry == nil {
-				return usbProvisionPayload{}, "", false, false, mcp.NewToolResultError("setting broker_url over USB without a device registry needs an explicit psk_hex (a generated PSK cannot be persisted here and would orphan the device)")
-			}
-			b := make([]byte, 32)
-			if _, err := rand.Read(b); err != nil {
-				return usbProvisionPayload{}, "", false, false, mcp.NewToolResultErrorFromErr("psk gen", err)
-			}
-			pskHex, pskGenerated = hex.EncodeToString(b), true
-		}
-	}
-	// A broker_url with no PSK to sign with is a dead config: it can only be
-	// resolved (reuse/mint) when we know which device this is. With an explicit
-	// port and no device_id we don't, so require one rather than push a broker
-	// URL the device could never authenticate against.
-	if brokerURL != "" && pskHex == "" {
-		return usbProvisionPayload{}, "", false, false, mcp.NewToolResultError("setting broker_url over USB needs device_id (so the device's PSK can be reused/derived) or an explicit psk_hex")
+	pskHex, errRes := explicitPSK(req)
+	if errRes != nil {
+		return usbProvisionPayload{}, errRes
 	}
 
 	payload := usbProvisionPayload{
@@ -420,7 +491,7 @@ func buildUSBPayload(d Deps, req mcp.CallToolRequest, code, expectID string) (us
 	if v := strings.TrimSpace(req.GetString("theme_mode", "")); v != "" {
 		tm := strings.ToLower(v)
 		if tm != "day" && tm != "night" && tm != "auto" {
-			return usbProvisionPayload{}, "", false, false, mcp.NewToolResultError("theme_mode must be one of: day, night, auto")
+			return usbProvisionPayload{}, mcp.NewToolResultError("theme_mode must be one of: day, night, auto")
 		}
 		payload.ThemeMode = tm
 	}
@@ -454,7 +525,7 @@ func buildUSBPayload(d Deps, req mcp.CallToolRequest, code, expectID string) (us
 	_, hasSSID := args["wifi_ssid"]
 	_, hasPass := args["wifi_pass"]
 	if hasSSID != hasPass {
-		return usbProvisionPayload{}, "", false, false, mcp.NewToolResultError("wifi_ssid and wifi_pass must be sent together (an open network needs wifi_pass set to an explicit empty string)")
+		return usbProvisionPayload{}, mcp.NewToolResultError("wifi_ssid and wifi_pass must be sent together (an open network needs wifi_pass set to an explicit empty string)")
 	}
 	if hasSSID {
 		ssid := req.GetString("wifi_ssid", "")
@@ -465,21 +536,21 @@ func buildUSBPayload(d Deps, req mcp.CallToolRequest, code, expectID string) (us
 		// BODY_BAD_WIFI after a whole lease + serial session was spent. Go's len()
 		// on a string is the byte count, which is exactly the firmware's bound.
 		if ssid == "" || len(ssid) > 32 {
-			return usbProvisionPayload{}, "", false, false, mcp.NewToolResultError("wifi_ssid must be 1..32 bytes (UTF-8 bytes, not characters)")
+			return usbProvisionPayload{}, mcp.NewToolResultError("wifi_ssid must be 1..32 bytes (UTF-8 bytes, not characters)")
 		}
 		if len(pass) > 64 {
-			return usbProvisionPayload{}, "", false, false, mcp.NewToolResultError("wifi_pass must be at most 64 bytes (UTF-8 bytes, not characters)")
+			return usbProvisionPayload{}, mcp.NewToolResultError("wifi_pass must be at most 64 bytes (UTF-8 bytes, not characters)")
 		}
 		payload.WiFiSSID = &ssid
 		payload.WiFiPass = &pass
 	}
 
-	return payload, pskHex, pskGenerated, pskReused, nil
+	return payload, nil
 }
 
-// mirrorToRegistry converges the local registry to the just-applied config,
-// matching handleProvision's Register→ReplaceActive fallback.
-func mirrorToRegistry(d Deps, deviceID string, payload usbProvisionPayload, pskHex string) (registered, reregistered bool, note string) {
+// usbRegistryPayload lifts the just-applied USB payload into the registry's
+// config shape, matching handleProvision's lift.
+func usbRegistryPayload(payload usbProvisionPayload, pskHex string) registry.ConfigPayload {
 	reg := registry.ConfigPayload{
 		BrokerURL: payload.BrokerURL,
 		PSKHex:    pskHex,
@@ -503,24 +574,15 @@ func mirrorToRegistry(d Deps, deviceID string, payload usbProvisionPayload, pskH
 		reg.PetEnabled = &v
 	}
 	if payload.Providers != nil {
+		// The USB payload carries the "antigravity" wire key; the registry's
+		// internal name for that provider is still Gemini.
 		reg.ProviderModes = &registry.ProviderModeSet{
 			Claude: registry.ProviderModeFromBool(payload.Providers["claude"]),
 			Codex:  registry.ProviderModeFromBool(payload.Providers["codex"]),
-			Gemini: registry.ProviderModeFromBool(payload.Providers["gemini"]),
+			Gemini: registry.ProviderModeFromBool(payload.Providers["antigravity"]),
 		}
 	}
-	_, err := d.Registry.Register(deviceID, reg)
-	switch {
-	case err == nil:
-		return true, false, ""
-	case strings.Contains(err.Error(), "already exists"):
-		if _, perr := d.Registry.ReplaceActive(deviceID, reg); perr != nil {
-			return false, false, "device provisioned but registry re-register failed: " + perr.Error()
-		}
-		return false, true, ""
-	default:
-		return false, false, "device provisioned but registry write failed: " + err.Error()
-	}
+	return reg
 }
 
 // usbProvisionErrorReport maps a session error to a structured tool result. The
@@ -546,7 +608,7 @@ func usbProvisionErrorReport(err error, pskHex string, pskGenerated bool) any {
 		rep.OutcomeUnknown = true
 		if pskGenerated {
 			rep.PSKHex = pskHex
-			rep.Note = "a fresh PSK was generated and may already be live on the device; record it — the registry was NOT updated because the outcome is unknown. Do not blindly re-run."
+			rep.Note = notePSKUnknown
 		}
 	case errors.Is(err, usbprov.ErrDeviceMismatch):
 		rep.DeviceMismatch = true

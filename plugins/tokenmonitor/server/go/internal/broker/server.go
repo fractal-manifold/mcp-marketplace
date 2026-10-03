@@ -901,23 +901,36 @@ type syncResponse struct {
 // pendingPayloadJSON serialises a registry.ConfigPayload to the canonical
 // JSON the firmware decrypts. Kept separate so changes to TOML
 // representation in registry don't leak into the wire format.
-func pendingPayloadJSON(p registry.ConfigPayload) ([]byte, error) {
+//
+// activeBrokerURL and fw decide the one legacy field, broker_url (below).
+func pendingPayloadJSON(p registry.ConfigPayload, activeBrokerURL, fw string) ([]byte, error) {
 	wire := map[string]any{
 		"version": p.Version,
 	}
-	// broker_url is deliberately NOT emitted. The broker's address is no
-	// longer configuration the control plane owns: the device locates it by
-	// mDNS on its own subnet and adopts it only after the response signature
-	// proves the pairing (compat/mdns.md). Echoing the registry's value here
-	// used to overwrite a freshly-discovered address with the one recorded at
-	// registration time — and, because the firmware treats a broker_url change
-	// as channel identity, reboot the device onto an address that had already
-	// stopped working. The registry field survives as a last-known-address
-	// record; nothing authoritative reads it.
+	// broker_url: a LEGACY re-point, sent under two conditions at once.
 	//
-	// Deployed firmware tolerates the absence: promote_candidate guards on
-	// presence and probe_candidate documents the fallback explicitly
-	// ("either may be absent on a partial update — keep the active value").
+	//  1. The device reports firmware older than 1.0.1 (the live
+	//     X-Tmon-Fw-Version header). From 1.0.1 the broker's address is not
+	//     configuration: the device locates it by mDNS on its own subnet and
+	//     adopts it only after the response signature proves the pairing
+	//     (compat/mdns.md). Older firmware has no other way to follow a broker
+	//     that moved, so for it this field is the only re-point there is.
+	//  2. An operator staged it: the pending's address differs from the
+	//     active record's. The registry's own value is only a last-known
+	//     address and is never echoed — doing that used to overwrite a
+	//     device's working address with the one recorded at registration and,
+	//     because the firmware treats a broker_url change as channel identity,
+	//     reboot it onto an address that had already stopped working.
+	//
+	// This gate exists for legacy units and must not be removed while any can
+	// exist: without it they cannot be re-pointed short of re-pairing by hand.
+	// Legacy firmware probes the candidate URL before promoting and reboots on
+	// promote when the address changed; it tolerates the field's absence
+	// (probe_candidate: "either may be absent on a partial update — keep the
+	// active value"). See compat/README.md, "Legacy firmware compatibility".
+	if legacy, _ := ota.BrokerURLFw(fw); legacy && p.BrokerURL != "" && p.BrokerURL != activeBrokerURL {
+		wire["broker_url"] = p.BrokerURL
+	}
 	if p.PSKHex != "" {
 		wire["psk_hex"] = p.PSKHex
 	}
@@ -1095,6 +1108,22 @@ func handleDeviceSync(cfg *config.Config, cache *auth.NonceCache, logger *log.Lo
 	}
 	observed, _ := parseUint32Header(r.Header.Get("X-Tmon-Config-Version"))
 
+	// An operator-staged broker_url is for legacy firmware only (see
+	// pendingPayloadJSON). If the device asking is not legacy — it upgraded
+	// while the re-point was queued, or was never legacy and the tool could
+	// not know yet — take the address out of the pending. This runs before
+	// the promotion below so the address can never be promoted into the
+	// active record as if the device had applied it. (A device that reports
+	// the pending's own version did apply it; that one is left to promote.)
+	if legacy, _ := ota.BrokerURLFw(r.Header.Get("X-Tmon-Fw-Version")); !legacy {
+		if dropped, derr := reg.DropPendingBrokerURL(deviceID, observed); derr != nil {
+			logger.Printf("registry drop-broker-url %s: %v", deviceID, derr)
+		} else if dropped != "" {
+			logger.Printf("device %s reports firmware %q, which resolves the broker by mDNS; dropped the staged broker_url %s",
+				deviceID, r.Header.Get("X-Tmon-Fw-Version"), dropped)
+		}
+	}
+
 	// Promote opportunistically on every authenticated /sync. For key
 	// rotations the device must sign with the pending PSK (PSKIndex==1);
 	// for non-rotation updates (theme / city / brightness / providers)
@@ -1227,7 +1256,7 @@ func handleDeviceSync(cfg *config.Config, cache *auth.NonceCache, logger *log.Lo
 			writeError(w, http.StatusInternalServerError, "broker config invalid")
 			return
 		}
-		pt, perr := pendingPayloadJSON(dev.Pending.ConfigPayload)
+		pt, perr := pendingPayloadJSON(dev.Pending.ConfigPayload, dev.Active.BrokerURL, fwReported)
 		if perr != nil {
 			logger.Printf("pending JSON marshal %s: %v", deviceID, perr)
 			writeError(w, http.StatusInternalServerError, "pending serialize")

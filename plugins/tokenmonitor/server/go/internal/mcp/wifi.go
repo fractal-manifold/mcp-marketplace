@@ -163,8 +163,9 @@ func handleSetWiFi(d Deps) server.ToolHandlerFunc {
 			return mcp.NewToolResultErrorFromErr("set pending", err), nil
 		}
 		if updated.Pending == nil {
-			// SetPending drops a pending identical to active. Reached when
-			// the device is already being sent to this network.
+			// SetPending writes no pending when nothing is queued and the
+			// result is identical to active. Reached when the device is
+			// already being sent to this network.
 			return mcp.NewToolResultText(fmt.Sprintf(
 				"No change staged: %s is already set to switch to %s.", deviceID, jsonQ(ssid))), nil
 		}

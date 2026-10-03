@@ -84,7 +84,7 @@ export function setWiFiTool(deps, args) {
   try { updated = deps.registry.setPending(deviceID, { wifi_ssid: ssid, wifi_pass: pass }); }
   catch (e) { return { error: e.message }; }
   if (!updated.pending) {
-    // setPending drops a pending identical to active. Reached when the device
+    // setPending writes no pending when nothing is queued and the result equals active. Reached when the device
     // is already being sent to this network.
     return { text: `No change staged: ${deviceID} is already set to switch to ${JSON.stringify(ssid)}.` };
   }

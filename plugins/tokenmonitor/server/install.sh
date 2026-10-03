@@ -1,8 +1,8 @@
 #!/bin/sh
-# install.sh — copy the tokenmonitor-mcp launcher to ~/.local/bin so Claude Code
-# (via the tokenmonitor plugin's .mcp.json that invokes "tokenmonitor-mcp")
-# can find it. The launcher then picks the actual impl (Go / Python /
-# JS) on each invocation.
+# install.sh — optional standalone (PATH-mode) installer: copies the
+# tokenmonitor-mcp launcher to ~/.local/bin. Plugin installs do not need it —
+# they exec the bundled launcher directly. The launcher then picks the actual
+# impl (Go / Python / JS) on each invocation.
 #
 # Usage:
 #   sh install.sh                   # interactive: asks for preferred runtime
@@ -29,7 +29,7 @@ for arg in "$@"; do
         --runtime=*) runtime="${arg#--runtime=}"; write_config="set" ;;
         --no-config) write_config="skip" ;;
         -h|--help)
-            sed -n '2,15p' "$0"
+            sed -n '2,13p' "$0"
             exit 0
             ;;
         *)

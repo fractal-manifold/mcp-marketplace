@@ -9,6 +9,7 @@ leader-mediated port lease (manager + follower client + wire types).
 from __future__ import annotations
 
 from . import frame, leasewire
+from .frame import PAYLOAD_MAX
 from .enum import (
     EnumerateUnsupported,
     Port,
@@ -65,6 +66,7 @@ from .usbids import (
 __all__ = [
     "frame",
     "leasewire",
+    "PAYLOAD_MAX",
     # enum
     "EnumerateUnsupported",
     "Port",

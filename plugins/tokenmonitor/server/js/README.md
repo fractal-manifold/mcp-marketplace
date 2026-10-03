@@ -1,7 +1,9 @@
 # tokenmonitor-mcp-js
 
 Node.js port of tokenmonitor-mcp with byte-exact parity to the Go reference
-impl on every wire and storage contract documented under `../compat/`.
+impl on every wire and storage contract documented under `compat/` at the
+root of the TokenMonitor repository (the plugin vendors only
+`../compat/tool-schemas.json` from it).
 
 ## Install
 

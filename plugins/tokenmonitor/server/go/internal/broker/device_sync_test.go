@@ -27,7 +27,7 @@ const syncTestID = "ab12cd34"
 func TestPendingPayloadJSON_VolOmittedWhenNil(t *testing.T) {
 	u8 := func(v uint8) *uint8 { return &v }
 
-	nilJSON, err := pendingPayloadJSON(registry.ConfigPayload{Version: 8, City: "Barcelona"})
+	nilJSON, err := pendingPayloadJSON(registry.ConfigPayload{Version: 8, City: "Barcelona"}, "", "")
 	if err != nil {
 		t.Fatalf("pendingPayloadJSON (nil vol): %v", err)
 	}
@@ -39,7 +39,7 @@ func TestPendingPayloadJSON_VolOmittedWhenNil(t *testing.T) {
 		t.Fatalf("nil Vol must omit the vol key, got %s", nilJSON)
 	}
 
-	zeroJSON, err := pendingPayloadJSON(registry.ConfigPayload{Version: 8, Vol: u8(0)})
+	zeroJSON, err := pendingPayloadJSON(registry.ConfigPayload{Version: 8, Vol: u8(0)}, "", "")
 	if err != nil {
 		t.Fatalf("pendingPayloadJSON (vol=0): %v", err)
 	}

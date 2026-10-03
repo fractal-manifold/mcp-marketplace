@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 // TokenMonitor SessionStart hook.
 //
-// The tokenmonitor-mcp broker does NOT auto-update, so it drifts behind the
-// firmware it feeds. This hook — which runs in the Claude Code harness, NOT in
-// the broker process, so it works even against an ancient broker binary —
-// compares the installed plugin version against the latest published in the
-// marketplace catalog and, when a newer release exists, emits additionalContext
-// nudging the user to update.
+// The tokenmonitor-mcp broker is bundled in the plugin and does NOT
+// auto-update, so it drifts behind the firmware it feeds. This hook — which
+// runs in the client's hook harness, NOT in the broker process, so it works
+// even against an ancient broker binary — compares the installed PLUGIN version
+// (plugin.json) against the latest published in the marketplace catalog and,
+// when a newer release exists, emits additionalContext nudging the user to
+// update. It never inspects the running broker or the device.
 //
-// It fires for every Claude Code session in every directory, so it must NEVER
+// It fires for every session in every directory, so it must NEVER
 // fail or noise up an unrelated session: any error, timeout, or "up to date"
 // verdict exits 0 silently. Result is cached with a TTL so we don't hit the
 // network on every session start.
@@ -56,8 +57,9 @@ function marketplaceURL() {
 
 // pluginRoot resolves the installed plugin directory WITHOUT depending on a
 // host-provided variable: Claude/Codex set CLAUDE_PLUGIN_ROOT, but Antigravity
+// (where this hook does not currently fire — it has no usable SessionStart)
 // never does. This file always lives at <root>/hooks/session-start.js, so
-// __dirname/.. is the root on every client.
+// __dirname/.. is the root wherever it is run.
 function pluginRoot() {
   return process.env.CLAUDE_PLUGIN_ROOT || path.join(__dirname, '..');
 }
@@ -192,10 +194,10 @@ function fetchLatest(cb) {
 
 function emit(installed, latest) {
   const msg =
-    `TokenMonitor: the tokenmonitor plugin/broker is out of date — ` +
-    `${installed} installed, ${latest} published. The broker does not ` +
-    `auto-update; offer to update it via /plugin (or the marketplace) so the ` +
-    `device stops showing stale data. Skip silently if the user is busy.`;
+    `TokenMonitor: a newer tokenmonitor plugin is published — ` +
+    `${installed} installed, ${latest} available. The broker bundled in the ` +
+    `plugin does not auto-update; offer to update the plugin through this ` +
+    `client's plugin manager. Skip silently if the user is busy.`;
   process.stdout.write(
     JSON.stringify({
       hookSpecificOutput: {

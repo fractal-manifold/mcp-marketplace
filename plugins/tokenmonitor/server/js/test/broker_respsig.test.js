@@ -170,20 +170,32 @@ test("no tag on an unauthorized response", async () => {
   }
 });
 
-test("pending payload never carries broker_url", async () => {
-  // The broker's address stopped being configuration. Echoing it back used to
-  // overwrite an address the device had just discovered — and, since the
-  // firmware treats a broker_url change as channel identity, reboot the device
-  // onto one that had already stopped working.
-  const { dir, reg } = newBroker();
-  try {
-    reg.setPending(DEVID, { ..._testing.emptyPayload(),
-                            broker_url: "http://192.168.1.28:8765", city: "Madrid" });
-    const dev = reg.load(DEVID);
-    const wire = brokerTesting.pendingPayloadJSON(dev.pending.payload);
-    assert.ok(!wire.includes("broker_url"), wire);
-    assert.ok(wire.includes("Madrid"), "the rest of the payload must still be emitted");
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
+test("pending payload: broker_url is a legacy re-point", () => {
+  // broker_url travels in a pending under two conditions at once: an operator
+  // staged it (it differs from the active record's address — the registry's
+  // own value is never echoed), and the device asking reports firmware older
+  // than 1.0.1, the release where the address stopped being configuration.
+  // Mirror of Go TestPendingPayloadJSON_BrokerURLIsALegacyRepoint.
+  const staged = "http://192.168.1.50:8765";
+  const recorded = "http://192.168.1.28:8765";
+  const cases = [
+    ["legacy 0.12.0", staged, recorded, "0.12.0", true],
+    ["legacy 1.0.0", staged, recorded, "1.0.0", true],
+    ["legacy dev build", staged, recorded, "1.0.0-dev.202609011200", true],
+    ["legacy, registry had no address", staged, "", "0.10.3", true],
+    ["1.0.1", staged, recorded, "1.0.1", false],
+    ["1.0.1 dev build", staged, recorded, "1.0.1-dev.202609181200", false],
+    ["2.0.0", staged, recorded, "2.0.0", false],
+    ["no version reported", staged, recorded, "", false],
+    ["unparseable version", staged, recorded, "dev", false],
+    ["legacy, but only the registry's own address", recorded, recorded, "0.12.0", false],
+    ["legacy, nothing staged", "", recorded, "0.12.0", false],
+  ];
+  for (const [name, pendingURL, activeURL, fw, want] of cases) {
+    const wire = JSON.parse(brokerTesting.pendingPayloadJSON(
+      { ..._testing.emptyPayload(), version: 9, broker_url: pendingURL, city: "Barcelona" }, activeURL, fw));
+    assert.equal("broker_url" in wire, want, name);
+    if (want) assert.equal(wire.broker_url, staged, name);
+    assert.equal(wire.city, "Barcelona", name);
   }
 });

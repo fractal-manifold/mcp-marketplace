@@ -12,11 +12,12 @@ wifi_ssid/wifi_pass pair (togetherness rule). See compat/PROVISION_WIRE.md.
 from __future__ import annotations
 
 import asyncio
-import secrets
 import threading
+from dataclasses import dataclass, field
 from typing import Any
 
 from .. import usbprov
+from . import enrol
 from ..registry.store import (
     ConfigPayload,
     NotFound,
@@ -42,12 +43,14 @@ def registered_skus(deps) -> dict[str, str]:
 
 
 def broker_base_url(deps) -> str:
-    """Loopback URL of this host's broker, for the lease client. A 0.0.0.0/""
-    bind is dialled as 127.0.0.1."""
-    host = deps.cfg.server.bind
-    if host in ("0.0.0.0", ""):
-        host = "127.0.0.1"
-    return f"http://{host}:{deps.cfg.server.port}"
+    """Loopback URL of this host's broker, for the lease client. The lease
+    endpoints are loopback-only (they reject any non-loopback peer REGARDLESS of
+    the broker's bind), so this must ALWAYS dial 127.0.0.1 — never the
+    configured LAN bind, whose self-connection would present a non-loopback
+    source and be rejected 403. A broker bound to 0.0.0.0 also listens on
+    loopback; one bound only to a specific LAN IP is simply unreachable here,
+    and open_leased then falls back to a direct exclusive open."""
+    return f"http://127.0.0.1:{deps.cfg.server.port}"
 
 
 def _clamp8(v: float, lo: int, hi: int) -> int:
@@ -116,6 +119,8 @@ async def handle_usb_scan(deps, args: dict) -> dict:
                     e["fw"] = dev.fw
                 if dev.state:
                     e["state"] = dev.state
+                if dev.has_psk is not None:
+                    e["has_psk"] = dev.has_psk
                 if dev.sku:
                     e["sku"] = dev.sku
         out.append(e)
@@ -133,6 +138,11 @@ def _probe_blocking(deps, port: str, timeout: float, cancel: threading.Event) ->
     try:
         to = usbprov.default_timeouts()
         to.hello_resp = timeout
+        # A scan sends exactly ONE bounded HELLO (PROVISION_WIRE §5). The
+        # default 5 tries would cost 5×timeout per silent port — a single
+        # non-TokenMonitor ESP32 devkit on the desk would then blow the 10s
+        # Codex tool budget.
+        to.hello_tries = 1
         return usbprov.identify(lp.handle.conn, to, cancel)
     finally:
         stop_watch.set()
@@ -186,26 +196,48 @@ async def handle_usb_provision(deps, args: dict) -> dict:
                 "from tokenmonitor_usb_scan"
             }
 
-    payload, psk_hex, psk_generated, psk_reused, err = build_usb_payload(deps, args, code, expect_id)
+    # Everything the arguments alone decide; the PSK and a seeded broker_url
+    # are added once the device has said who it is (finalize_usb_payload).
+    base, err = build_usb_payload(args, code)
     if err is not None:
         return {"error": err}
 
-    import json
+    # Validate the encoded size HERE, before leasing or opening anything. An
+    # over-cap payload fails inside the PROVISION send, which is reported as
+    # outcome-unknown — but zero bytes have left the host, so it is a pure
+    # client-side error.
+    if len(_encode_payload(base)) > usbprov.PAYLOAD_MAX:
+        return {"error": _payload_too_big(len(_encode_payload(base)))}
 
-    # Compact UTF-8, like Go's json.Marshal: no spaces (saves bytes against the
-    # 1024-byte PAYLOAD_MAX budget) and no \uXXXX inflation of non-ASCII city
-    # names (firmware cJSON decodes UTF-8 directly).
-    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    # What may be sent depends on the HELLO_RESP — which device this is, whether
+    # it already holds a PSK, whether its firmware can find the broker without
+    # an address — so the payload is finished inside the session, after the
+    # handshake and before any PROVISION write.
+    candidates = enrol.hint_urls(deps)
+    fin: list[USBFinal] = []
+
+    def finalize(dev: usbprov.DeviceInfo) -> bytes:
+        # A re-handshake (pre-PROVISION reset recovery) must resend the same
+        # bytes — in particular the same minted PSK.
+        if fin and fin[0].device_id == dev.device_id:
+            return fin[0].body
+        f, err_text = finalize_usb_payload(deps, args, base, dev, candidates)
+        if err_text is not None:
+            raise USBRefusal(err_text)
+        fin[:] = [f]
+        return f.body
 
     cancel = threading.Event()
     try:
-        res = await asyncio.to_thread(_run_provision_blocking, deps, port, body, expect_id, cancel)
+        res = await asyncio.to_thread(_run_provision_blocking, deps, port, finalize, expect_id, cancel)
     except asyncio.CancelledError:
         # MCP request cancelled mid-session: signal the worker so run_provision
         # unwinds (post-PROVISION it lands on OUTCOME_UNKNOWN inside the thread —
         # NEVER auto-retried) and the lease/port are released, then propagate.
         cancel.set()
         raise
+    except USBRefusal as e:
+        return {"error": str(e)}
     except usbprov.LeaseBusy:
         return {"error": "the serial port is leased by another provisioning session; retry shortly"}
     except usbprov.PortBusy:
@@ -221,11 +253,111 @@ async def handle_usb_provision(deps, args: dict) -> dict:
         usbprov.SessionCancelled,
         usbprov.SessionIO,
     ) as e:
-        return usb_provision_error_report(e)
+        f0 = fin[0] if fin else None
+        return usb_provision_error_report(
+            e, f0.psk_hex if f0 else "", f0.psk_generated if f0 else False
+        )
     except Exception as e:  # noqa: BLE001
         return {"error": f"open serial port: {e}"}
 
-    # The device applied and returned a RESULT. Its device_id is authoritative.
+    return usb_provision_report(deps, res, fin[0], enrol.no_registry_note(deps, args, fin[0].psk_hex))
+
+
+class USBRefusal(Exception):
+    """A decision NOT to provision, taken after the handshake and before any
+    PROVISION write. It surfaces as a plain tool error."""
+
+
+def _encode_payload(payload: dict) -> bytes:
+    """The PROVISION body, byte for byte what Go's json.Marshal produces:
+    compact (no spaces — saves bytes against the 1024-byte PAYLOAD_MAX budget),
+    non-ASCII left as UTF-8 (firmware cJSON decodes it directly), and the five
+    characters Go escapes for HTML/JS safety — < > & U+2028 U+2029 — written
+    as \\uXXXX. They can only occur inside strings, so a plain replace is
+    safe. Without it a city like "Tom & Jerry" would put different bytes (and a
+    different size) on the wire than the Go runtime."""
+    import json
+
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    for ch, esc in (("<", "\\u003c"), (">", "\\u003e"), ("&", "\\u0026"),
+                    ("\u2028", "\\u2028"), ("\u2029", "\\u2029")):
+        text = text.replace(ch, esc)
+    return text.encode("utf-8")
+
+
+def _payload_too_big(n: int) -> str:
+    return (
+        f"provisioning payload is {n} bytes, over the "
+        f"{usbprov.PAYLOAD_MAX}-byte device limit; shorten fields such as city"
+    )
+
+
+@dataclass
+class USBFinal:
+    """The payload as it actually goes on the wire, with what was decided on
+    the way."""
+
+    device_id: str = ""
+    payload: dict = field(default_factory=dict)
+    body: bytes = b""
+    psk_hex: str = ""
+    psk_generated: bool = False
+    psk_reused: bool = False
+    caller_url: bool = False  # the caller supplied broker_url
+    seeded: str = ""  # the broker_url this host added, if any
+
+
+def finalize_usb_payload(
+    deps, args: dict, base: dict, dev: usbprov.DeviceInfo, candidates: list[str]
+) -> tuple[USBFinal | None, str | None]:
+    """Complete the payload for the device that answered the HELLO: the PSK
+    (resolve_enrol_psk, with the device's own has_psk as evidence) and, for
+    firmware that cannot find the broker by itself, a broker_url. `candidates`
+    are the provision hint's URLs. A non-None error is a refusal: nothing has
+    been written and nothing will be."""
+    f = USBFinal(device_id=dev.device_id, caller_url=bool(base.get("broker_url")))
+    f.psk_hex, f.psk_generated, f.psk_reused, err = enrol.resolve_enrol_psk(
+        deps, args, dev.device_id, dev.has_psk
+    )
+    if err is not None:
+        return None, err
+    broker_url = base.get("broker_url", "")
+    # A PSK with no address strands firmware older than 1.0.0 on "Waiting for
+    # setup". Over the cable there is no route to read an address off, so the
+    # provision hint is used — but only when it names exactly one.
+    if f.psk_hex and not f.caller_url and not enrol.fw_finds_broker_alone(dev.fw):
+        f.seeded, err = enrol.seed_url_from_hint(dev.fw, candidates)
+        if err is not None:
+            return None, err
+        broker_url = f.seeded
+    # Same key order as the Go struct, so the bytes on the wire are identical.
+    payload: dict[str, Any] = {}
+    if "pairing_code" in base:
+        payload["pairing_code"] = base["pairing_code"]
+    if broker_url:
+        payload["broker_url"] = broker_url
+    if f.psk_hex:
+        payload["psk_hex"] = f.psk_hex
+    for k, v in base.items():
+        if k not in ("pairing_code", "broker_url", "psk_hex"):
+            payload[k] = v
+    f.payload = payload
+    f.body = _encode_payload(payload)
+    if len(f.body) > usbprov.PAYLOAD_MAX:
+        return None, _payload_too_big(len(f.body))
+    return f, None
+
+
+def usb_provision_report(deps, res, fin: USBFinal, note: str = "") -> dict:
+    """Turn a received RESULT into the tool result. A RESULT is only the device
+    ANSWERING — success and error alike arrive as one (PROVISION_WIRE §3) — so
+    top-level ok is the device's own `ok`, and the registry is mirrored only
+    when the device says it applied the payload."""
+    import json
+
+    psk_hex, psk_generated, psk_reused = fin.psk_hex, fin.psk_generated, fin.psk_reused
+    # The device_id echoed in HELLO_RESP is authoritative — use it for the
+    # registry mirror below.
     device_id = res.device.device_id
     device_resp: Any = None
     try:
@@ -235,12 +367,15 @@ async def handle_usb_provision(deps, args: dict) -> dict:
         device_resp = parsed if isinstance(parsed, dict) else None
     except (ValueError, UnicodeDecodeError):
         device_resp = None
+    applied = device_resp is not None and device_resp.get("ok") is True
 
-    out: dict[str, Any] = {
-        "ok": True,
-        "device_id": device_id,
-        "registered": False,
-    }
+    out: dict[str, Any] = {"ok": applied}
+    if not applied:
+        msg = device_resp.get("error") if device_resp is not None else None
+        out["error"] = msg if isinstance(msg, str) and msg else "device rejected the provisioning payload"
+    out["device_id"] = device_id
+    out["registered"] = False
+    out["enrolled"] = False
     if res.device.sku:
         out["sku"] = res.device.sku
     if res.device.fw:
@@ -249,24 +384,37 @@ async def handle_usb_provision(deps, args: dict) -> dict:
         out["psk_generated"] = True
     if psk_reused:
         out["psk_reused"] = True
+    if fin.seeded:
+        out["broker_url_seeded"] = fin.seeded
     if device_resp is not None:
         out["device_response"] = device_resp
+    if not applied:
+        if psk_generated:
+            out["psk_hex"] = psk_hex
+            out["note"] = enrol.NOTE_PSK_MAYBE_LIVE
+        return out
 
-    # Mirror into the registry only when broker_url + psk were pushed and the
-    # device_id is well-formed (a partial provision — e.g. only WiFi — leaves the
-    # registry untouched).
-    if deps.registry is not None and payload.get("broker_url") and psk_hex and valid_device_id(device_id):
-        registered, reregistered, note = mirror_to_registry(deps, device_id, payload, psk_hex)
+    # Mirror the enrolment into the registry whenever a PSK was pushed and the
+    # device_id is well-formed — with or without a broker_url. enroll=false
+    # pushed none and leaves the registry untouched.
+    if deps.registry is not None and psk_hex and valid_device_id(device_id):
+        registered, reregistered, enrolled, note = enrol.mirror_to_registry(
+            deps, device_id, usb_registry_payload(fin.payload, psk_hex), fin.caller_url
+        )
         out["registered"] = registered
         if reregistered:
             out["reregistered"] = True
-        if note:
-            out["note"] = note
+        out["enrolled"] = enrolled
+    if psk_generated and not out["enrolled"]:
+        out["psk_hex"] = psk_hex
+        note = enrol.join_notes(note, enrol.NOTE_PSK_UNRECORDED)
+    if note:
+        out["note"] = note
     return out
 
 
 def _run_provision_blocking(
-    deps, port: str, body: bytes, expect_id: str, cancel: threading.Event
+    deps, port: str, finalize, expect_id: str, cancel: threading.Event
 ) -> usbprov.ProvisionResult:
     client = usbprov.LeaseClient(broker_base_url(deps), deps.cfg.psk())
     lp = client.open_leased(port, cancel)  # may raise LeaseBusy / PortBusy; cancel interrupts open
@@ -274,7 +422,7 @@ def _run_provision_blocking(
     try:
         return usbprov.run_provision(
             lp.handle.conn,
-            usbprov.ProvisionOpts(provision_json=body, expect_device_id=expect_id),
+            usbprov.ProvisionOpts(expect_device_id=expect_id, finalize=finalize),
             cancel,
         )
     finally:
@@ -300,64 +448,16 @@ def _wire_lost(lp: usbprov.LeasedPort, cancel: threading.Event) -> threading.Eve
     return stop_watch
 
 
-def build_usb_payload(
-    deps, args: dict, code: str, expect_id: str
-) -> tuple[dict, str, bool, bool, str | None]:
-    """Assemble the PROVISION JSON from the tool args, including the WiFi pair.
-    Mirrors handleProvision's field handling plus PSK reuse/gen, and enforces the
-    wifi_ssid⇄wifi_pass togetherness rule. Returns
-    (payload, psk_hex, psk_generated, psk_reused, error_or_None)."""
+def build_usb_payload(args: dict, code: str) -> tuple[dict, str | None]:
+    """Assemble the part of the PROVISION JSON the tool args alone decide,
+    including the WiFi pair. Mirrors _provision's field handling and enforces
+    the wifi_ssid⇄wifi_pass togetherness rule. An explicit psk_hex is validated
+    here; which PSK is finally sent is finalize_usb_payload's call. Returns
+    (payload, error_or_None)."""
     broker_url = str(args.get("broker_url", "")).strip()
-    psk_hex = str(args.get("psk_hex", "")).strip().lower()
-    psk_generated = False
-    psk_reused = False
-    if psk_hex:
-        if len(psk_hex) != 64:
-            return {}, "", False, False, "psk_hex must be 64 hex chars"
-        try:
-            bytes.fromhex(psk_hex)
-        except ValueError:
-            return {}, "", False, False, "psk_hex is not valid hex"
-    elif broker_url and expect_id:
-        # No PSK supplied but a broker is being (re)set: reuse the device's
-        # existing registry PSK so the two never drift, else mint a fresh one.
-        existing = ""
-        if deps.registry is not None:
-            try:
-                dev = deps.registry.load(expect_id)
-                existing = dev.active.payload.psk_hex or ""
-            except Exception:  # noqa: BLE001
-                existing = ""
-        if existing:
-            psk_hex, psk_reused = existing, True
-        else:
-            # Registry-less (legacy global-PSK) mode cannot persist a minted
-            # per-device PSK — it would be lost the instant this call returns
-            # and orphan the device (it signs with a key nobody has). Require
-            # an explicit psk_hex there instead of silently generating one.
-            if deps.registry is None:
-                return (
-                    {},
-                    "",
-                    False,
-                    False,
-                    "setting broker_url over USB without a device registry needs an "
-                    "explicit psk_hex (a generated PSK cannot be persisted here and "
-                    "would orphan the device)",
-                )
-            psk_hex, psk_generated = secrets.token_hex(32), True
-
-    # A broker_url with no PSK to sign with is a dead config: it can only be
-    # resolved when we know which device this is. Require device_id or psk_hex.
-    if broker_url and not psk_hex:
-        return (
-            {},
-            "",
-            False,
-            False,
-            "setting broker_url over USB needs device_id (so the device's PSK can be "
-            "reused/derived) or an explicit psk_hex",
-        )
+    psk_hex, err = enrol.explicit_psk(args)
+    if err is not None:
+        return {}, err
 
     payload: dict[str, Any] = {}
     if code:
@@ -384,7 +484,7 @@ def build_usb_payload(
     if tm:
         tm = tm.lower()
         if tm not in ("day", "night", "auto"):
-            return {}, "", False, False, "theme_mode must be one of: day, night, auto"
+            return {}, "theme_mode must be one of: day, night, auto"
         payload["theme_mode"] = tm
 
     if "pet_enabled" in args:
@@ -395,14 +495,16 @@ def build_usb_payload(
     has_anti = "provider_antigravity" in args
     has_gemini = "provider_gemini" in args
     if has_claude or has_codex or has_anti or has_gemini:
+        # Emit the current "antigravity" wire key (PROVISION_WIRE §3). Every
+        # firmware with a serial transport accepts it (the rename predates the
+        # transport). Keys go in sorted order — the order Go's json.Marshal
+        # gives a map — so all three runtimes put the same bytes on the wire.
+        anti_key = "provider_antigravity" if has_anti else "provider_gemini"
         p = {
+            "antigravity": bool(args.get(anti_key, False)),
             "claude": bool(args.get("provider_claude", False)),
             "codex": bool(args.get("provider_codex", False)),
         }
-        if has_anti:
-            p["gemini"] = bool(args.get("provider_antigravity", False))
-        else:
-            p["gemini"] = bool(args.get("provider_gemini", False))
         payload["providers"] = p
 
     # WiFi pair: enforce togetherness. wifi_pass present without wifi_ssid, or
@@ -412,21 +514,24 @@ def build_usb_payload(
     if has_ssid != has_pass:
         return (
             {},
-            "",
-            False,
-            False,
             "wifi_ssid and wifi_pass must be sent together (an open network needs "
             "wifi_pass set to an explicit empty string)",
         )
     if has_ssid:
         ssid = str(args.get("wifi_ssid", ""))
         wpass = str(args.get("wifi_pass", ""))
-        if ssid == "":
-            return {}, "", False, False, "wifi_ssid must be 1..32 bytes"
+        # Length is in UTF-8 BYTES, not code points (PROVISION_WIRE §7): the
+        # schema's maxLength counts characters, so a 32-CHARACTER SSID of
+        # multibyte glyphs passes it and is then rejected by firmware as
+        # BODY_BAD_WIFI after a whole lease + serial session was spent.
+        if ssid == "" or len(ssid.encode("utf-8")) > 32:
+            return {}, "wifi_ssid must be 1..32 bytes (UTF-8 bytes, not characters)"
+        if len(wpass.encode("utf-8")) > 64:
+            return {}, "wifi_pass must be at most 64 bytes (UTF-8 bytes, not characters)"
         payload["wifi_ssid"] = ssid
         payload["wifi_pass"] = wpass
 
-    return payload, psk_hex, psk_generated, psk_reused, None
+    return payload, None
 
 
 def _as_float(v, default: float = 0.0) -> float:
@@ -436,10 +541,9 @@ def _as_float(v, default: float = 0.0) -> float:
         return default
 
 
-def mirror_to_registry(deps, device_id: str, payload: dict, psk_hex: str) -> tuple[bool, bool, str]:
-    """Converge the local registry to the just-applied config, matching
-    handleProvision's register→replace_active fallback. Returns
-    (registered, reregistered, note)."""
+def usb_registry_payload(payload: dict, psk_hex: str) -> ConfigPayload:
+    """Lift the just-applied USB payload into the registry's config shape,
+    matching _provision's lift."""
     reg = ConfigPayload(
         broker_url=payload.get("broker_url", ""),
         psk_hex=psk_hex,
@@ -460,29 +564,29 @@ def mirror_to_registry(deps, device_id: str, payload: dict, psk_hex: str) -> tup
         reg.provider_modes = ProviderModeSet(
             claude=provider_mode_from_bool(pv.get("claude", False)),
             codex=provider_mode_from_bool(pv.get("codex", False)),
-            gemini=provider_mode_from_bool(pv.get("gemini", False)),
+            # The USB payload carries the "antigravity" wire key; the
+            # registry's internal name for that provider is still gemini.
+            gemini=provider_mode_from_bool(pv.get("antigravity", False)),
         )
-    try:
-        deps.registry.register(device_id, reg)
-        return True, False, ""
-    except Exception as e:  # noqa: BLE001
-        msg = str(e)
-        if "already exists" in msg:
-            try:
-                deps.registry.replace_active(device_id, reg)
-                return False, True, ""
-            except Exception as e2:  # noqa: BLE001
-                return False, False, f"device provisioned but registry re-register failed: {e2}"
-        return False, False, f"device provisioned but registry write failed: {msg}"
+    return reg
 
 
-def usb_provision_error_report(err: Exception) -> dict:
+def usb_provision_error_report(err: Exception, psk_hex: str = "", psk_generated: bool = False) -> dict:
     """Map a session error to a structured tool result. The outcome-unknown case
     is called out explicitly so the model does NOT blindly re-run (which would
-    risk a double-apply / a burned pairing attempt)."""
+    risk a double-apply / a burned pairing attempt).
+
+    psk_hex/psk_generated surface a freshly-minted PSK on the outcome-unknown
+    path: the device MAY have committed it, but the registry was NOT updated (we
+    don't know it applied), so without this the device could end up signing with
+    a key nobody on the host has. A reused/existing PSK is already persisted, so
+    it is not echoed."""
     rep: dict[str, Any] = {"ok": False, "error": str(err)}
     if isinstance(err, usbprov.OutcomeUnknown):
         rep["outcome_unknown"] = True
+        if psk_generated:
+            rep["psk_hex"] = psk_hex
+            rep["note"] = enrol.NOTE_PSK_UNKNOWN
     elif isinstance(err, usbprov.DeviceMismatch):
         rep["device_mismatch"] = True
     return rep

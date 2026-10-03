@@ -227,17 +227,16 @@ mcp_tool_call_review = false
 
 The Gemini CLI was retired on 2026-06-18 and replaced by the Antigravity
 CLI (`agy`). `agy` has no `gemini mcp add` equivalent — MCP servers are
-registered through its **extension** mechanism (the same `tokenmonitor`
-plugin the marketplace ships):
+registered by installing the plugin (the same `tokenmonitor` plugin the
+marketplace ships):
 
 ```sh
-agy extensions install tokenmonitor
+agy plugin install https://github.com/fractal-manifold/mcp-marketplace/plugins/tokenmonitor
 ```
 
-This drops the extension under `~/.gemini/antigravity/extensions/`
-(OAuth still lives at the unchanged `~/.gemini/oauth_creds.json`). Restart
-`agy` afterwards so it picks up the new extension. See `website/plugin.html`
-for the end-user install flow.
+OAuth still lives at the unchanged `~/.gemini/oauth_creds.json`. Restart `agy`
+afterwards so it picks up the plugin. See the plugin `README.md` (two
+directories up) for the end-user install flow.
 
 ## Migrating from an existing broker
 
@@ -283,21 +282,39 @@ prevents session-owned daemons from starting alongside this explicit service.
 
 ## MCP tools
 
-When launched without `--daemon`, `tokenmonitor-mcp` exposes the following tools
-to Claude Code over stdio JSON-RPC. The model invokes them when you ask
-diagnostic questions about your wall monitor.
+When launched without `--daemon`, `tokenmonitor-mcp` exposes **17 tools** to
+the MCP client over stdio JSON-RPC: diagnostics (status, health, logs), the
+device registry and control plane (list / register / stage a pending config /
+change WiFi), firmware OTA (publish, revert, check for updates), and
+provisioning over the LAN or a USB cable.
 
-| Tool                          | What it does |
-|-------------------------------|--------------|
-| `tokenmonitor_status`         | Snapshot: leader/follower role, since when, last ESP32 request (time, remote, HTTP status), request count. |
-| `tokenmonitor_health`         | End-to-end check: credentials file readable + unexpired, broker reachable via a self-signed self-ping, observed traffic in the last window. Returns PASS/FAIL per component. |
-| `tokenmonitor_recent_logs`    | Tail of the shared daemon log (default 50 lines, max 500). Shows auth rejections, peer IPs and lifecycle events. |
-| `tokenmonitor_provision_hint` | The laptop's LAN IPv4 addresses + the configured port, formatted as `http://…` URLs to paste into the device's captive portal. |
-| `tokenmonitor_list_devices`   | Every device in the local registry, with active config version, whether a pending update is queued, last seen, providers enabled. |
-| `tokenmonitor_register_device`| Register an existing device — needed once for any device originally provisioned through the captive portal. Args: `device_id` (8 hex), `broker_url`, `psk_hex` (64 hex), optional `city`/`br_day`/`br_night`/`vol`. |
-| `tokenmonitor_set_device_pending` | Stage a pending config change. Args (all optional except `device_id`): `broker_url`, `psk_hex`, `city`, `br_day`, `br_night`, `vol`, `provider_claude`, `provider_codex`, `provider_antigravity` (legacy alias: `provider_gemini`), `autorotate_enabled`, `autorotate_interval_s`. The device applies it within ~60 s under candidate/rollback. |
-| `tokenmonitor_discover_devices` | Scan the local network via mDNS (`_tmon._tcp.local.`) for devices in BOOT_NEEDS_CONFIG. Default 4 s scan, max 15 s. Returns `device_id`, `fw`, `ipv4`, `provision_url`. The pairing code is **not** returned — it lives only on the device's screen. |
-| `tokenmonitor_provision`      | POST `/provision` on a discovered device with the 6-digit pairing code the user reads off the screen plus the broker URL, PSK hex, and any optional config. On success the device persists to NVS and reboots; if `broker_url + psk_hex` are supplied this tool also registers/queues the device in the local registry. |
+The table is not repeated here — it lives in the plugin `README.md`, two
+directories up ("Tools exposed to the model"), and the authoritative names,
+descriptions and argument schemas are `compat/tool-schemas.json`, which
+`TestToolSchemas_MatchGolden` pins this implementation to. Result shapes and
+canonical error strings are in `compat/mcp-errors.md`.
+
+Two things that table cannot say in one line:
+
+- **The broker's address is not configuration.** The device finds its broker by
+  mDNS and adopts it only after the broker proves the pairing. Where the
+  provisioning tools and `tokenmonitor_register_device` accept a `broker_url`
+  it is an optional cache seed / last-known address. The exception is
+  **legacy firmware**: units older than 1.0.0 cannot pair without an address
+  (the provisioning tools seed one when it is omitted), and units older than
+  1.0.1 can only be moved to a new broker address by
+  `tokenmonitor_set_device_pending` `broker_url`, which is refused for
+  anything newer and sent in a `/sync` pending only to firmware reporting a
+  version below 1.0.1. See `compat/README.md`, "Legacy firmware
+  compatibility".
+- **Provisioning enrols by default.** `tokenmonitor_provision` and
+  `tokenmonitor_usb_provision` push a PSK (the caller's, else the one the
+  registry holds for the device, else a fresh one) and record the device in the
+  registry, with or without a `broker_url`; `enroll=false` changes settings
+  only. A device the registry does not know is only given a new PSK when that
+  is clearly meant (`enroll=true`, `psk_hex`, a device reporting
+  `has_psk:false` over USB, …) — the full rule is in `compat/mcp-errors.md`,
+  "Enrolment rule".
 
 ## Per-device control plane
 
@@ -313,7 +330,7 @@ device_id = "ab12cd34"
 
 [active]
 version = 7
-broker_url = "http://192.168.1.10:8765"
+broker_url = "http://192.168.1.10:8765"   # optional: last-known address only
 psk_hex = "0011…"        # 64 hex
 city = "Madrid"
 br_day = 80
@@ -382,7 +399,9 @@ and serve HTTP on port 80:
   ```
 
   All fields except `pairing_code` are optional; only the ones supplied
-  get persisted. The 6-digit `pairing_code` is generated fresh on every
+  get persisted. `broker_url` is a cache seed on firmware 1.0.0 or newer (a
+  device handed a PSK and no address finds the broker by mDNS) and required by
+  older firmware. The 6-digit `pairing_code` is generated fresh on every
   boot, shown only on the device's screen, and compared in constant
   time. A wrong code returns `401`; a successful provision returns
   `{"ok":true,"device_id":"…","next":"rebooting"}` and the device
@@ -470,7 +489,7 @@ does not implement TLS. **Do not expose port 8765 to the public internet.**
 - [x] Configuration fallback from `tokenmonitor.toml` to legacy `service.toml`
 - [x] MCP stdio JSON-RPC surface via
       [`mark3labs/mcp-go`](https://github.com/mark3labs/mcp-go), with
-      four tools (see below)
+      17 tools (see "MCP tools" above)
 
 ## License
 

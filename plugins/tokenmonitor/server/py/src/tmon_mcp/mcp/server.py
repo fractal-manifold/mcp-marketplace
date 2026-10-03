@@ -19,8 +19,10 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .. import auth, creds, devlog, session_life
+from . import enrol
 from ..config import Config
 from ..ota import pack_semver
 from ..gate import (
@@ -40,6 +42,7 @@ from ..registry.store import (
     provider_mode_from_bool,
     valid_provider_mode,
     effective_channel,
+    broker_url_fw,
 )
 from ..state import State, load_shared_snapshot
 
@@ -107,6 +110,36 @@ def _provider_names(p: ProviderModeSet | None) -> list[str]:
     return out
 
 
+# Canonical strings for the legacy broker_url re-point (compat/mcp-errors.md).
+ERR_BROKER_URL_MDNS_FMT = (
+    "broker_url cannot be staged for device {id}: it reports firmware {fw}, and "
+    "firmware 1.0.1 or newer resolves the broker by mDNS and does not take a pushed "
+    "address. Nothing was staged."
+)
+ERR_BROKER_URL_SHAPE = "broker_url must be an http:// or https:// URL of at most 127 bytes"
+NOTE_BROKER_URL_HELD = (
+    "broker_url is staged but held: this device has not reported a firmware version "
+    "yet. It is sent only if the device's next poll reports firmware older than 1.0.1, "
+    "and dropped if that poll reports 1.0.1 or newer, or no readable version."
+)
+LABEL_BROKER_URL_HELD = (
+    "broker_url (held: sent only if the device's next poll reports firmware older than 1.0.1)"
+)
+LABEL_BROKER_URL_DROP = (
+    "broker_url (will be dropped: firmware 1.0.1 or newer resolves the broker by mDNS)"
+)
+
+
+def _broker_url_label(reported_fw: str) -> str:
+    """The pending_changes entry for a staged broker_url. It says what will
+    actually happen to it, which depends on the firmware the device last
+    reported (active.firmware_version)."""
+    legacy, known = broker_url_fw(reported_fw)
+    if not known:
+        return LABEL_BROKER_URL_HELD
+    return "broker_url" if legacy else LABEL_BROKER_URL_DROP
+
+
 def _device_summary(dev) -> dict:
     out: dict[str, Any] = {
         "device_id": dev.device_id,
@@ -133,13 +166,17 @@ def _device_summary(dev) -> dict:
         out["pending_version"] = dev.pending.payload.version
         out["pending_created_at"] = dev.pending.created_at.isoformat().replace("+00:00", "Z")
         out["pending_changes"] = _pending_changes(dev.active.payload, dev.pending.payload)
+    if getattr(dev, "broker_url_dropped", ""):
+        # A staged broker_url that was removed unsent because the device runs
+        # firmware that resolves the broker by mDNS.
+        out["broker_url_dropped"] = dev.broker_url_dropped
     return out
 
 
 def _pending_changes(active: ConfigPayload, pending: ConfigPayload) -> list[str]:
     diffs: list[str] = []
     if pending.broker_url and pending.broker_url != active.broker_url:
-        diffs.append("broker_url")
+        diffs.append(_broker_url_label(active.firmware_version))
     if pending.psk_hex and pending.psk_hex != active.psk_hex:
         diffs.append("psk_hex (key rotation)")
     if pending.city and pending.city != active.city:
@@ -148,7 +185,8 @@ def _pending_changes(active: ConfigPayload, pending: ConfigPayload) -> list[str]
         diffs.append("br_day")
     if pending.br_night and pending.br_night != active.br_night:
         diffs.append("br_night")
-    if pending.vol and pending.vol != active.vol:
+    # `is not None`, not truthiness: muting (vol=0) is a change like any other.
+    if pending.vol is not None and pending.vol != active.vol:
         diffs.append("vol")
     if pending.provider_modes is not None and (active.provider_modes is None or pending.provider_modes != active.provider_modes):
         diffs.append("providers")
@@ -649,8 +687,6 @@ def _register_device(deps: Deps, args: dict) -> dict:
     psk_hex = (args.get("psk_hex") or "").strip().lower()
     if not valid_device_id(device_id):
         return {"error": "device_id must be 8 lowercase hex chars"}
-    if not broker_url:
-        return {"error": "broker_url required"}
     if len(psk_hex) != 64:
         return {"error": "psk_hex must be exactly 64 hex chars"}
     try:
@@ -665,6 +701,8 @@ def _register_device(deps: Deps, args: dict) -> dict:
         channel = _valid_channel_arg(raw)
         if channel is None:
             return {"error": "channel must be 'stable' or 'dev'"}
+    # broker_url is optional: the device resolves its broker by mDNS, so the
+    # registry only keeps one as the last-known address.
     payload = ConfigPayload(broker_url=broker_url, psk_hex=psk_hex, city=(args.get("city") or "").strip())
     if (v := args.get("br_day")):
         try:
@@ -708,12 +746,33 @@ def _set_device_pending(deps: Deps, args: dict) -> dict:
         except Exception as e:
             return {"error": str(e)}
     update = ConfigPayload()
-    # No broker_url here: the device's broker address is not something the
-    # control plane sets any more. It is discovered by mDNS on the device's own
-    # subnet and adopted only after the response signature proves the pairing,
-    # so a staged address would be overwritten within a poll cycle — after
-    # costing a reboot. The provisioning tools still accept one as a cache seed
-    # for a device that has never resolved.
+    # broker_url is a LEGACY re-point. From firmware 1.0.1 the broker's address
+    # is not something the control plane sets: the device finds it by mDNS and
+    # adopts it on a response signature, so staging one would queue a field
+    # that is never sent. Firmware older than that has no other way to follow a
+    # broker that moved. This gate exists for those units and must not be
+    # removed while any can exist; the /sync side of it is
+    # _pending_payload_json. See compat/README.md, "Legacy firmware
+    # compatibility".
+    broker_url_held = False
+    if (v := str(args.get("broker_url") or "").strip()):
+        if not v.startswith(("http://", "https://")) or len(v.encode("utf-8")) > 127:
+            return {"error": ERR_BROKER_URL_SHAPE}
+        try:
+            cur = deps.registry.load(device_id)
+        except NotFound:
+            return {"error": f"device {device_id} not registered — call tokenmonitor_register_device first"}
+        except Exception as e:
+            return {"error": f"load: {e}"}
+        legacy, known = broker_url_fw(cur.active.payload.firmware_version)
+        if known and not legacy:
+            return {
+                "error": ERR_BROKER_URL_MDNS_FMT.format(
+                    id=device_id, fw=cur.active.payload.firmware_version
+                )
+            }
+        broker_url_held = not known
+        update.broker_url = v
     if (v := (args.get("psk_hex") or "").strip().lower()):
         if len(v) != 64:
             return {"error": "psk_hex must be exactly 64 hex chars"}
@@ -860,7 +919,14 @@ def _set_device_pending(deps: Deps, args: dict) -> dict:
         return {"error": f"device {device_id} not registered — call tokenmonitor_register_device first"}
     except Exception as e:
         return {"error": str(e)}
-    return {"ok": True, "device": _device_summary(dev)}
+    out: dict = {"ok": True, "device": _device_summary(dev)}
+    if (
+        broker_url_held
+        and dev.pending is not None
+        and dev.pending.payload.broker_url != dev.active.payload.broker_url
+    ):
+        out["note"] = NOTE_BROKER_URL_HELD
+    return out
 
 
 def _revert_firmware(deps: Deps, args: dict) -> dict:
@@ -1037,7 +1103,7 @@ def _set_wifi(deps: Deps, args: dict) -> dict:
         device_id, ConfigPayload(wifi_ssid=ssid, wifi_pass=passphrase)
     )
     if updated.pending is None:
-        # set_pending drops a pending identical to active. Reached when the
+        # set_pending writes no pending when nothing is queued and the result equals active. Reached when the
         # device is already being sent to this network.
         return {"text": f"No change staged: {device_id} is already set to switch to {json.dumps(ssid, ensure_ascii=False)}."}
 
@@ -1254,35 +1320,30 @@ async def _provision(deps: Deps, args: dict) -> dict:
         return {"error": "pairing_code must be 6 digits"}
 
     broker_url = (args.get("broker_url") or "").strip()
-    psk_hex = (args.get("psk_hex") or "").strip().lower()
-    psk_generated = False
-    psk_reused = False
-    if psk_hex:
-        if len(psk_hex) != 64:
-            return {"error": "psk_hex must be 64 hex chars"}
+    caller_url = bool(broker_url)
+    _, err = enrol.explicit_psk(args)
+    if err is not None:
+        return {"error": err}
+    # /info and the mDNS TXT carry no has_psk, so the LAN never knows whether
+    # the device already holds a key: None, "unknown".
+    psk_hex, psk_generated, psk_reused, err = enrol.resolve_enrol_psk(deps, args, device_id, None)
+    if err is not None:
+        return {"error": err}
+    # A PSK with no address strands firmware older than 1.0.0 on "Waiting for
+    # setup": it cannot find the broker by itself. So an enrolment with no
+    # broker_url is given the one address the device can demonstrably reach —
+    # ours, on the route to it. On 1.0.0+ that is just a cache seed.
+    seeded = ""
+    if psk_hex and not broker_url:
         try:
-            bytes.fromhex(psk_hex)
+            u = urlsplit(provision_url)
+            if u.hostname:
+                seeded = enrol.seed_url_towards(deps, u.hostname, u.port or 80)
         except ValueError:
-            return {"error": "psk_hex is not valid hex"}
-    elif broker_url:
-        # No PSK supplied. If this device already has an active PSK in the
-        # registry (a benign re-provision — not a fresh device), REUSE it and
-        # re-push it so the two never drift: rotating the key on every
-        # reconfigure risks desyncing a device whose push silently fails.
-        # Only a genuinely new device mints a fresh 32-byte random PSK.
-        existing = ""
-        if deps.registry is not None:
-            try:
-                existing = deps.registry.load(device_id).active.payload.psk_hex or ""
-            except Exception:
-                existing = ""  # NotFound → new device
-        if existing:
-            psk_hex = existing
-            psk_reused = True
-        else:
-            import secrets
-            psk_hex = secrets.token_hex(32)
-            psk_generated = True
+            seeded = ""
+        if not seeded:
+            return {"error": enrol.ERR_NO_SEED_LAN}
+        broker_url = seeded
 
     payload: dict[str, Any] = {"pairing_code": code}
     if broker_url:
@@ -1332,20 +1393,52 @@ async def _provision(deps: Deps, args: dict) -> dict:
             async with s.post(provision_url, json=payload) as resp:
                 body_text = await resp.text()
                 if resp.status != 200:
-                    return {"ok": False, "http_status": resp.status, "body": body_text}
+                    rejected: dict[str, Any] = {"ok": False, "http_status": resp.status, "body": body_text}
+                    # A 4xx is a refusal before anything was stored. A 5xx is a
+                    # failed write, and those can leave a partial config behind
+                    # (PROVISION_WIRE §3) — the minted PSK may be part of it.
+                    if psk_generated and resp.status >= 500:
+                        rejected["psk_hex"] = psk_hex
+                        rejected["note"] = enrol.NOTE_PSK_MAYBE_LIVE
+                    return rejected
                 try:
                     device_resp: Any = json.loads(body_text)
                 except json.JSONDecodeError:
                     device_resp = body_text
     except Exception as e:
+        if psk_generated:
+            # The request may have reached the device before the connection
+            # died (it reboots right after applying), so the minted PSK may be
+            # live with no copy anywhere on this host. Hand it back rather than
+            # lose it with the error.
+            return {
+                "ok": False,
+                "error": f"POST /provision: {e}",
+                "outcome_unknown": True,
+                "psk_hex": psk_hex,
+                "note": enrol.NOTE_PSK_UNKNOWN,
+            }
         return {"error": f"POST /provision: {e}"}
 
-    out: dict[str, Any] = {"ok": True, "device_id": device_id, "registered": False, "device_response": device_resp}
+    out: dict[str, Any] = {
+        "ok": True,
+        "device_id": device_id,
+        "registered": False,
+        "enrolled": False,
+        "device_response": device_resp,
+    }
     if psk_generated:
         out["psk_generated"] = True
     if psk_reused:
         out["psk_reused"] = True
-    if deps.registry is not None and broker_url and psk_hex:
+    if seeded:
+        out["broker_url_seeded"] = seeded
+    # Mirror the enrolment into the local registry so /device/<id>/sync
+    # recognises the device on first poll. This keys on the PSK that was pushed,
+    # NOT on broker_url: the device finds the broker by mDNS, so an enrolment
+    # with no address is the normal case, not a partial one.
+    note = enrol.no_registry_note(deps, args, psk_hex)
+    if deps.registry is not None and psk_hex:
         reg_payload = ConfigPayload(broker_url=broker_url, psk_hex=psk_hex, city=payload.get("city", ""))
         for k in ("br_day", "br_night", "vol"):
             if k in payload:
@@ -1364,21 +1457,18 @@ async def _provision(deps: Deps, args: dict) -> dict:
                 codex=provider_mode_from_bool(providers.get("codex", False)),
                 gemini=provider_mode_from_bool(providers.get("gemini", False)),
             )
-        try:
-            deps.registry.register(device_id, reg_payload)
-            out["registered"] = True
-        except Exception as e:
-            msg = str(e)
-            if "already exists" in msg:
-                try:
-                    # Re-provision (device wiped + re-paired): converge the active
-                    # config in place — the device already applied it and proved
-                    # presence via the pairing code. Queueing a pending here left
-                    # a stuck, undecryptable update. Preserves metadata. See #8.
-                    deps.registry.replace_active(device_id, reg_payload)
-                    out["reregistered"] = True
-                except Exception as e2:
-                    out["note"] = f"re-register failed: {e2}"
-            else:
-                out["note"] = f"device provisioned but registry write failed: {msg}"
+        registered, reregistered, enrolled, note = enrol.mirror_to_registry(
+            deps, device_id, reg_payload, caller_url
+        )
+        out["registered"] = registered
+        if reregistered:
+            out["reregistered"] = True
+        out["enrolled"] = enrolled
+    if psk_generated and not out["enrolled"]:
+        # The device now signs with a key that exists nowhere on this host.
+        # Hand it back, or the only way out is a factory reset.
+        out["psk_hex"] = psk_hex
+        note = enrol.join_notes(note, enrol.NOTE_PSK_UNRECORDED)
+    if note:
+        out["note"] = note
     return out

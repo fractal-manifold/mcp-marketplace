@@ -66,6 +66,28 @@ export function packSemver(v) {
   return (((maj << 24) | (min << 16) | pat) >>> 0);
 }
 
+// The firmware release where the broker's address stopped being configuration:
+// from 1.0.1 the device resolves it by mDNS and adopts it on a response
+// signature, so a broker_url in a /sync pending is sent only to firmware
+// reporting a version BELOW this. See compat/README.md, "Legacy firmware
+// compatibility".
+export const BROKER_URL_PUSHED_BELOW_FW = "1.0.1";
+
+// brokerURLFw classifies a device's reported firmware version for the one
+// legacy field the control plane still pushes: broker_url. known is false for
+// an empty or unparseable version; legacy is true only for a parseable version
+// below BROKER_URL_PUSHED_BELOW_FW.
+//
+// The comparison is on the numeric MAJOR.MINOR.PATCH base, any "-dev.<ts>"
+// suffix ignored: the version was bumped to 1.0.1 in the same commit that made
+// the address mDNS-resolved (31cfd43), so every 1.0.1-dev.* build already has
+// it and every 1.0.0-dev.* build does not.
+export function brokerURLFw(fw) {
+  const got = packSemver(String(fw ?? "").trim());
+  if (got === null) return { legacy: false, known: false };
+  return { legacy: got < packSemver(BROKER_URL_PUSHED_BELOW_FW), known: true };
+}
+
 // devPrerelease extracts the numeric timestamp from a "-dev.<12 digits>"
 // development prerelease suffix (a YYYYMMDDhhmm value). Returns the timestamp
 // (as a BigInt) when present and well-formed, or null when the string carries

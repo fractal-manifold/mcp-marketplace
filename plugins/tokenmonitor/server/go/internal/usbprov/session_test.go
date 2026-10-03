@@ -30,13 +30,28 @@ type fakeDevice struct {
 	silentAfterProvision bool // apply, but never answer (session stays alive)
 	injectStaleResult    bool
 
+	fwVersion string // "" = 1.0.2
+	hasPSK    *bool  // nil = the firmware predates has_psk and omits it
+
 	gotProvision atomic.Bool // set when a PROVISION is actually applied
+	lastPayload  atomic.Value
 }
 
+// describe is the HELLO_RESP body byte for byte as transport_serial.c's
+// op_describe formats it. Note the key is fw_version, and `state` is the
+// session's done latch ("needs_config" on every HELLO, paired or not).
 func (fd *fakeDevice) describe() []byte {
+	fw := fd.fwVersion
+	if fw == "" {
+		fw = "1.0.2"
+	}
+	psk := ""
+	if fd.hasPSK != nil {
+		psk = fmt.Sprintf(`,"has_psk":%v`, *fd.hasPSK)
+	}
 	return []byte(fmt.Sprintf(
-		`{"device_id":%q,"sku":"S1","fw":"1.0.0","state":"BOOT_NEEDS_CONFIG","proto_ver":1}`,
-		fd.deviceID))
+		`{"device_id":%q,"fw_version":%q,"serial":"TM-S1-DEV-2609-%s","sku":"S1","serial_factory":false,"state":"needs_config","proto_ver":1%s}`,
+		fd.deviceID, fw, fd.deviceID, psk))
 }
 
 func (fd *fakeDevice) run(conn net.Conn) {
@@ -122,6 +137,7 @@ func (fd *fakeDevice) run(conn net.Conn) {
 					continue
 				}
 				fd.gotProvision.Store(true)
+				fd.lastPayload.Store(string(f.Payload))
 				if fd.silentAfterProvision {
 					continue // applied, but the RESULT never goes out
 				}
@@ -269,6 +285,78 @@ func TestSession_CancelAfterProvisionIsOutcomeUnknown(t *testing.T) {
 	}
 	if !fd.gotProvision.Load() {
 		t.Error("the device should have received the PROVISION in this scenario")
+	}
+}
+
+func TestSession_HelloRespAsFirmwareSendsIt(t *testing.T) {
+	// The firmware has always called the version field fw_version; hosts that
+	// read only "fw" saw every device as version-less. has_psk is optional and
+	// three-valued: absent means unknown, never false.
+	yes, no := true, false
+	for _, tc := range []struct {
+		fw     string
+		hasPSK *bool
+	}{{"0.11.0", nil}, {"0.12.0", nil}, {"1.0.1", nil}, {"1.0.2", &no}, {"1.0.2", &yes}} {
+		fd := &fakeDevice{deviceID: "03abcdef", baseNonce: 0xDEADBEEF, resultJSON: []byte(`{"ok":true}`), fwVersion: tc.fw, hasPSK: tc.hasPSK}
+		res, err := runWithFake(t, fd, ProvisionOpts{ProvisionJSON: []byte(`{"city":"Madrid"}`)})
+		if err != nil {
+			t.Fatalf("fw %s: %v", tc.fw, err)
+		}
+		d := res.Device
+		if d.FW != tc.fw || d.SKU != "S1" || d.State != "needs_config" {
+			t.Errorf("fw %s: device info wrong: %+v", tc.fw, d)
+		}
+		if (d.HasPSK == nil) != (tc.hasPSK == nil) || (d.HasPSK != nil && *d.HasPSK != *tc.hasPSK) {
+			t.Errorf("fw %s: has_psk = %v, want %v", tc.fw, d.HasPSK, tc.hasPSK)
+		}
+	}
+}
+
+func TestSession_FinalizeBuildsThePayloadFromTheHelloResp(t *testing.T) {
+	fd := &fakeDevice{deviceID: "03abcdef", baseNonce: 0xDEADBEEF, resultJSON: []byte(`{"ok":true}`), fwVersion: "0.12.0"}
+	_, err := runWithFake(t, fd, ProvisionOpts{
+		ProvisionJSON: []byte(`{"never":"sent"}`),
+		Finalize: func(d DeviceInfo) ([]byte, error) {
+			return []byte(fmt.Sprintf(`{"for":%q,"fw":%q}`, d.DeviceID, d.FW)), nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("RunProvision: %v", err)
+	}
+	if got, _ := fd.lastPayload.Load().(string); got != `{"for":"03abcdef","fw":"0.12.0"}` {
+		t.Errorf("the finalized payload must be what is sent, got %s", got)
+	}
+}
+
+func TestSession_FinalizeRefusalAbortsBeforeWrite(t *testing.T) {
+	refusal := errors.New("not this device")
+	fd := &fakeDevice{deviceID: "03abcdef", baseNonce: 0xDEADBEEF, resultJSON: []byte(`{"ok":true}`)}
+	_, err := runWithFake(t, fd, ProvisionOpts{Finalize: func(DeviceInfo) ([]byte, error) { return nil, refusal }})
+	if err != refusal {
+		t.Fatalf("a Finalize error must come back as-is, got %v", err)
+	}
+	if fd.gotProvision.Load() {
+		t.Error("a refused device must receive NO PROVISION write")
+	}
+}
+
+func TestSession_FinalizeRunsAgainAfterAReHello(t *testing.T) {
+	// A pre-PROVISION reset is recovered by a new handshake; Finalize sees the
+	// device again and the PROVISION carries what it returned.
+	calls := 0
+	fd := &fakeDevice{deviceID: "03abcdef", baseNonce: 0x1000, resultJSON: []byte(`{"ok":true}`), resetOnSessionBegin: true}
+	_, err := runWithFake(t, fd, ProvisionOpts{Finalize: func(DeviceInfo) ([]byte, error) {
+		calls++
+		return []byte(`{"city":"Madrid"}`), nil
+	}})
+	if err != nil {
+		t.Fatalf("RunProvision: %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("Finalize must run once per accepted handshake, ran %d times", calls)
+	}
+	if got, _ := fd.lastPayload.Load().(string); got != `{"city":"Madrid"}` {
+		t.Errorf("payload: %s", got)
 	}
 }
 

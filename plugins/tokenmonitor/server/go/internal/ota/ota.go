@@ -119,6 +119,24 @@ type ManifestFields struct {
 	Channel string `json:"channel"`
 }
 
+// BrokerURLFw classifies a device's reported firmware version for the one
+// legacy field the control plane still pushes: broker_url. known is false for
+// an empty or unparseable version; legacy is true only for a parseable version
+// below registry.BrokerURLPushedBelowFw.
+//
+// The comparison is on the numeric MAJOR.MINOR.PATCH base, any "-dev.<ts>"
+// suffix ignored: the version was bumped to 1.0.1 in the same commit that
+// made the address mDNS-resolved (31cfd43), so every 1.0.1-dev.* build already
+// has it and every 1.0.0-dev.* build does not.
+func BrokerURLFw(fw string) (legacy, known bool) {
+	got, ok := PackSemver(strings.TrimSpace(fw))
+	if !ok {
+		return false, false
+	}
+	min, _ := PackSemver(registry.BrokerURLPushedBelowFw)
+	return got < min, true
+}
+
 // PackSemver packs the MAJOR.MINOR.PATCH base into the 8.8.16 u32 layout the
 // firmware uses for tmon_min_sv (major<<24 | minor<<16 | patch). An optional
 // "-dev.<ts>" development prerelease suffix is ignored (the anti-rollback

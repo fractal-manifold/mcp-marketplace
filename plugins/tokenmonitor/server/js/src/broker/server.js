@@ -10,7 +10,7 @@ import * as devlog from "../devlog.js";
 import { encryptPending, encryptPendingGCM, gcmFwGate } from "../registry/crypto.js";
 import { NotFound, validDeviceID } from "../registry/store.js";
 import { firmwarePath } from "../config.js";
-import { compareSemver, validVersion } from "../ota.js";
+import { compareSemver, validVersion, brokerURLFw } from "../ota.js";
 import { LEASE_PATH, LEASE_RENEW_PATH, LEASE_RELEASE_PATH } from "../usbprov/leasewire.js";
 import { LeaseBusyError, LeaseUnknownError } from "../usbprov/lease.js";
 import { canonicalPort } from "../usbprov/serial.js";
@@ -690,6 +690,20 @@ function handleDeviceSync({ cfg, cache, state, registry, logger, deviceID }, req
   // it to a 4xx/5xx response instead — mirroring handleCredentials' envelope.
   try {
     const observed = parseUint32(req.headers["x-tmon-config-version"] || "");
+    // An operator-staged broker_url is for legacy firmware only (see
+    // pendingPayloadJSON). If the device asking is not legacy — it upgraded
+    // while the re-point was queued, or was never legacy and the tool could
+    // not know yet — take the address out of the pending. This runs before
+    // the promotion below so the address can never be promoted into the
+    // active record as if the device had applied it. (A device that reports
+    // the pending's own version did apply it; that one is left to promote.)
+    const fwEarly = String(req.headers["x-tmon-fw-version"] || "").trim();
+    if (!brokerURLFw(fwEarly).legacy) {
+      try {
+        const dropped = registry.dropPendingBrokerURL(deviceID, observed);
+        if (dropped) logger.warn(`device ${deviceID} reports firmware ${JSON.stringify(fwEarly)}, which resolves the broker by mDNS; dropped the staged broker_url ${dropped}`);
+      } catch (e) { logger.warn(`drop-broker-url: ${e.message}`); }
+    }
     try { registry.maybePromote(deviceID, observed, res2.pskIndex === 1); } catch (e) { logger.warn(`promote: ${e.message}`); }
     try { registry.touch(deviceID, req.socket?.remoteAddress || "", auth.responseSigHost(req)); } catch (e) { logger.warn(`touch: ${e.message}`); }
     // Schema v2: capture factory identity from headers. Not bound to
@@ -722,7 +736,7 @@ function handleDeviceSync({ cfg, cache, state, registry, logger, deviceID }, req
       catch (e) { logger.warn(`set-fw-version: ${e.message}`); }
     }
 
-    const dev = registry.load(deviceID);
+    let dev = registry.load(deviceID);
 
     // Clear a stale revert tombstone once the device has reached a version
     // STRICTLY NEWER than the blocked one (a fixed release landed), so the
@@ -772,7 +786,7 @@ function handleDeviceSync({ cfg, cache, state, registry, logger, deviceID }, req
     }
     if (dev.pending && observed < dev.pending.payload.version) {
       if (!active || active.length !== 32) return finishErr(500, "broker config invalid");
-      const pt = Buffer.from(pendingPayloadJSON(dev.pending.payload), "utf8");
+      const pt = Buffer.from(pendingPayloadJSON(dev.pending.payload, dev.active.payload.broker_url, fwHdr), "utf8");
       const ver = dev.pending.payload.version;
       // Gate the GCM wire format on the LIVE firmware version, never on
       // registry state: a device that just OTA'd to >= 0.9.0 must immediately
@@ -1091,20 +1105,32 @@ function handleDeviceSettings({ cfg, cache, state, registry, logger, deviceID },
   });
 }
 
-export const _testing = { pendingPayloadJSON: (p) => pendingPayloadJSON(p) };
+export const _testing = { pendingPayloadJSON: (p, activeBrokerURL, fw) => pendingPayloadJSON(p, activeBrokerURL, fw) };
 
-function pendingPayloadJSON(p) {
+// activeBrokerURL and fw decide the one legacy field, broker_url.
+function pendingPayloadJSON(p, activeBrokerURL = "", fw = "") {
   const wire = { version: p.version };
-  // broker_url is deliberately NOT emitted. The broker's address is no longer
-  // configuration the control plane owns: the device locates it by mDNS on its
-  // own subnet and adopts it only after the response signature proves the
-  // pairing (compat/mdns.md). Echoing the registry's value here used to
-  // overwrite a freshly-discovered address with the one recorded at
-  // registration time — and, because the firmware treats a broker_url change
-  // as channel identity, reboot the device onto an address that had already
-  // stopped working. The registry field survives as a last-known-address
-  // record; nothing authoritative reads it. Deployed firmware tolerates the
-  // absence (promote_candidate guards on presence).
+  // broker_url: a LEGACY re-point, sent under two conditions at once.
+  //
+  //  1. The device reports firmware older than 1.0.1 (the live
+  //     X-Tmon-Fw-Version header). From 1.0.1 the broker's address is not
+  //     configuration: the device locates it by mDNS on its own subnet and
+  //     adopts it only after the response signature proves the pairing
+  //     (compat/mdns.md). Older firmware has no other way to follow a broker
+  //     that moved, so for it this field is the only re-point there is.
+  //  2. An operator staged it: the pending's address differs from the active
+  //     record's. The registry's own value is only a last-known address and is
+  //     never echoed — doing that used to overwrite a device's working address
+  //     with the one recorded at registration and, because the firmware treats
+  //     a broker_url change as channel identity, reboot it onto an address
+  //     that had already stopped working.
+  //
+  // This gate exists for legacy units and must not be removed while any can
+  // exist: without it they cannot be re-pointed short of re-pairing by hand.
+  // Legacy firmware probes the candidate URL before promoting and reboots on
+  // promote when the address changed; it tolerates the field's absence. See
+  // compat/README.md, "Legacy firmware compatibility".
+  if (brokerURLFw(fw).legacy && p.broker_url && p.broker_url !== activeBrokerURL) wire.broker_url = p.broker_url;
   if (p.psk_hex) wire.psk_hex = p.psk_hex;
   if (p.city) wire.city = p.city;
   // br_day / br_night have documented ranges 10..100 / 5..100, so 0 is

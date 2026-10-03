@@ -321,10 +321,24 @@ type Device struct {
 	// (a fixed release landed), so stale tombstones don't accumulate. Device-
 	// level (sibling of Channel), NOT part of the config payload — the firmware
 	// never sees it. Mirror of py/js blocked_firmware_version.
-	BlockedFirmwareVersion string   `toml:"blocked_firmware_version,omitempty"`
-	Active                 Active   `toml:"active"`
-	Pending                *Pending `toml:"pending,omitempty"`
+	BlockedFirmwareVersion string `toml:"blocked_firmware_version,omitempty"`
+	// BrokerURLDropped is an operator-staged broker_url that was removed from
+	// the pending without ever being sent, because the device turned out to
+	// run firmware that resolves the broker by mDNS (see
+	// BrokerURLPushedBelowFw). Kept so list_devices can say what happened to
+	// the re-point instead of letting it vanish; cleared by the next staged
+	// broker_url or a re-provision. Device-level, never on the wire.
+	BrokerURLDropped string   `toml:"broker_url_dropped,omitempty"`
+	Active           Active   `toml:"active"`
+	Pending          *Pending `toml:"pending,omitempty"`
 }
+
+// BrokerURLPushedBelowFw is the firmware release where the broker's address
+// stopped being configuration: from 1.0.1 the device resolves it by mDNS and
+// adopts it on a response signature, so a broker_url in a /sync pending is
+// sent only to firmware reporting a version BELOW this. See
+// compat/README.md, "Legacy firmware compatibility".
+const BrokerURLPushedBelowFw = "1.0.1"
 
 // normalizeChannel canonicalises a release-channel string: trim +
 // lowercase, kept verbatim. "" means AUTO (track derived from the serial);
@@ -565,8 +579,10 @@ func (r *Registry) Register(deviceID string, active ConfigPayload, channel ...st
 	if !ValidDeviceID(deviceID) {
 		return nil, fmt.Errorf("registry: invalid device_id %q", deviceID)
 	}
-	if active.PSKHex == "" || active.BrokerURL == "" {
-		return nil, errors.New("registry: register requires psk_hex and broker_url")
+	// The PSK is the whole of an enrolment. broker_url is optional: the device
+	// resolves its broker by mDNS, so the record only keeps a last-known one.
+	if active.PSKHex == "" {
+		return nil, errors.New("registry: register requires psk_hex")
 	}
 	if _, err := hex.DecodeString(active.PSKHex); err != nil || len(active.PSKHex) != 64 {
 		return nil, errors.New("registry: psk_hex must be 64 lowercase hex chars")
@@ -607,8 +623,20 @@ func (r *Registry) Register(deviceID string, active ConfigPayload, channel ...st
 //     already queued instead of dropping prior edits.
 //   - version = max(active.Version, prior pending.Version) + 1, so the
 //     device always sees a strictly newer number than what it last knew.
-//   - If the resulting pending is identical to active (no real change),
-//     drop pending instead of writing a no-op.
+//   - If nothing is queued and the result is identical to active (no real
+//     change), write no pending. But a queued pending is never withdrawn:
+//     undoing it leaves a pending that equals active, under a new version,
+//     to be delivered and promoted like any other.
+//
+// The invariant behind that last point: a pending version number, once it may
+// have been handed to a device, is never used again for different content.
+// Withdrawing the pending would let the next staging take the same number
+// (active.Version+1) — and the firmware's candidate probe compares only the
+// number, as does the AES-GCM AAD, so a candidate the device still holds, or
+// a captured blob, from the withdrawn pending would pass for the new one.
+// Versions therefore only ever move forward: here, in DropPendingBrokerURL,
+// through MaybePromote (active takes the pending's number) and through
+// ReplaceActive (which carries the highest number forward).
 //
 // Returns the device record after the update for the caller to inspect.
 func (r *Registry) SetPending(deviceID string, update ConfigPayload) (*Device, error) {
@@ -636,6 +664,9 @@ func (r *Registry) SetPending(deviceID string, update ConfigPayload) (*Device, e
 			base = dev.Active.ConfigPayload
 		}
 		merged := mergePayload(base, update)
+		if update.BrokerURL != "" {
+			dev.BrokerURLDropped = "" // a new re-point supersedes the old report
+		}
 
 		nextVersion := dev.Active.Version + 1
 		if dev.Pending != nil && dev.Pending.Version >= nextVersion {
@@ -643,8 +674,8 @@ func (r *Registry) SetPending(deviceID string, update ConfigPayload) (*Device, e
 		}
 		merged.Version = nextVersion
 
-		if payloadEquivalent(merged, dev.Active.ConfigPayload) {
-			dev.Pending = nil
+		if dev.Pending == nil && payloadEquivalent(merged, dev.Active.ConfigPayload) {
+			// Nothing queued, nothing to change: no version was handed out.
 		} else {
 			dev.Pending = &Pending{
 				ConfigPayload: merged,
@@ -658,6 +689,53 @@ func (r *Registry) SetPending(deviceID string, update ConfigPayload) (*Device, e
 		return nil
 	})
 	return out, err
+}
+
+// DropPendingBrokerURL removes an operator-staged broker_url from the pending
+// (one that differs from the active record's) and remembers it in
+// BrokerURLDropped. The /sync handler calls it when the device asking turns
+// out not to be legacy firmware: the address would never be sent, and leaving
+// it queued would promote it into the active record as if the device had
+// taken it.
+//
+// The pending survives with its version bumped, even when the address was all
+// it held. The bump is what retires a candidate the device may already have
+// stored from the version that carried the address — the firmware's probe
+// compares only the version number, so reusing it (now, or for the next
+// staging) would let that stale candidate be promoted, address included.
+//
+// observedVersion is the config version the device reports. When it equals
+// the pending's, the device already applied this pending — address included,
+// back when it was still legacy — and upgraded before acknowledging it;
+// nothing is dropped, so the acknowledgement promotes it as usual (dropping
+// would also strand a PSK rotation the device has already taken).
+// Returns the dropped URL, "" when there was none.
+func (r *Registry) DropPendingBrokerURL(deviceID string, observedVersion uint32) (string, error) {
+	if !ValidDeviceID(deviceID) {
+		return "", fmt.Errorf("registry: invalid device_id %q", deviceID)
+	}
+	dropped := ""
+	err := r.withLock(deviceID, func(p string) error {
+		dev, err := r.loadLocked(p)
+		if err != nil {
+			return err
+		}
+		if dev.Pending == nil || dev.Pending.BrokerURL == "" || dev.Pending.BrokerURL == dev.Active.BrokerURL {
+			return nil
+		}
+		if dev.Pending.Version == observedVersion {
+			return nil
+		}
+		dropped = dev.Pending.BrokerURL
+		dev.BrokerURLDropped = dropped
+		dev.Pending.BrokerURL = dev.Active.BrokerURL
+		dev.Pending.Version++
+		return r.saveLocked(dev, p)
+	})
+	if err != nil {
+		return "", err
+	}
+	return dropped, nil
 }
 
 // ReplaceActive overwrites a device's active config in place, preserving ALL
@@ -678,20 +756,34 @@ func (r *Registry) ReplaceActive(deviceID string, active ConfigPayload, channel 
 	if !ValidDeviceID(deviceID) {
 		return nil, fmt.Errorf("registry: invalid device_id %q", deviceID)
 	}
-	if active.PSKHex == "" || active.BrokerURL == "" {
-		return nil, errors.New("registry: replace requires psk_hex and broker_url")
+	if active.PSKHex == "" {
+		return nil, errors.New("registry: replace requires psk_hex")
 	}
 	if _, err := hex.DecodeString(active.PSKHex); err != nil || len(active.PSKHex) != 64 {
 		return nil, errors.New("registry: psk_hex must be 64 lowercase hex chars")
 	}
 	active.PSKHex = strings.ToLower(active.PSKHex)
-	active.Version = 1
 
 	var out *Device
 	err := r.withLock(deviceID, func(p string) error {
 		dev, err := r.loadLocked(p)
 		if err != nil {
 			return err
+		}
+		// The version is carried forward, never reset: the highest number
+		// this record ever used (active, or a pending that may have been
+		// handed out). A re-provisioned device that kept its NVS still
+		// reports its old config version, and may still hold a candidate; a
+		// record restarted at 1 would stage its next pending under a number
+		// the device already knows — promoted on the spot by MaybePromote
+		// without ever being applied, or matched by the stale candidate. See
+		// SetPending for the invariant.
+		active.Version = dev.Active.Version
+		if dev.Pending != nil && dev.Pending.Version > active.Version {
+			active.Version = dev.Pending.Version
+		}
+		if active.Version == 0 {
+			active.Version = 1
 		}
 		// Carry over device-reported OTA state from the existing active record:
 		// FirmwareVersion (the running image the device last reported) and
@@ -710,6 +802,7 @@ func (r *Registry) ReplaceActive(deviceID string, active ConfigPayload, channel 
 			LastIP: prev.LastIP, LastLocalAddr: prev.LastLocalAddr,
 			WiFiKnown: prev.WiFiKnown}
 		dev.Pending = nil
+		dev.BrokerURLDropped = ""
 		if len(channel) > 0 {
 			dev.Channel = normalizeChannel(channel[0])
 		}

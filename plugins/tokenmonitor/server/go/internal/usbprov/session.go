@@ -86,8 +86,16 @@ type DeviceInfo struct {
 	DeviceID string `json:"device_id"`
 	SKU      string `json:"sku"`
 	FW       string `json:"fw"`
-	State    string `json:"state"`
-	ProtoVer int    `json:"proto_ver"`
+	// FWVersion is the key shipping firmware actually sends (its HELLO_RESP
+	// mirrors GET /info); parseHelloResp folds it into FW.
+	FWVersion string `json:"fw_version"`
+	State     string `json:"state"`
+	ProtoVer  int    `json:"proto_ver"`
+	// HasPSK says whether the device holds a PSK. Three-valued on purpose:
+	// nil means the firmware did not say (it predates the field, or NVS could
+	// not answer) and MUST be treated as "unknown", never as "fresh". It is
+	// not State, which is only this session's done latch.
+	HasPSK *bool `json:"has_psk"`
 }
 
 // ProvisionOpts drives a full provisioning session.
@@ -100,7 +108,16 @@ type ProvisionOpts struct {
 	// multi-device attach wrote to the intended unit. It is re-checked after
 	// every (re)handshake, so a mid-session device swap cannot slip through.
 	ExpectDeviceID string
-	Timeouts       Timeouts
+	// Finalize, if set, produces the PROVISION payload once the device has
+	// identified itself — it replaces ProvisionJSON. It exists because what
+	// may be sent depends on the HELLO_RESP (device_id, firmware version,
+	// has_psk), which nobody has before the handshake. It runs after every
+	// accepted handshake and always BEFORE any PROVISION write, so an error
+	// from it aborts the session with nothing written and is returned as-is.
+	// A re-handshake calls it again; it must return the same bytes for the
+	// same device.
+	Finalize func(DeviceInfo) ([]byte, error)
+	Timeouts Timeouts
 }
 
 // ProvisionResult is the outcome of a session.
@@ -184,7 +201,14 @@ func RunProvision(ctx context.Context, rwc io.ReadWriteCloser, opts ProvisionOpt
 			return nil, err
 		}
 
-		res, retryHandshake, err := runExchange(ctx, fc, dev, opts.ProvisionJSON, to)
+		payload := opts.ProvisionJSON
+		if opts.Finalize != nil {
+			if payload, err = opts.Finalize(dev); err != nil {
+				return nil, err
+			}
+		}
+
+		res, retryHandshake, err := runExchange(ctx, fc, dev, payload, to)
 		if err != nil {
 			return nil, err
 		}
@@ -368,6 +392,9 @@ func parseHelloResp(f Frame, wantSeq uint8) (DeviceInfo, bool) {
 	}
 	if dev.DeviceID == "" {
 		return DeviceInfo{}, false
+	}
+	if dev.FW == "" {
+		dev.FW = dev.FWVersion
 	}
 	dev.Nonce = f.Nonce
 	return dev, true

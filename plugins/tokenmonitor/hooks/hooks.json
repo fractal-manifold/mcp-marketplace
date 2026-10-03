@@ -1,5 +1,5 @@
 {
-  "description": "TokenMonitor SessionStart hook — nudges to update the plugin/broker when a newer release is published (the broker does not auto-update)",
+  "description": "TokenMonitor SessionStart hook — prewarms the bundled server and nudges to update the plugin when a newer release is published (the bundled broker does not auto-update)",
   "hooks": {
     "SessionStart": [
       {

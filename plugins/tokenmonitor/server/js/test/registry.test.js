@@ -77,8 +77,10 @@ test("theme_mode-only pending bumps version and round-trips", () => {
     assert.ok(d.pending);
     assert.equal(d.pending.payload.version, 2);
     assert.equal(d.pending.payload.theme_mode, "night");
+    // Undo: the pending stays, equal to active, under a new version.
     const d2 = reg.setPending("abcdef04", { ..._testing.emptyPayload(), theme_mode: "day" });
-    assert.equal(d2.pending, null);
+    assert.equal(d2.pending.payload.version, 3);
+    assert.equal(d2.pending.payload.theme_mode, "day");
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
@@ -135,8 +137,46 @@ test("register then set_pending workflow", () => {
     assert.ok(d2.pending);
     assert.equal(d2.pending.payload.version, 2);
     assert.equal(d2.pending.payload.city, "Y");
+    // Undoing a queued pending does not withdraw it (a version is never reused).
     const d3 = reg.setPending("abcdef01", { ..._testing.emptyPayload(), city: "X" });
-    assert.equal(d3.pending, null);
+    assert.equal(d3.pending.payload.version, 3);
+    assert.equal(d3.pending.payload.city, "X");
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("setPending never reuses a version", () => {
+  // Mirror of Go TestSetPending_NeverReusesAVersion.
+  const tmp = mkdtempSync(join(tmpdir(), "tmon-reg-"));
+  try {
+    const reg = new Registry(tmp);
+    const id = "abcdef0b";
+    const p = (o) => ({ ..._testing.emptyPayload(), ...o });
+    reg.register(id, p({ broker_url: "http://x", psk_hex: "aa".repeat(32), city: "Madrid" }));
+    assert.equal(reg.setPending(id, p({ broker_url: "http://y" })).pending.payload.version, 2);
+    let dev = reg.setPending(id, p({ broker_url: "http://x" })); // undo
+    assert.equal(dev.pending.payload.version, 3);
+    assert.equal(dev.pending.payload.broker_url, "http://x");
+    assert.equal(reg.setPending(id, p({ city: "Paris" })).pending.payload.version, 4);
+    // An ack of a retired number promotes nothing; the live one does.
+    assert.equal(reg.maybePromote(id, 2, false), false);
+    assert.equal(reg.maybePromote(id, 3, false), false);
+    assert.equal(reg.maybePromote(id, 4, false), true);
+    // An undone pending, left alone, is delivered and promoted as a no-op.
+    reg.setPending(id, p({ city: "Roma" })); // v5
+    reg.setPending(id, p({ city: "Paris" })); // v6, equals active
+    assert.equal(reg.maybePromote(id, 6, false), true);
+    dev = reg.load(id);
+    assert.equal(dev.active.payload.version, 6);
+    assert.equal(dev.pending, null);
+    assert.equal(dev.active.payload.city, "Paris");
+    // A re-provision carries the highest number forward too, pending included.
+    reg.setPending(id, p({ city: "Oslo" })); // v7
+    dev = reg.replaceActive(id, p({ broker_url: "http://z", psk_hex: "bb".repeat(32) }));
+    assert.equal(dev.active.payload.version, 7);
+    assert.equal(dev.pending, null);
+    assert.equal(reg.setPending(id, p({ city: "Lima" })).pending.payload.version, 8);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
@@ -157,14 +197,14 @@ test("replaceActive converges active, clears pending, preserves metadata (#8)", 
     assert.equal(dev.active.payload.broker_url, "http://new");
     assert.equal(dev.active.payload.psk_hex, "bb".repeat(32));
     assert.equal(dev.active.payload.city, "Sevilla");
-    assert.equal(dev.active.payload.version, 1);
+    assert.equal(dev.active.payload.version, 2); // carried forward, never reset
     assert.equal(dev.channel, "dev"); // device metadata preserved
     assert.equal(dev.active.payload.firmware_version, "1.2.3"); // OTA state preserved
     assert.equal(dev.active.payload.min_secure_version, 7); // anti-rollback floor kept
 
     const d2 = reg.setPending("abcdef0c", { ..._testing.emptyPayload(), city: "Bilbao" });
     assert.ok(d2.pending);
-    assert.equal(d2.pending.payload.version, 2);
+    assert.equal(d2.pending.payload.version, 3);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }

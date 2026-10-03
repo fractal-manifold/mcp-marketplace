@@ -29,7 +29,7 @@ from .. import usbprov
 from ..config import Config, firmware_path
 from ..registry import crypto as reg_crypto
 from ..registry import store as registry  # alias kept for parity with Go broker
-from ..registry.store import NotFound, Registry, valid_device_id
+from ..registry.store import NotFound, Registry, broker_url_fw, valid_device_id
 
 log = logging.getLogger("tmon_mcp.broker")
 
@@ -1096,6 +1096,25 @@ async def _handle_device_sync(req: web.Request) -> web.Response:
             return _error(401, "unauthorized")
 
         observed = _parse_uint32(req.headers.get("X-Tmon-Config-Version", ""))
+        # An operator-staged broker_url is for legacy firmware only (see
+        # _pending_payload_json). If the device asking is not legacy — it
+        # upgraded while the re-point was queued, or was never legacy and the
+        # tool could not know yet — take the address out of the pending. This
+        # runs before the promotion below so the address can never be promoted
+        # into the active record as if the device had applied it. (A device
+        # that reports the pending's own version did apply it; that one is
+        # left to promote.)
+        if not broker_url_fw(req.headers.get("X-Tmon-Fw-Version", ""))[0]:
+            try:
+                dropped = registry.drop_pending_broker_url(device_id, observed)
+                if dropped:
+                    log.warning(
+                        "device %s reports firmware %r, which resolves the broker by mDNS; "
+                        "dropped the staged broker_url %s",
+                        device_id, req.headers.get("X-Tmon-Fw-Version", ""), dropped,
+                    )
+            except Exception as e:
+                log.warning("registry drop_pending_broker_url %s: %s", device_id, e)
         try:
             registry.maybe_promote(device_id, observed, res.psk_index == 1)
         except Exception as e:
@@ -1180,7 +1199,9 @@ async def _handle_device_sync(req: web.Request) -> web.Response:
             if active is None or len(active) != 32:
                 status_to_record = 500
                 return _error(500, "broker config invalid")
-            pt = _pending_payload_json(dev.pending.payload).encode("utf-8")
+            pt = _pending_payload_json(
+                dev.pending.payload, dev.active.payload.broker_url, fw_hdr
+            ).encode("utf-8")
             pending_version = dev.pending.payload.version
             # Gate on the LIVE firmware version the device reports, never on
             # registry state: a device running >= PENDING_GCM_MIN_FW carries
@@ -1525,18 +1546,32 @@ def _parse_uint32(s: str) -> int:
         return 0
 
 
-def _pending_payload_json(p) -> str:
+def _pending_payload_json(p, active_broker_url: str = "", fw: str = "") -> str:
+    """Serialise a pending payload to the JSON the firmware decrypts.
+    active_broker_url and fw decide the one legacy field, broker_url."""
     wire: dict[str, Any] = {"version": int(p.version)}
-    # broker_url is deliberately NOT emitted. The broker's address is no longer
-    # configuration the control plane owns: the device locates it by mDNS on
-    # its own subnet and adopts it only after the response signature proves the
-    # pairing (compat/mdns.md). Echoing the registry's value here used to
-    # overwrite a freshly-discovered address with the one recorded at
-    # registration time — and, because the firmware treats a broker_url change
-    # as channel identity, reboot the device onto an address that had already
-    # stopped working. The registry field survives as a last-known-address
-    # record; nothing authoritative reads it. Deployed firmware tolerates the
-    # absence (promote_candidate guards on presence).
+    # broker_url: a LEGACY re-point, sent under two conditions at once.
+    #
+    #  1. The device reports firmware older than 1.0.1 (the live
+    #     X-Tmon-Fw-Version header). From 1.0.1 the broker's address is not
+    #     configuration: the device locates it by mDNS on its own subnet and
+    #     adopts it only after the response signature proves the pairing
+    #     (compat/mdns.md). Older firmware has no other way to follow a broker
+    #     that moved, so for it this field is the only re-point there is.
+    #  2. An operator staged it: the pending's address differs from the active
+    #     record's. The registry's own value is only a last-known address and
+    #     is never echoed — doing that used to overwrite a device's working
+    #     address with the one recorded at registration and, because the
+    #     firmware treats a broker_url change as channel identity, reboot it
+    #     onto an address that had already stopped working.
+    #
+    # This gate exists for legacy units and must not be removed while any can
+    # exist: without it they cannot be re-pointed short of re-pairing by hand.
+    # Legacy firmware probes the candidate URL before promoting and reboots on
+    # promote when the address changed; it tolerates the field's absence. See
+    # compat/README.md, "Legacy firmware compatibility".
+    if broker_url_fw(fw)[0] and p.broker_url and p.broker_url != active_broker_url:
+        wire["broker_url"] = p.broker_url
     if p.psk_hex:
         wire["psk_hex"] = p.psk_hex
     if p.city:

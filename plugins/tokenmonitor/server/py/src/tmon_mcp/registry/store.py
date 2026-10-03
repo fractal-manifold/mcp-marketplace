@@ -455,6 +455,13 @@ class Device:
     # tombstone. Device-level (sibling of channel), NOT in the config payload.
     # Mirror of go/js blocked_firmware_version.
     blocked_firmware_version: str = ""
+    # An operator-staged broker_url that was removed from the pending without
+    # ever being sent, because the device turned out to run firmware that
+    # resolves the broker by mDNS (see BROKER_URL_PUSHED_BELOW_FW). Kept so
+    # list_devices can say what happened to the re-point instead of letting it
+    # vanish; cleared by the next staged broker_url or a re-provision.
+    # Device-level, never on the wire. Mirror of Go BrokerURLDropped.
+    broker_url_dropped: str = ""
     active: Active = field(default_factory=Active)
     pending: Pending | None = None
 
@@ -471,6 +478,8 @@ class Device:
             doc["channel"] = self.channel
         if self.blocked_firmware_version:
             doc["blocked_firmware_version"] = self.blocked_firmware_version
+        if self.broker_url_dropped:
+            doc["broker_url_dropped"] = self.broker_url_dropped
         doc["active"] = self.active.payload.to_toml_dict()
         if self.active.last_seen:
             doc["active"]["last_seen"] = self.active.last_seen
@@ -532,6 +541,7 @@ def _device_from_toml(text: str) -> Device:
         hw_sku=str(d.get("hw_sku", "")),
         channel=normalize_channel(d.get("channel")),
         blocked_firmware_version=str(d.get("blocked_firmware_version", "")),
+        broker_url_dropped=str(d.get("broker_url_dropped", "")),
         active=active,
         pending=pending,
     )
@@ -611,8 +621,11 @@ class Registry:
     def register(self, device_id: str, active: ConfigPayload, channel: str = "") -> Device:
         if not valid_device_id(device_id):
             raise RegistryError(f"registry: invalid device_id {device_id!r}")
-        if not active.psk_hex or not active.broker_url:
-            raise RegistryError("registry: register requires psk_hex and broker_url")
+        # The PSK is the whole of an enrolment. broker_url is optional: the
+        # device resolves its broker by mDNS, so the record only keeps a
+        # last-known one.
+        if not active.psk_hex:
+            raise RegistryError("registry: register requires psk_hex")
         if len(active.psk_hex) != 64 or not re.fullmatch(r"[0-9a-fA-F]{64}", active.psk_hex):
             raise RegistryError("registry: psk_hex must be 64 lowercase hex chars")
         active.psk_hex = active.psk_hex.lower()
@@ -636,7 +649,12 @@ class Registry:
     ) -> Device:
         """Overwrite a device's active config in place, preserving ALL
         device-level metadata (serial, hw_sku, channel, OTA tombstones, …) and
-        clearing any pending. Version resets to 1.
+        clearing any pending. The version is carried forward, never reset: the
+        highest number this record ever used (active, or a pending that may
+        have been handed out). A re-provisioned device that kept its NVS still
+        reports its old config version and may still hold a candidate; a record
+        restarted at 1 would stage its next pending under a number the device
+        already knows.
 
         For a physical RE-PROVISION (user re-ran /tokenmonitor:configure after
         wiping NVS): the device has already applied the new broker_url+psk and
@@ -646,14 +664,18 @@ class Registry:
         ReplaceActive. See #8. Device must already exist (NotFound bubbles up)."""
         if not valid_device_id(device_id):
             raise RegistryError(f"registry: invalid device_id {device_id!r}")
-        if not active.psk_hex or not active.broker_url:
-            raise RegistryError("registry: replace requires psk_hex and broker_url")
+        if not active.psk_hex:
+            raise RegistryError("registry: replace requires psk_hex")
         if len(active.psk_hex) != 64 or not re.fullmatch(r"[0-9a-fA-F]{64}", active.psk_hex):
             raise RegistryError("registry: psk_hex must be 64 lowercase hex chars")
         active.psk_hex = active.psk_hex.lower()
-        active.version = 1
         with self._with_lock(device_id):
             dev = self._load_locked(device_id)
+            active.version = dev.active.payload.version
+            if dev.pending is not None and dev.pending.payload.version > active.version:
+                active.version = dev.pending.payload.version
+            if active.version == 0:
+                active.version = 1
             # Carry over device-reported OTA state from the existing active
             # record: firmware_version (the running image the device last
             # reported) and min_secure_version (the anti-rollback floor). The
@@ -669,10 +691,51 @@ class Registry:
                                 last_local_addr=prev.last_local_addr,
                                 wifi_known=prev.wifi_known)
             dev.pending = None
+            dev.broker_url_dropped = ""
             if channel is not None:
                 dev.channel = normalize_channel(channel)
             self._save_locked(dev)
             return dev
+
+    def drop_pending_broker_url(self, device_id: str, observed_version: int) -> str:
+        """Remove an operator-staged broker_url from the pending (one that
+        differs from the active record's) and remember it in
+        broker_url_dropped. The /sync handler calls it when the device asking
+        turns out not to be legacy firmware: the address would never be sent,
+        and leaving it queued would promote it into the active record as if the
+        device had taken it.
+
+        The pending survives with its version bumped, even when the address was
+        all it held. The bump is what retires a candidate the device may
+        already have stored from the version that carried the address — the
+        firmware's probe compares only the version number, so reusing it (now,
+        or for the next staging) would let that stale candidate be promoted,
+        address included.
+
+        observed_version is the config version the device reports. When it
+        equals the pending's, the device already applied this pending —
+        address included, back when it was still legacy — and upgraded before
+        acknowledging it; nothing is dropped, so the acknowledgement promotes
+        it as usual (dropping would also strand a PSK rotation the device has
+        already taken). Returns the dropped URL, "" when there was none.
+        Mirror of Go DropPendingBrokerURL."""
+        if not valid_device_id(device_id):
+            raise RegistryError(f"registry: invalid device_id {device_id!r}")
+        with self._with_lock(device_id):
+            dev = self._load_locked(device_id)
+            act = dev.active.payload
+            if dev.pending is None or not dev.pending.payload.broker_url:
+                return ""
+            if dev.pending.payload.broker_url == act.broker_url:
+                return ""
+            if dev.pending.payload.version == observed_version:
+                return ""
+            dropped = dev.pending.payload.broker_url
+            dev.broker_url_dropped = dropped
+            dev.pending.payload.broker_url = act.broker_url
+            dev.pending.payload.version += 1
+            self._save_locked(dev)
+            return dropped
 
     def set_pending(self, device_id: str, update: ConfigPayload) -> Device:
         if not valid_device_id(device_id):
@@ -685,12 +748,20 @@ class Registry:
             dev = self._load_locked(device_id)
             base = dev.pending.payload if dev.pending else dev.active.payload
             merged = _merge_payload(base, update)
+            if update.broker_url:
+                dev.broker_url_dropped = ""  # a new re-point supersedes the old report
             next_version = dev.active.payload.version + 1
             if dev.pending and dev.pending.payload.version >= next_version:
                 next_version = dev.pending.payload.version + 1
             merged.version = next_version
-            if _payload_equivalent(merged, dev.active.payload):
-                dev.pending = None
+            # A queued pending is never withdrawn: undoing it leaves a pending
+            # that equals active, under a new version, delivered and promoted
+            # like any other. Withdrawing it would let the next staging reuse
+            # the same number (active.version+1) for different content — and
+            # the firmware's candidate probe compares only the number, as does
+            # the AES-GCM AAD. Versions only move forward (Go SetPending).
+            if dev.pending is None and _payload_equivalent(merged, dev.active.payload):
+                pass  # nothing queued, nothing to change: no version handed out
             else:
                 dev.pending = Pending(payload=merged, created_at=_iso_now())
             self._save_locked(dev)
@@ -1074,6 +1145,34 @@ def _apply_reported(
             p.pet_name = name
             changed = True
     return changed
+
+
+# The firmware release where the broker's address stopped being configuration:
+# from 1.0.1 the device resolves it by mDNS and adopts it on a response
+# signature, so a broker_url in a /sync pending is sent only to firmware
+# reporting a version BELOW this. See compat/README.md, "Legacy firmware
+# compatibility".
+BROKER_URL_PUSHED_BELOW_FW = "1.0.1"
+
+
+def broker_url_fw(fw: str) -> tuple[bool, bool]:
+    """Classify a device's reported firmware version for the one legacy field
+    the control plane still pushes: broker_url. Returns (legacy, known): known
+    is False for an empty or unparseable version; legacy is True only for a
+    parseable version below BROKER_URL_PUSHED_BELOW_FW.
+
+    The comparison is on the numeric MAJOR.MINOR.PATCH base, any "-dev.<ts>"
+    suffix ignored: the version was bumped to 1.0.1 in the same commit that
+    made the address mDNS-resolved (31cfd43), so every 1.0.1-dev.* build
+    already has it and every 1.0.0-dev.* build does not."""
+    from ..ota import pack_semver  # lazy: avoid import cycle (ota → registry)
+
+    got = pack_semver((fw or "").strip())
+    if got is None:
+        return False, False
+    floor = pack_semver(BROKER_URL_PUSHED_BELOW_FW)
+    assert floor is not None  # constant is well-formed
+    return got < floor, True
 
 
 def _merge_payload(base: ConfigPayload, upd: ConfigPayload) -> ConfigPayload:

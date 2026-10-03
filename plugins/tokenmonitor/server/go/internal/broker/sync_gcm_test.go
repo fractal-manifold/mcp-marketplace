@@ -452,3 +452,131 @@ func TestDeviceSync_DoesNotBlockOnWeakOTAFailReports(t *testing.T) {
 		})
 	}
 }
+
+// syncPendingPayload polls /sync as firmware `fw` and returns the decrypted
+// pending payload, nil when the response carries none.
+func syncPendingPayload(t *testing.T, ts *httptest.Server, pskBytes []byte, fw string) map[string]any {
+	t.Helper()
+	resp := signedSyncRequestFW(t, ts, pskBytes, syncTestID, 1, fw)
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var r syncResponse
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		t.Fatal(err)
+	}
+	if r.Pending == nil {
+		return nil
+	}
+	nonce, ct := mustDecode(t, r.Pending.NonceB64), mustDecode(t, r.Pending.PayloadB64)
+	var pt []byte
+	var err error
+	if r.Pending.Enc == "gcm" {
+		pt, err = registry.DecryptPendingGCM(pskBytes, r.Pending.Version, nonce, ct)
+	} else {
+		pt, err = registry.DecryptPending(pskBytes, nonce, ct)
+	}
+	if err != nil {
+		t.Fatalf("decrypt: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(pt, &payload); err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
+// A legacy unit is re-pointed through its pending: the staged address travels,
+// and stays queued until the device acknowledges the version.
+func TestDeviceSync_LegacyFwReceivesStagedBrokerURL(t *testing.T) {
+	ts, reg := newDeviceSyncServer(t)
+	activePSK := mustHex(t, 32)
+	reg.Register(syncTestID, registry.ConfigPayload{PSKHex: activePSK, BrokerURL: "http://192.168.1.28:8765"})
+	reg.SetPending(syncTestID, registry.ConfigPayload{BrokerURL: "http://192.168.1.50:8765"})
+	pskBytes, _ := hex.DecodeString(activePSK)
+
+	for _, fw := range []string{"0.12.0", "1.0.0", "1.0.0-dev.202609011200"} {
+		payload := syncPendingPayload(t, ts, pskBytes, fw)
+		if payload["broker_url"] != "http://192.168.1.50:8765" {
+			t.Fatalf("fw %s: legacy firmware must receive the staged broker_url, got %v", fw, payload)
+		}
+	}
+	dev, _ := reg.Load(syncTestID)
+	if dev.Pending == nil || dev.BrokerURLDropped != "" {
+		t.Errorf("the re-point must stay queued for a legacy device: %+v", dev)
+	}
+}
+
+// The registry's own record of the address is a last-known value, not
+// something to push: a pending that changes something else carries no
+// broker_url even to legacy firmware.
+func TestDeviceSync_NeverEchoesTheRecordedBrokerURL(t *testing.T) {
+	ts, reg := newDeviceSyncServer(t)
+	activePSK := mustHex(t, 32)
+	reg.Register(syncTestID, registry.ConfigPayload{PSKHex: activePSK, BrokerURL: "http://192.168.1.28:8765", City: "Madrid"})
+	reg.SetPending(syncTestID, registry.ConfigPayload{City: "Paris"})
+	pskBytes, _ := hex.DecodeString(activePSK)
+	payload := syncPendingPayload(t, ts, pskBytes, "0.12.0")
+	if _, ok := payload["broker_url"]; ok || payload["city"] != "Paris" {
+		t.Fatalf("the recorded address must not be echoed: %v", payload)
+	}
+}
+
+// A device that upgrades to 1.0.1+ while a re-point is queued: the address is
+// taken out of the pending (it would never be sent, and must not be promoted
+// into the active record as if applied) and remembered for list_devices.
+func TestDeviceSync_UpgradeWhileQueuedDropsBrokerURL(t *testing.T) {
+	for _, fw := range []string{"1.0.1", "1.0.1-dev.202609181200", "1.2.0", ""} {
+		ts, reg := newDeviceSyncServer(t)
+		activePSK := mustHex(t, 32)
+		reg.Register(syncTestID, registry.ConfigPayload{PSKHex: activePSK, BrokerURL: "http://192.168.1.28:8765", City: "Madrid"})
+		reg.SetPending(syncTestID, registry.ConfigPayload{BrokerURL: "http://192.168.1.50:8765", City: "Paris"})
+		pskBytes, _ := hex.DecodeString(activePSK)
+
+		payload := syncPendingPayload(t, ts, pskBytes, fw)
+		if _, ok := payload["broker_url"]; ok || payload["city"] != "Paris" {
+			t.Fatalf("fw %q: broker_url must be withheld and the rest delivered: %v", fw, payload)
+		}
+		dev, _ := reg.Load(syncTestID)
+		if dev.BrokerURLDropped != "http://192.168.1.50:8765" {
+			t.Errorf("fw %q: the dropped address must be remembered, got %q", fw, dev.BrokerURLDropped)
+		}
+		// The version moves on: a candidate the device may hold from the
+		// version that carried the address must read as stale.
+		if dev.Pending == nil || dev.Pending.BrokerURL != "http://192.168.1.28:8765" || dev.Pending.City != "Paris" || dev.Pending.Version != 3 {
+			t.Errorf("fw %q: the rest of the pending must survive under a new version: %+v", fw, dev.Pending)
+		}
+		if promoted, _ := reg.MaybePromote(syncTestID, 2, false); promoted {
+			t.Errorf("fw %q: an ack of the version that carried the address must not promote", fw)
+		}
+		if promoted, _ := reg.MaybePromote(syncTestID, 3, false); !promoted {
+			t.Errorf("fw %q: the surviving pending must still promote", fw)
+		}
+		if dev, _ = reg.Load(syncTestID); dev.Active.BrokerURL != "http://192.168.1.28:8765" || dev.Active.City != "Paris" {
+			t.Errorf("fw %q: the dropped address must never reach the active record: %+v", fw, dev.Active)
+		}
+		ts.Close()
+	}
+
+	// A pending that held nothing but the address is still delivered, empty,
+	// under the new version — for the same reason.
+	ts, reg := newDeviceSyncServer(t)
+	activePSK := mustHex(t, 32)
+	reg.Register(syncTestID, registry.ConfigPayload{PSKHex: activePSK})
+	reg.SetPending(syncTestID, registry.ConfigPayload{BrokerURL: "http://192.168.1.50:8765"})
+	pskBytes, _ := hex.DecodeString(activePSK)
+	payload := syncPendingPayload(t, ts, pskBytes, "1.0.2")
+	if _, ok := payload["broker_url"]; ok || payload["version"] != float64(3) {
+		t.Fatalf("want the pending re-versioned and without the address: %v", payload)
+	}
+	dev, _ := reg.Load(syncTestID)
+	if dev.Pending == nil || dev.Pending.Version != 3 || dev.BrokerURLDropped != "http://192.168.1.50:8765" || dev.Active.BrokerURL != "" {
+		t.Errorf("pending must be re-versioned, the drop remembered, the active record untouched: %+v", dev)
+	}
+	// Staging a new address clears the report.
+	reg.SetPending(syncTestID, registry.ConfigPayload{BrokerURL: "http://192.168.1.51:8765"})
+	if dev, _ = reg.Load(syncTestID); dev.BrokerURLDropped != "" {
+		t.Errorf("a new re-point supersedes the old report: %q", dev.BrokerURLDropped)
+	}
+}

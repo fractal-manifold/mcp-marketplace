@@ -229,7 +229,12 @@ function parseHelloResp(f, wantSeq) {
   // ignored — so reject it here too rather than coercing. Absent fields are the
   // zero value ("" / 0), which is fine.
   const strField = (v) => v === undefined || v === null || typeof v === "string";
-  if (!strField(obj.sku) || !strField(obj.fw) || !strField(obj.state)) return null;
+  if (!strField(obj.sku) || !strField(obj.fw) || !strField(obj.fw_version) || !strField(obj.state)) return null;
+  // has_psk is three-valued on purpose: undefined means the firmware did not
+  // say (it predates the field, or NVS could not answer) and MUST be treated
+  // as "unknown", never as "fresh". It is not `state`, which is only this
+  // session's done latch.
+  if (obj.has_psk !== undefined && obj.has_psk !== null && typeof obj.has_psk !== "boolean") return null;
   if (obj.proto_ver !== undefined && obj.proto_ver !== null && !Number.isInteger(obj.proto_ver)) {
     return null;
   }
@@ -237,9 +242,12 @@ function parseHelloResp(f, wantSeq) {
     nonce: f.nonce,
     deviceID: obj.device_id,
     sku: typeof obj.sku === "string" ? obj.sku : "",
-    fw: typeof obj.fw === "string" ? obj.fw : "",
+    // fw_version is the key shipping firmware actually sends (its HELLO_RESP
+    // mirrors GET /info); fold it into fw.
+    fw: (typeof obj.fw === "string" && obj.fw) || (typeof obj.fw_version === "string" ? obj.fw_version : ""),
     state: typeof obj.state === "string" ? obj.state : "",
     protoVer: Number.isInteger(obj.proto_ver) ? obj.proto_ver : 0,
+    hasPSK: typeof obj.has_psk === "boolean" ? obj.has_psk : undefined,
   };
 }
 
@@ -350,7 +358,16 @@ async function runExchange(fc, dev, provisionJSON, to, signal) {
 // exchange over transport (an already-opened, OS-exclusively-held serial
 // stream). It CONSUMES transport (closes it before returning).
 //
-// opts: { provisionJSON: Buffer, expectDeviceID?: string, timeouts?, signal? }.
+// opts: { provisionJSON: Buffer, expectDeviceID?: string, finalize?, timeouts?,
+// signal? }.
+//
+// finalize(dev), if set, produces the PROVISION payload once the device has
+// identified itself — it replaces provisionJSON. It exists because what may be
+// sent depends on the HELLO_RESP (device_id, firmware version, has_psk), which
+// nobody has before the handshake. It runs after every accepted handshake and
+// always BEFORE any PROVISION write, so an error thrown from it aborts the
+// session with nothing written and propagates as-is. A re-handshake calls it
+// again; it must return the same bytes for the same device.
 // Returns { device, resultJSON }.
 export async function runProvision(transport, opts) {
   const to = withDefaults(opts.timeouts);
@@ -365,7 +382,8 @@ export async function runProvision(transport, opts) {
     for (let attempt = 0; attempt <= MAX_RESET_RECOVERIES; attempt++) {
       const dev = await doHandshake(fc, to, seqRef, signal);
       acceptDevice(dev, opts); // throws DeviceMismatch / UnsupportedProto before any write
-      const { resultJSON, retryHandshake } = await runExchange(fc, dev, provisionJSON, to, signal);
+      const payload = opts.finalize ? opts.finalize(dev) : provisionJSON;
+      const { resultJSON, retryHandshake } = await runExchange(fc, dev, payload, to, signal);
       if (retryHandshake) continue; // pre-PROVISION reset → re-HELLO
       return { device: dev, resultJSON };
     }

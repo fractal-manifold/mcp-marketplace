@@ -7,17 +7,16 @@ works without it.
 ## The two independent switches
 
 1. **The device flag** `panel_enabled` (this skill, or on-device Settings →
-   Display → Custom panel). Controls whether the device *polls for* and
-   *renders* the swipe-up screen at all.
+   Content → Custom panel). Controls whether the device *polls for* the
+   swipe-up screen's content at all.
 2. **The broker content** — a JSON file the broker serves at
    `GET /device/<id>/panel`. With no file the endpoint returns **404** and the
    page drops out of the rotation even when `panel_enabled` is true.
 
-Both must be on for the screen to show data, and the two fail *differently*:
+Both must be on for the screen to *get* data, and the two fail *differently*:
 flag on but no file → the endpoint 404s and the page drops out of the rotation;
-file present but flag off → the device never polls or renders it at all. The
-empty-state message only appears when the device is polling a broker that
-answers without usable panel content.
+file present but flag off → the device never polls, so a device that boots
+with the flag off never shows the page.
 
 ## Enabling
 
@@ -27,22 +26,30 @@ above).
 
 ## Disabling
 
-Preferred: `panel_enabled: false` — the device stops polling and rendering,
-which is what frees the RAM the panel's render buffers hold.
+Preferred: `panel_enabled: false` — the device stops polling once it re-reads
+the flag, at its next cycle (20 s by default, up to 60 s with `poll_s`, up to
+5 min if it was backing off after failed fetches). That is all the flag does at runtime: a document already loaded stays
+on screen, and its buffers stay allocated, until the device reboots. To make
+the page disappear right away, also 404 the content as described below (do
+that *before* turning the flag off, while the device is still polling), or
+tell the user it goes at the next reboot.
 
 Fallback for brokers too old to advertise `panel_enabled` in the
 `tokenmonitor_set_device_pending` schema (e.g. 0.9.6): you cannot toggle the
 device flag remotely, so 404 the *content* instead —
 
-- move/rename `<panel-dir>/<device-id>.json` aside, **and**
-  `<panel-dir>/default.json` if present (otherwise the device falls back to the
-  default file and the page stays); or
+- move/rename aside the file the resolution order below lands on for that
+  device. With an explicit `[panel.file]."<device-id>"` entry that one file is
+  enough (a missing explicit target 404s without falling back). Without one,
+  move `<dir>/<device-id>.json`, `<dir>/default.json` **and** the shared
+  `file` / `[panel.file].default` — otherwise the next one in the chain is
+  served and the page stays; or
 - comment out the whole `[panel]` section in the broker config and restart the
   broker.
 
 The broker re-reads panel files on every request (mtime+size cache), so
-removing a file 404s on the **next device poll (~20 s) with no broker
-restart** — only editing the `[panel]` *section* of the config needs a
+removing a file 404s on the **next device poll (20 s by default, 3–60 s if
+the document set `poll_s`) with no broker restart** — only editing the `[panel]` *section* of the config needs a
 restart. Tell the user the panel flag itself is still on, and suggest bumping
 the broker so `panel_enabled` becomes pushable.
 
@@ -54,8 +61,15 @@ to change *what the panel shows*, edit the file — do not queue a pending.
 Resolve the location from the broker's `[panel]` section in
 `~/.config/tokenmonitor/tokenmonitor.toml`:
 
-- `dir` set → per-device `dir/<device-id>.json`, else `dir/default.json`;
-- else `file` → one shared panel for every device.
+1. `[panel.file]."<device-id>"` — an explicit per-device entry outranks the
+   directory, and is final: if that file is missing the endpoint 404s, it does
+   not fall through;
+2. `dir/<device-id>.json`, if it exists;
+3. `dir/default.json`, if it exists;
+4. `[panel.file].default`, a.k.a. the bare `file` — one shared panel for every
+   device.
+
+Nothing configured, or the chosen file missing → 404.
 
 Write valid PANEL_WIRE JSON there: `version: 1`, 1–4 `tiles` of type
 `line` / `bar` / `pie` / `table` / `text`; caps are 4 tiles, 4 series, 64

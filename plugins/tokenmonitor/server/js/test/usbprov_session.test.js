@@ -59,10 +59,16 @@ function pipePair() {
   return [a, b];
 }
 
+// The HELLO_RESP body byte for byte as transport_serial.c's op_describe
+// formats it. Note the key is fw_version, and `state` is the session's done
+// latch ("needs_config" on every HELLO, paired or not). hasPSK undefined = the
+// firmware predates has_psk and omits it.
 function describe(opts) {
   const pv = opts.protoVer ?? 1;
+  const fw = opts.fwVersion ?? "1.0.2";
+  const psk = opts.hasPSK === undefined ? "" : `,"has_psk":${opts.hasPSK}`;
   return Buffer.from(
-    `{"device_id":${JSON.stringify(opts.deviceID)},"sku":"S1","fw":"1.0.0","state":"BOOT_NEEDS_CONFIG","proto_ver":${pv}}`,
+    `{"device_id":${JSON.stringify(opts.deviceID)},"fw_version":"${fw}","serial":"TM-S1-DEV-2609-${opts.deviceID}","sku":"S1","serial_factory":false,"state":"needs_config","proto_ver":${pv}${psk}}`,
   );
 }
 
@@ -138,6 +144,7 @@ function attachFakeDevice(b, opts) {
             continue;
           }
           opts.gotProvision.v = true;
+          if (opts.lastPayload) opts.lastPayload.v = Buffer.from(f.payload).toString("utf8");
           if (opts.silentAfterProvision) continue;
           haveLast = true;
           lastSeq = f.seq;
@@ -177,6 +184,7 @@ async function runWithFake(opts, provOpts = {}) {
   return runProvision(host, {
     provisionJSON: Buffer.from(provOpts.provisionJSON || `{"pairing_code":"123456"}`),
     expectDeviceID: provOpts.expectDeviceID,
+    finalize: provOpts.finalize,
     timeouts: FAST,
     signal: provOpts.signal,
   });
@@ -282,6 +290,46 @@ test("cancel after PROVISION is OutcomeUnknown (preserves cancel cause)", async 
   assert.equal(opts.gotProvision.v, true, "device should have received the PROVISION");
 });
 
+test("HELLO_RESP as firmware sends it", async () => {
+  // The firmware has always called the version field fw_version; hosts that
+  // read only "fw" saw every device as version-less. has_psk is optional and
+  // three-valued: absent means unknown, never false.
+  for (const [fw, hasPSK] of [["0.11.0", undefined], ["0.12.0", undefined], ["1.0.1", undefined], ["1.0.2", false], ["1.0.2", true]]) {
+    const res = await runWithFake({ deviceID: "03abcdef", baseNonce: 0xdeadbeef, resultJSON: Buffer.from(`{"ok":true}`), fwVersion: fw, hasPSK });
+    assert.equal(res.device.fw, fw);
+    assert.equal(res.device.sku, "S1");
+    assert.equal(res.device.state, "needs_config");
+    assert.equal(res.device.hasPSK, hasPSK);
+  }
+});
+
+test("finalize builds the payload from the HELLO_RESP", async () => {
+  const opts = { deviceID: "03abcdef", baseNonce: 0xdeadbeef, resultJSON: Buffer.from(`{"ok":true}`), fwVersion: "0.12.0", lastPayload: { v: null } };
+  await runWithFake(opts, {
+    provisionJSON: `{"never":"sent"}`,
+    finalize: (d) => Buffer.from(JSON.stringify({ for: d.deviceID, fw: d.fw })),
+  });
+  assert.equal(opts.lastPayload.v, `{"for":"03abcdef","fw":"0.12.0"}`);
+});
+
+test("a finalize refusal aborts before any write", async () => {
+  class Refused extends Error {}
+  const opts = { deviceID: "03abcdef", baseNonce: 0xdeadbeef, resultJSON: Buffer.from(`{"ok":true}`), gotProvision: { v: false } };
+  await assert.rejects(
+    () => runWithFake(opts, { finalize: () => { throw new Refused("not this device"); } }),
+    Refused,
+  );
+  assert.equal(opts.gotProvision.v, false);
+});
+
+test("finalize runs again after a re-HELLO", async () => {
+  let calls = 0;
+  const opts = { deviceID: "03abcdef", baseNonce: 0x1000, resultJSON: Buffer.from(`{"ok":true}`), resetOnSessionBegin: true, lastPayload: { v: null } };
+  await runWithFake(opts, { finalize: () => { calls++; return Buffer.from(`{"city":"Madrid"}`); } });
+  assert.equal(calls, 2);
+  assert.equal(opts.lastPayload.v, `{"city":"Madrid"}`);
+});
+
 test("device_id mismatch aborts before any write", async () => {
   const opts = {
     deviceID: "03abcdef",
@@ -326,6 +374,6 @@ test("identify performs a HELLO-only handshake", async () => {
   const dev = await identify(host, FAST);
   assert.equal(dev.deviceID, "03abcdef");
   assert.equal(dev.nonce, 0x12345678);
-  assert.equal(dev.fw, "1.0.0");
+  assert.equal(dev.fw, "1.0.2");
   assert.equal(opts.gotProvision.v, false, "identify must not open a session");
 });

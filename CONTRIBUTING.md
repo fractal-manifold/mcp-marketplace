@@ -1,8 +1,11 @@
 # Contributing to fractalmanifold-mcp-marketplace
 
-This repository is consumed two ways:
+This repository is consumed three ways:
 - Standalone, by anyone who runs `/plugin marketplace add fractal-manifold/mcp-marketplace`.
 - As a git submodule of the (private) `agentnetwork` repository, mounted at `marketplace/`.
+- As a git submodule of the `tokenmonitor` monorepo, mounted at `mcp-marketplace/`
+  (substitute that path in the steps below; its release rules live in that
+  repo's `docs/releasing.md`).
 
 The submodule embedding is for convenience: it lets the maintainers edit the
 plugin source side-by-side with the server it talks to. **Pushing to `main` here
@@ -46,5 +49,9 @@ WIP stays private. Merge or rebase onto `main` later when you're ready.
 ## Versioning
 
 - `marketplace.json` plugin entry → `version` is the marketplace-facing version.
-- `plugins/agentnetwork/.claude-plugin/plugin.json` → `version` should match.
+- `plugins/<name>/.claude-plugin/plugin.json` → `version` should match.
+- tokenmonitor also carries the version in `gemini-extension.json` and in the
+  generated `.codex-plugin/plugin.json` (regenerate it with the monorepo's
+  `tmtools.plugin.vendor_contract`; never hand-edit). `server/VERSION` is the
+  separate broker version.
 - Bump on every release; copy-only changes don't need a bump.

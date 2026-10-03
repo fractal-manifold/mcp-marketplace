@@ -130,26 +130,46 @@ func TestResponseSignature_WrongPSKDoesNotVerify(t *testing.T) {
 	}
 }
 
-// The broker's address is no longer configuration it pushes: echoing the
-// registry's recorded broker_url used to overwrite a freshly discovered
-// address and reboot the device onto the one that had already stopped working.
-func TestPendingPayloadJSON_NeverCarriesBrokerURL(t *testing.T) {
-	out, err := pendingPayloadJSON(registry.ConfigPayload{
-		Version:   9,
-		BrokerURL: "http://192.168.1.28:8765",
-		City:      "Barcelona",
-	})
-	if err != nil {
-		t.Fatalf("pendingPayloadJSON: %v", err)
-	}
-	var m map[string]any
-	if err := json.Unmarshal(out, &m); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if _, ok := m["broker_url"]; ok {
-		t.Fatalf("pending must not carry broker_url, got %s", out)
-	}
-	if m["city"] != "Barcelona" {
-		t.Fatalf("other fields must still travel, got %s", out)
+// broker_url travels in a pending under two conditions at once: an operator
+// staged it (it differs from the active record's address — the registry's own
+// value is never echoed), and the device asking reports firmware older than
+// 1.0.1, the release where the address stopped being configuration.
+func TestPendingPayloadJSON_BrokerURLIsALegacyRepoint(t *testing.T) {
+	const staged, recorded = "http://192.168.1.50:8765", "http://192.168.1.28:8765"
+	for _, tc := range []struct {
+		name          string
+		pendingURL    string
+		activeURL, fw string
+		want          bool
+	}{
+		{"legacy 0.12.0", staged, recorded, "0.12.0", true},
+		{"legacy 1.0.0", staged, recorded, "1.0.0", true},
+		{"legacy dev build", staged, recorded, "1.0.0-dev.202609011200", true},
+		{"legacy, registry had no address", staged, "", "0.10.3", true},
+		{"1.0.1", staged, recorded, "1.0.1", false},
+		{"1.0.1 dev build", staged, recorded, "1.0.1-dev.202609181200", false},
+		{"2.0.0", staged, recorded, "2.0.0", false},
+		{"no version reported", staged, recorded, "", false},
+		{"unparseable version", staged, recorded, "dev", false},
+		{"legacy, but only the registry's own address", recorded, recorded, "0.12.0", false},
+		{"legacy, nothing staged", "", recorded, "0.12.0", false},
+	} {
+		out, err := pendingPayloadJSON(registry.ConfigPayload{Version: 9, BrokerURL: tc.pendingURL, City: "Barcelona"}, tc.activeURL, tc.fw)
+		if err != nil {
+			t.Fatalf("%s: pendingPayloadJSON: %v", tc.name, err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(out, &m); err != nil {
+			t.Fatalf("%s: unmarshal: %v", tc.name, err)
+		}
+		if _, got := m["broker_url"]; got != tc.want {
+			t.Errorf("%s: broker_url present = %v, want %v (%s)", tc.name, got, tc.want, out)
+		}
+		if tc.want && m["broker_url"] != staged {
+			t.Errorf("%s: broker_url = %v", tc.name, m["broker_url"])
+		}
+		if m["city"] != "Barcelona" {
+			t.Errorf("%s: other fields must still travel, got %s", tc.name, out)
+		}
 	}
 }

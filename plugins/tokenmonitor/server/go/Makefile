@@ -39,8 +39,8 @@ fmt:
 install: build
 	install -Dm755 $(BIN) $(PREFIX)/bin/$(BIN)
 	@echo "Installed to $(PREFIX)/bin/$(BIN)"
-	@echo "Now install the launcher so Claude Code can find it:"
-	@echo "    sh ../tokenmonitor-mcp-launcher/install.sh"
+	@echo "Now install the launcher so your MCP client can find it:"
+	@echo "    sh ../install.sh"
 	@echo "(The launcher exposes 'tokenmonitor-mcp' on PATH and picks Go/Python/JS"
 	@echo " in priority order.)"
 

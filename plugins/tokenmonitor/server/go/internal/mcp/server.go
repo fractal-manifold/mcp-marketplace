@@ -5,7 +5,7 @@
 //	tokenmonitor_health          — full diagnostic: creds + self-ping
 //	tokenmonitor_recent_logs     — last N broker log lines (local buffer)
 //	tokenmonitor_firmware_logs   — last N ESP-IDF log lines from the device
-//	tokenmonitor_provision_hint  — IP/port to enter in the device's captive portal
+//	tokenmonitor_provision_hint  — the address(es) this broker is reachable on (diagnostic)
 //
 // The MCP server runs in its own goroutine alongside the broker; it does
 // not own the listener or the broker — it just reads from the shared
@@ -118,7 +118,7 @@ func NewServer(d Deps) *server.MCPServer {
 
 	s.AddTool(
 		mcp.NewTool("tokenmonitor_provision_hint",
-			mcp.WithDescription("Print the address(es) the device should be told to poll in its captive portal `svc_url` field — i.e. the laptop's non-loopback IPv4 interfaces, paired with the configured broker port."),
+			mcp.WithDescription("Print the address(es) this broker is reachable on — the laptop's non-loopback IPv4 interfaces paired with the configured broker port. This is a diagnostic: the device finds the broker by itself over mDNS and adopts it only once the broker proves the pairing, and the captive portal collects WiFi credentials only, so nothing has to be told this address. Use it to check reachability, or as the optional `broker_url` cache seed the provisioning tools accept."),
 		),
 		handleProvisionHint(d),
 	)
@@ -132,9 +132,9 @@ func NewServer(d Deps) *server.MCPServer {
 
 	s.AddTool(
 		mcp.NewTool("tokenmonitor_register_device",
-			mcp.WithDescription("Register a device in the local registry so its future polls are recognised. Required for any device that was originally provisioned via the captive portal (which doesn't know about device_ids). Pass the device_id printed on the device (or the first 8 hex chars of its MAC), the broker_url it points to, the PSK hex it derived from its passphrase, and any optional config you want to seed."),
+			mcp.WithDescription("Register a device in the local registry so its future polls are recognised. Use it for a device that already holds a PSK this registry does not know: a legacy unit, one configured by hand, or one whose provisioning call returned psk_hex because the registry could not be written. Pass the device_id printed on the device (or the first 8 hex chars of its MAC), the PSK hex it signs with, and any optional config you want to seed. broker_url is optional and is only recorded as the device's last-known broker address."),
 			mcp.WithString("device_id", mcp.Required(), mcp.Description("8 lowercase hex chars (the device prints this in serial logs).")),
-			mcp.WithString("broker_url", mcp.Required(), mcp.Description("HTTP(S) URL of the tokenmonitor-mcp broker the device should poll. Use tokenmonitor_provision_hint to learn the laptop's reachable address; the URL depends on the user's network.")),
+			mcp.WithString("broker_url", mcp.Description("Optional. HTTP(S) URL of the broker, recorded as the device's last-known address and nothing more — the device resolves its broker by mDNS, so this configures nothing. tokenmonitor_provision_hint lists this host's reachable addresses.")),
 			mcp.WithString("psk_hex", mcp.Required(), mcp.Description("64 lowercase hex chars; for legacy devices it's sha256(passphrase) hex.")),
 			mcp.WithString("city", mcp.Description("e.g. Madrid")),
 			mcp.WithNumber("br_day", mcp.Description("Daytime brightness, 10..100.")),
@@ -150,8 +150,9 @@ func NewServer(d Deps) *server.MCPServer {
 
 	s.AddTool(
 		mcp.NewTool("tokenmonitor_set_device_pending",
-			mcp.WithDescription("Stage a pending config update for a registered device. The next time the device polls /device/<id>/sync, it will receive the encrypted payload and apply it under the candidate/rollback safety net. Only fields you supply are changed; omitted fields keep their active value. Setting psk_hex triggers a key rotation that the broker tracks via two-PSK acceptance until the device confirms."),
+			mcp.WithDescription("Stage a pending config update for a registered device. The next time the device polls /device/<id>/sync, it will receive the encrypted payload and apply it under the candidate/rollback safety net. Only fields you supply are changed; omitted fields keep their active value. Setting psk_hex triggers a key rotation that the broker tracks via two-PSK acceptance until the device confirms. broker_url is accepted only as a legacy re-point for firmware older than 1.0.1 (see that argument)."),
 			mcp.WithString("device_id", mcp.Required(), mcp.Description("8 lowercase hex chars.")),
+			mcp.WithString("broker_url", mcp.Description("LEGACY re-point, for firmware older than 1.0.1 only: the address the device should move to, an http:// or https:// URL of at most 127 bytes (take it from tokenmonitor_provision_hint). From 1.0.1 the device finds the broker by mDNS and adopts it only on a signed response, so the address is not configuration and the call is refused when the device last reported 1.0.1 or newer (a -dev.<ts> build counts by its base version). If the device has not reported a firmware version yet, the address is staged but held: it is sent only if the device's next poll reports firmware older than 1.0.1, and dropped — then reported as broker_url_dropped by tokenmonitor_list_devices — if that poll reports 1.0.1 or newer, or no readable version. The registry's own record of the address is never pushed; only a value staged here is. Legacy firmware probes the new address before switching and reboots onto it, so the broker answering there must be this one (same registry), or the device stays where it is.")),
 			mcp.WithString("psk_hex", mcp.Description("New 64-hex PSK to rotate to.")),
 			mcp.WithString("city", mcp.Description("New city for ambient weather.")),
 			mcp.WithNumber("br_day", mcp.Description("Daytime brightness 10..100.")),
@@ -168,7 +169,7 @@ func NewServer(d Deps) *server.MCPServer {
 			mcp.WithBoolean("autorotate_enabled", mcp.Description("Cycle through enabled providers on the dashboard.")),
 			mcp.WithNumber("autorotate_interval_s", mcp.Description("Seconds between provider cycles, 1..300.")),
 			mcp.WithString("theme_mode",
-				mcp.Description("Theme mode applied on the device: 'day' (light palette), 'night' (dark palette) or 'auto' (follows sunrise/sunset). Applied LIVE when the candidate is promoted — no reboot. Fields that DO reboot the device: psk_hex, the WiFi pair, and arming a firmware update."),
+				mcp.Description("Theme mode applied on the device: 'day' (light palette), 'night' (dark palette) or 'auto' (follows sunrise/sunset). Applied LIVE when the candidate is promoted — no reboot. Fields that DO reboot the device: psk_hex, the WiFi pair, arming a firmware update, and — on firmware older than 1.0.1 — broker_url."),
 				mcp.Enum("day", "night", "auto"),
 			),
 			mcp.WithBoolean("pet_enabled", mcp.Description("Show the on-device virtual pet (default true). The pet is device-owned, like the display settings; the user can also toggle it on the device.")),
@@ -182,7 +183,7 @@ func NewServer(d Deps) *server.MCPServer {
 				mcp.Description("Deprecated alias of antigravity_models, accepted for backward compatibility. Prefer antigravity_models."),
 			),
 			mcp.WithBoolean("log_enabled",
-				mcp.Description("Enable (true) or disable (false) over-the-air diagnostic log upload on the device. Dev units default on and factory units default off, so set true to stream a production unit's logs (visible via tokenmonitor_device_logs) or false to silence one. Takes effect after the device promotes and reboots."),
+				mcp.Description("Enable (true) or disable (false) over-the-air diagnostic log upload on the device. Dev units default on and factory units default off, so set true to stream a production unit's logs (visible via tokenmonitor_device_logs) or false to silence one. Takes effect when the device promotes the change — no reboot."),
 			),
 			mcp.WithString("firmware_url",
 				mcp.Description("Direct HTTPS URL of the .bin to install. Either point at this broker's own /firmware/<file> (preferred for LAN dev) or any external HTTPS host (GitHub release, S3…). Must be set together with firmware_sha256 and firmware_version; otherwise the device ignores all three. Prefer tokenmonitor_publish_firmware for the local-hosting flow."),

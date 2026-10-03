@@ -13,7 +13,7 @@ import { randomBytes, createHash } from "node:crypto";
 import * as auth from "../auth.js";
 import * as creds from "../creds.js";
 import * as ota from "../ota.js";
-import { packSemver } from "../ota.js";
+import { packSemver, brokerURLFw } from "../ota.js";
 import {
   GATE_OK,
   gateDeviceOf,
@@ -25,6 +25,7 @@ import { validDeviceID, effectiveChannel, providerModeEnabled, providerModeFromB
 import { firmwarePath } from "../config.js";
 import { clipCodePoints } from "../textutil.js";
 import { handleUSBScan, handleUSBProvision } from "./usb.js";
+import { resolveEnrolPSK, explicitPSK, seedURLTowards, noRegistryNote, mirrorToRegistry, joinNotes, NOTE_PSK_UNRECORDED, NOTE_PSK_MAYBE_LIVE, NOTE_PSK_UNKNOWN, ERR_NO_SEED_LAN } from "./enrol.js";
 import { setWiFiTool } from "./wifi.js";
 import { daemonLogTail, daemonRunning } from "../sessionLife.js";
 import { loadSharedSnapshot } from "../state.js";
@@ -70,7 +71,25 @@ function providerNames(p) {
   return out;
 }
 
-function deviceSummary(dev) {
+// Canonical strings for the legacy broker_url re-point (compat/mcp-errors.md).
+export const errBrokerURLMDNS = (id, fw) =>
+  `broker_url cannot be staged for device ${id}: it reports firmware ${fw}, and firmware 1.0.1 or newer resolves the broker by mDNS and does not take a pushed address. Nothing was staged.`;
+export const ERR_BROKER_URL_SHAPE = "broker_url must be an http:// or https:// URL of at most 127 bytes";
+export const NOTE_BROKER_URL_HELD =
+  "broker_url is staged but held: this device has not reported a firmware version yet. It is sent only if the device's next poll reports firmware older than 1.0.1, and dropped if that poll reports 1.0.1 or newer, or no readable version.";
+export const LABEL_BROKER_URL_HELD = "broker_url (held: sent only if the device's next poll reports firmware older than 1.0.1)";
+export const LABEL_BROKER_URL_DROP = "broker_url (will be dropped: firmware 1.0.1 or newer resolves the broker by mDNS)";
+
+// brokerURLLabel is the pending_changes entry for a staged broker_url. It says
+// what will actually happen to it, which depends on the firmware the device
+// last reported (active.firmware_version).
+function brokerURLLabel(reportedFw) {
+  const { legacy, known } = brokerURLFw(reportedFw);
+  if (!known) return LABEL_BROKER_URL_HELD;
+  return legacy ? "broker_url" : LABEL_BROKER_URL_DROP;
+}
+
+export function deviceSummary(dev) {
   const out = { device_id: dev.deviceID, active_version: dev.active.payload.version, has_pending: !!dev.pending };
   if (dev.serialNumber) out.serial_number = dev.serialNumber;
   if (dev.hwSku) out.hw_sku = dev.hwSku;
@@ -86,12 +105,15 @@ function deviceSummary(dev) {
     out.pending_created_at = dev.pending.createdAt.toISOString();
     out.pending_changes = pendingChanges(dev.active.payload, dev.pending.payload);
   }
+  // A staged broker_url that was removed unsent because the device runs
+  // firmware that resolves the broker by mDNS.
+  if (dev.brokerURLDropped) out.broker_url_dropped = dev.brokerURLDropped;
   return out;
 }
 
 function pendingChanges(a, p) {
   const out = [];
-  if (p.broker_url && p.broker_url !== a.broker_url) out.push("broker_url");
+  if (p.broker_url && p.broker_url !== a.broker_url) out.push(brokerURLLabel(a.firmware_version));
   if (p.psk_hex && p.psk_hex !== a.psk_hex) out.push("psk_hex (key rotation)");
   if (p.city && p.city !== a.city) out.push("city");
   if (p.br_day && p.br_day !== a.br_day) out.push("br_day");
@@ -233,7 +255,7 @@ export async function dispatch(deps, name, args) {
     case "tokenmonitor_provision": return await provisionTool(deps, args);
     case "tokenmonitor_check_updates": return await checkUpdatesTool(deps, args);
     case "tokenmonitor_usb_scan": return await handleUSBScan(deps, args);
-    case "tokenmonitor_usb_provision": return await handleUSBProvision(deps, args);
+    case "tokenmonitor_usb_provision": return await handleUSBProvision(deps, args, hintURLs(deps));
     default: return { error: `unknown tool ${name}` };
   }
 }
@@ -505,10 +527,17 @@ function gateStagedFirmware(dev, manifestB64, shaHex, version, firmwareURL) {
   return null;
 }
 
+// hintURLs is the provision hint's candidate list: one URL per LAN interface.
+export function hintURLs(deps) {
+  const port = deps.cfg?.server?.port || 0;
+  if (!port) return [];
+  return localIPv4s().map((ip) => `http://${ip}:${port}`);
+}
+
 function provisionHintTool(deps) {
   const ips = localIPv4s();
   const port = deps.cfg.server.port;
-  const urls = ips.map((ip) => `http://${ip}:${port}`);
+  const urls = hintURLs(deps);
   const out = { port, bind: deps.cfg.server.bind, hosts: ips, urls };
   if (deps.cfg.server.bind === "127.0.0.1" || deps.cfg.server.bind === "localhost") {
     out.warning = "broker is bound to 127.0.0.1; the device can only reach it from this host. Switch bind to 0.0.0.0 in tokenmonitor.toml.";
@@ -537,7 +566,6 @@ function registerDeviceTool(deps, args) {
   const brokerURL = String(args.broker_url || "").trim();
   const pskHex = String(args.psk_hex || "").trim().toLowerCase();
   if (!validDeviceID(deviceID)) return { error: "device_id must be 8 lowercase hex chars" };
-  if (!brokerURL) return { error: "broker_url required" };
   if (pskHex.length !== 64) return { error: "psk_hex must be exactly 64 hex chars" };
   if (!/^[0-9a-fA-F]{64}$/.test(pskHex)) return { error: "psk_hex is not valid hex" };
   let channel = ""; // "" = auto-derive the track from the serial
@@ -545,6 +573,8 @@ function registerDeviceTool(deps, args) {
     channel = validChannelArg(args.channel);
     if (channel === null) return { error: "channel must be 'stable' or 'dev'" };
   }
+  // broker_url is optional: the device resolves its broker by mDNS, so the
+  // registry only keeps one as the last-known address.
   const payload = { broker_url: brokerURL, psk_hex: pskHex, city: String(args.city || "").trim(), br_day: 0, br_night: 0, vol: null, providers: null, provider_modes: null, autorotate_enabled: null, autorotate_interval_s: null, version: 0, channel };
   if (args.br_day) payload.br_day = clamp(Number.parseInt(args.br_day, 10) || 0, 10, 100);
   if (args.br_night) payload.br_night = clamp(Number.parseInt(args.br_night, 10) || 0, 5, 100);
@@ -570,12 +600,29 @@ function setDevicePendingTool(deps, args) {
     }
   }
   const upd = { version: 0, broker_url: "", psk_hex: "", city: "", br_day: 0, br_night: 0, vol: null, providers: null, provider_modes: null, autorotate_enabled: null, autorotate_interval_s: null, theme_mode: "", pet_enabled: null, pet_species: null, pet_name: "", panel_enabled: null, gemini_models: null, log_enabled: null, firmware_url: "", firmware_sha256: "", firmware_version: "", firmware_manifest_b64: "", firmware_manifest_sig_b64: "", min_secure_version: 0 };
-  // No broker_url here: the device's broker address is not something the
-  // control plane sets any more. It is discovered by mDNS on the device's own
-  // subnet and adopted only after the response signature proves the pairing, so
-  // a staged address would be overwritten within a poll cycle — after costing a
-  // reboot. The provisioning tools still accept one as a cache seed for a
-  // device that has never resolved.
+  // broker_url is a LEGACY re-point. From firmware 1.0.1 the broker's address
+  // is not something the control plane sets: the device finds it by mDNS and
+  // adopts it on a response signature, so staging one would queue a field that
+  // is never sent. Firmware older than that has no other way to follow a
+  // broker that moved. This gate exists for those units and must not be
+  // removed while any can exist; the /sync side of it is pendingPayloadJSON in
+  // broker/server.js. See compat/README.md, "Legacy firmware compatibility".
+  let brokerURLHeld = false;
+  const stagedURL = String(args.broker_url || "").trim();
+  if (stagedURL) {
+    if (!/^https?:\/\//.test(stagedURL) || Buffer.byteLength(stagedURL, "utf8") > 127) return { error: ERR_BROKER_URL_SHAPE };
+    let cur;
+    try { cur = deps.registry.load(deviceID); }
+    catch (e) {
+      if (/not found/.test(e.message)) return { error: `device ${deviceID} not registered — call tokenmonitor_register_device first` };
+      return { error: `load: ${e.message}` };
+    }
+    const reported = String(cur.active.payload.firmware_version || "");
+    const { legacy, known } = brokerURLFw(reported);
+    if (known && !legacy) return { error: errBrokerURLMDNS(deviceID, reported) };
+    brokerURLHeld = !known;
+    upd.broker_url = stagedURL;
+  }
   if (args.psk_hex) {
     const v = String(args.psk_hex).trim().toLowerCase();
     if (v.length !== 64) return { error: "psk_hex must be exactly 64 hex chars" };
@@ -683,7 +730,12 @@ function setDevicePendingTool(deps, args) {
     const bad = gateStagedFirmware(cur, mb, upd.firmware_sha256, upd.firmware_version, upd.firmware_url);
     if (bad) return { error: bad };
   }
-  try { return { ok: true, device: deviceSummary(deps.registry.setPending(deviceID, upd)) }; }
+  try {
+    const dev = deps.registry.setPending(deviceID, upd);
+    const out = { ok: true, device: deviceSummary(dev) };
+    if (brokerURLHeld && dev.pending && dev.pending.payload.broker_url !== dev.active.payload.broker_url) out.note = NOTE_BROKER_URL_HELD;
+    return out;
+  }
   catch (e) {
     if (/not found/.test(e.message)) return { error: `device ${deviceID} not registered — call tokenmonitor_register_device first` };
     return { error: e.message };
@@ -912,32 +964,29 @@ export async function provisionTool(deps, args) {
   if (!validDeviceID(deviceID)) return { error: "device_id must be 8 lowercase hex chars" };
   if (!provisionURL.endsWith("/provision")) return { error: "provision_url must end in /provision (use tokenmonitor_discover_devices to get it)" };
   if (code.length !== 6) return { error: "pairing_code must be 6 digits" };
-  const brokerURL = String(args.broker_url || "").trim();
-  let pskHex = String(args.psk_hex || "").trim().toLowerCase();
-  let pskGenerated = false;
-  let pskReused = false;
-  if (pskHex) {
-    if (pskHex.length !== 64) return { error: "psk_hex must be 64 hex chars" };
-    if (!/^[0-9a-fA-F]{64}$/.test(pskHex)) return { error: "psk_hex is not valid hex" };
-  } else if (brokerURL) {
-    // No PSK supplied. If this device already has an active PSK in the
-    // registry (a benign re-provision — not a fresh device), REUSE it and
-    // re-push it so the two never drift: rotating the key on every
-    // reconfigure risks desyncing a device whose push silently fails.
-    // Only a genuinely new device mints a fresh 32-byte random PSK.
-    let existing = "";
-    if (deps.registry) {
-      try { existing = deps.registry.load(deviceID)?.active?.payload?.psk_hex || ""; }
-      catch { /* NotFound → new device */ }
+  let brokerURL = String(args.broker_url || "").trim();
+  const callerURL = !!brokerURL;
+  const given = explicitPSK(args);
+  if (given.error) return { error: given.error };
+  // /info and the mDNS TXT carry no has_psk, so the LAN never knows whether
+  // the device already holds a key: undefined, "unknown".
+  const psk = resolveEnrolPSK(deps, args, deviceID, undefined);
+  if (psk.error) return { error: psk.error };
+  const { pskHex, pskGenerated, pskReused } = psk;
+  // A PSK with no address strands firmware older than 1.0.0 on "Waiting for
+  // setup": it cannot find the broker by itself. So an enrolment with no
+  // broker_url is given the one address the device can demonstrably reach —
+  // ours, on the route to it. On 1.0.0+ that is just a cache seed.
+  let seeded = "";
+  if (pskHex && !brokerURL) {
+    try {
+      const u = new URL(provisionURL);
+      if (u.hostname) seeded = await seedURLTowards(deps, u.hostname.replace(/^\[|\]$/g, ""), Number(u.port) || 80);
+    } catch {
+      seeded = "";
     }
-    if (existing) {
-      pskHex = existing;
-      pskReused = true;
-    } else {
-      const { randomBytes } = await import("node:crypto");
-      pskHex = randomBytes(32).toString("hex");
-      pskGenerated = true;
-    }
+    if (!seeded) return { error: ERR_NO_SEED_LAN };
+    brokerURL = seeded;
   }
   const payload = { pairing_code: code };
   if (brokerURL) payload.broker_url = brokerURL;
@@ -991,6 +1040,9 @@ export async function provisionTool(deps, args) {
         let buf = "";
         res.on("data", (c) => { buf += c; });
         res.on("end", () => resolve({ status: res.statusCode, body: buf }));
+        // An answer cut off part-way must fail the call, not leave it pending.
+        res.on("error", reject);
+        res.on("aborted", () => reject(new Error("response aborted")));
       });
       req.on("error", reject);
       req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
@@ -998,32 +1050,56 @@ export async function provisionTool(deps, args) {
       req.end();
     });
     httpStatus = r.status; respText = r.body;
-  } catch (e) { return { error: `POST /provision: ${e.message}` }; }
+  } catch (e) {
+    if (pskGenerated) {
+      // The request may have reached the device before the connection died
+      // (it reboots right after applying), so the minted PSK may be live with
+      // no copy anywhere on this host. Hand it back rather than lose it with
+      // the error.
+      return { ok: false, error: `POST /provision: ${e.message}`, outcome_unknown: true, psk_hex: pskHex, note: NOTE_PSK_UNKNOWN };
+    }
+    return { error: `POST /provision: ${e.message}` };
+  }
 
-  if (httpStatus !== 200) return { ok: false, http_status: httpStatus, body: respText };
+  if (httpStatus !== 200) {
+    const rejected = { ok: false, http_status: httpStatus, body: respText };
+    // A 4xx is a refusal before anything was stored. A 5xx is a failed write,
+    // and those can leave a partial config behind (PROVISION_WIRE §3) — the
+    // minted PSK may be part of it.
+    if (pskGenerated && httpStatus >= 500) {
+      rejected.psk_hex = pskHex;
+      rejected.note = NOTE_PSK_MAYBE_LIVE;
+    }
+    return rejected;
+  }
   let deviceResp;
   try { deviceResp = JSON.parse(respText); } catch { deviceResp = respText; }
-  const out = { ok: true, device_id: deviceID, registered: false, device_response: deviceResp };
+  const out = { ok: true, device_id: deviceID, registered: false, enrolled: false, device_response: deviceResp };
   if (pskGenerated) out.psk_generated = true;
   if (pskReused) out.psk_reused = true;
-  if (deps.registry && brokerURL && pskHex) {
+  if (seeded) out.broker_url_seeded = seeded;
+  // Mirror the enrolment into the local registry so /device/<id>/sync
+  // recognises the device on first poll. This keys on the PSK that was pushed,
+  // NOT on broker_url: the device finds the broker by mDNS, so an enrolment
+  // with no address is the normal case, not a partial one.
+  let note = noRegistryNote(deps, args, pskHex);
+  if (deps.registry && pskHex) {
     const regModes = payload.providers
       ? { claude: providerModeFromBool(!!payload.providers.claude), codex: providerModeFromBool(!!payload.providers.codex), gemini: providerModeFromBool(!!payload.providers.gemini) }
       : null;
     const regPayload = { version: 0, broker_url: brokerURL, psk_hex: pskHex, city: payload.city || "", br_day: payload.br_day || 0, br_night: payload.br_night || 0, vol: payload.vol ?? null, providers: null, provider_modes: regModes, autorotate_enabled: null, autorotate_interval_s: null, theme_mode: payload.theme_mode || "", pet_enabled: ("pet_enabled" in payload) ? payload.pet_enabled : null, panel_enabled: ("panel_enabled" in payload) ? payload.panel_enabled : null };
-    try { deps.registry.register(deviceID, regPayload); out.registered = true; }
-    catch (e) {
-      if (/already exists/.test(e.message)) {
-        // Re-provision (device wiped + re-paired): converge active config in
-        // place — the device already applied it and proved presence via the
-        // pairing code. Queueing a pending left a stuck, undecryptable update.
-        // Preserves device metadata. See #8.
-        try { deps.registry.replaceActive(deviceID, regPayload); out.reregistered = true; }
-        catch (e2) { out.note = `re-register failed: ${e2.message}`; }
-      } else {
-        out.note = `device provisioned but registry write failed: ${e.message}`;
-      }
-    }
+    const m = mirrorToRegistry(deps, deviceID, regPayload, callerURL);
+    out.registered = m.registered;
+    if (m.reregistered) out.reregistered = true;
+    out.enrolled = m.enrolled;
+    note = m.note;
   }
+  if (pskGenerated && !out.enrolled) {
+    // The device now signs with a key that exists nowhere on this host. Hand
+    // it back, or the only way out is a factory reset.
+    out.psk_hex = pskHex;
+    note = joinNotes(note, NOTE_PSK_UNRECORDED);
+  }
+  if (note) out.note = note;
   return out;
 }

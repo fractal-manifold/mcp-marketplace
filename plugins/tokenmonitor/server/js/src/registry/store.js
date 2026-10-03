@@ -161,7 +161,9 @@ export class Registry {
 
   register(id, active) {
     if (!validDeviceID(id)) throw new RegistryError(`registry: invalid device_id ${JSON.stringify(id)}`);
-    if (!active.psk_hex || !active.broker_url) throw new RegistryError("registry: register requires psk_hex and broker_url");
+    // The PSK is the whole of an enrolment. broker_url is optional: the device
+    // resolves its broker by mDNS, so the record only keeps a last-known one.
+    if (!active.psk_hex) throw new RegistryError("registry: register requires psk_hex");
     if (active.psk_hex.length !== 64 || !/^[0-9a-fA-F]{64}$/.test(active.psk_hex)) {
       throw new RegistryError("registry: psk_hex must be 64 lowercase hex chars");
     }
@@ -181,7 +183,7 @@ export class Registry {
 
   // replaceActive overwrites a device's active config in place, preserving ALL
   // device-level metadata (serialNumber, hwSku, channel, blockedFirmwareVersion,
-  // …) and clearing any pending. Version resets to 1. For a physical
+  // …) and clearing any pending. The version is carried forward (see below). For a physical
   // re-provision (user re-ran /tokenmonitor:configure after wiping NVS): the
   // device already applied the new broker_url+psk and proved presence with the
   // pairing code, so converge active rather than queue a pending the wiped
@@ -189,14 +191,21 @@ export class Registry {
   // config version 0). Mirror of Go ReplaceActive. See #8. Device must exist.
   replaceActive(id, active) {
     if (!validDeviceID(id)) throw new RegistryError(`registry: invalid device_id ${JSON.stringify(id)}`);
-    if (!active.psk_hex || !active.broker_url) throw new RegistryError("registry: replace requires psk_hex and broker_url");
+    if (!active.psk_hex) throw new RegistryError("registry: replace requires psk_hex");
     if (active.psk_hex.length !== 64 || !/^[0-9a-fA-F]{64}$/.test(active.psk_hex)) {
       throw new RegistryError("registry: psk_hex must be 64 lowercase hex chars");
     }
     active.psk_hex = active.psk_hex.toLowerCase();
-    active.version = 1;
     return this._withLock(id, () => {
       const dev = this._loadLocked(id);
+      // The version is carried forward, never reset: the highest number this
+      // record ever used (active, or a pending that may have been handed out).
+      // A re-provisioned device that kept its NVS still reports its old config
+      // version and may still hold a candidate; a record restarted at 1 would
+      // stage its next pending under a number the device already knows.
+      active.version = dev.active && dev.active.payload ? dev.active.payload.version : 0;
+      if (dev.pending && dev.pending.payload.version > active.version) active.version = dev.pending.payload.version;
+      if (!active.version) active.version = 1;
       if (active.channel !== undefined && active.channel !== null) dev.channel = normalizeChannel(active.channel);
       delete active.channel; // channel is device-level, not part of the config payload
       // Carry over device-reported OTA state from the existing active record:
@@ -217,8 +226,47 @@ export class Registry {
                      lastLocalAddr: prev ? (prev.lastLocalAddr || "") : "",
                      wifiKnown: prev ? (prev.wifiKnown ?? null) : null };
       dev.pending = null;
+      dev.brokerURLDropped = "";
       this._saveLocked(dev);
       return dev;
+    });
+  }
+
+  // dropPendingBrokerURL removes an operator-staged broker_url from the pending
+  // (one that differs from the active record's) and remembers it in
+  // brokerURLDropped. The /sync handler calls it when the device asking turns
+  // out not to be legacy firmware: the address would never be sent, and
+  // leaving it queued would promote it into the active record as if the device
+  // had taken it.
+  //
+  // The pending survives with its version bumped, even when the address was
+  // all it held. The bump is what retires a candidate the device may already
+  // have stored from the version that carried the address — the firmware's
+  // probe compares only the version number, so reusing it (now, or for the
+  // next staging) would let that stale candidate be promoted, address
+  // included.
+  //
+  // observedVersion is the config version the device reports. When it equals
+  // the pending's, the device already applied this pending — address
+  // included, back when it was still legacy — and upgraded before
+  // acknowledging it; nothing is dropped, so the acknowledgement promotes it
+  // as usual (dropping would also strand a PSK rotation the device has
+  // already taken). Returns the dropped URL, "" when there was none. Mirror of
+  // Go DropPendingBrokerURL.
+  dropPendingBrokerURL(id, observedVersion) {
+    if (!validDeviceID(id)) throw new RegistryError(`registry: invalid device_id ${JSON.stringify(id)}`);
+    return this._withLock(id, () => {
+      const dev = this._loadLocked(id);
+      const act = dev.active.payload;
+      if (!dev.pending || !dev.pending.payload.broker_url) return "";
+      if (dev.pending.payload.broker_url === act.broker_url) return "";
+      if (dev.pending.payload.version === observedVersion) return "";
+      const dropped = dev.pending.payload.broker_url;
+      dev.brokerURLDropped = dropped;
+      dev.pending.payload.broker_url = act.broker_url;
+      dev.pending.payload.version += 1;
+      this._saveLocked(dev);
+      return dropped;
     });
   }
 
@@ -234,11 +282,18 @@ export class Registry {
       const dev = this._loadLocked(id);
       const base = dev.pending ? dev.pending.payload : dev.active.payload;
       const merged = mergePayload(base, update);
+      if (update.broker_url) dev.brokerURLDropped = ""; // a new re-point supersedes the old report
       let next = dev.active.payload.version + 1;
       if (dev.pending && dev.pending.payload.version >= next) next = dev.pending.payload.version + 1;
       merged.version = next;
-      if (payloadEquivalent(merged, dev.active.payload)) {
-        dev.pending = null;
+      // A queued pending is never withdrawn: undoing it leaves a pending that
+      // equals active, under a new version, delivered and promoted like any
+      // other. Withdrawing it would let the next staging reuse the same number
+      // (active.version+1) for different content — and the firmware's
+      // candidate probe compares only the number, as does the AES-GCM AAD.
+      // Versions only move forward (Go SetPending).
+      if (!dev.pending && payloadEquivalent(merged, dev.active.payload)) {
+        // nothing queued, nothing to change: no version was handed out
       } else {
         dev.pending = { payload: merged, createdAt: new Date() };
       }
@@ -674,6 +729,7 @@ function deviceToTOML(dev) {
   if (dev.hwSku) doc.hw_sku = dev.hwSku;
   if (dev.channel) doc.channel = dev.channel;
   if (dev.blockedFirmwareVersion) doc.blocked_firmware_version = dev.blockedFirmwareVersion;
+  if (dev.brokerURLDropped) doc.broker_url_dropped = dev.brokerURLDropped;
   const a = payloadToTomlObj(dev.active.payload);
   if (dev.active.lastSeen) a.last_seen = dev.active.lastSeen;
   if (dev.active.lastIP) a.last_ip = dev.active.lastIP;
@@ -727,6 +783,13 @@ function deviceFromTOML(text) {
     hwSku: String(d.hw_sku || ""),
     channel: normalizeChannel(d.channel),
     blockedFirmwareVersion: String(d.blocked_firmware_version || ""),
+    // An operator-staged broker_url that was removed from the pending without
+    // ever being sent, because the device turned out to run firmware that
+    // resolves the broker by mDNS. Kept so list_devices can say what happened
+    // to the re-point; cleared by the next staged broker_url or a
+    // re-provision. Device-level, never on the wire. Mirror of Go
+    // BrokerURLDropped.
+    brokerURLDropped: String(d.broker_url_dropped || ""),
     active,
     pending,
   };

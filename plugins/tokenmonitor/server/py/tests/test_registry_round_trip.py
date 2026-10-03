@@ -99,16 +99,44 @@ def test_register_and_set_pending(tmp_path: Path):
     assert dev2.pending is not None
     assert dev2.pending.payload.version == 2
     assert dev2.pending.payload.city == "Y"
-    # Set pending: no-op (same city as current pending) → version still bumps and is then dropped if equal to active
-    # Equivalent to active → drops pending
+    # Undoing a queued pending does not withdraw it: it stays, equal to active,
+    # under a new version (a version number is never reused).
     dev3 = reg.set_pending("abcdef01", ConfigPayload(city="X"))
-    assert dev3.pending is None
+    assert dev3.pending is not None and dev3.pending.payload.version == 3
+    assert dev3.pending.payload.city == "X"
+
+
+def test_set_pending_never_reuses_a_version(tmp_path: Path):
+    # Mirror of Go TestSetPending_NeverReusesAVersion.
+    reg = Registry(str(tmp_path))
+    did = "abcdef0b"
+    reg.register(did, ConfigPayload(broker_url="http://x", psk_hex="aa" * 32, city="Madrid"))
+    assert reg.set_pending(did, ConfigPayload(broker_url="http://y")).pending.payload.version == 2
+    dev = reg.set_pending(did, ConfigPayload(broker_url="http://x"))  # undo
+    assert dev.pending.payload.version == 3 and dev.pending.payload.broker_url == "http://x"
+    assert reg.set_pending(did, ConfigPayload(city="Paris")).pending.payload.version == 4
+    # An ack of a retired number promotes nothing; the live one does.
+    assert not reg.maybe_promote(did, 2, False)
+    assert not reg.maybe_promote(did, 3, False)
+    assert reg.maybe_promote(did, 4, False)
+    # An undone pending, left alone, is delivered and promoted as a no-op.
+    reg.set_pending(did, ConfigPayload(city="Roma"))  # v5
+    reg.set_pending(did, ConfigPayload(city="Paris"))  # v6, equals active
+    assert reg.maybe_promote(did, 6, False)
+    dev = reg.load(did)
+    assert dev.active.payload.version == 6 and dev.pending is None
+    assert dev.active.payload.city == "Paris"
+    # A re-provision carries the highest number forward too, pending included.
+    reg.set_pending(did, ConfigPayload(city="Oslo"))  # v7
+    dev = reg.replace_active(did, ConfigPayload(broker_url="http://z", psk_hex="bb" * 32))
+    assert dev.active.payload.version == 7 and dev.pending is None
+    assert reg.set_pending(did, ConfigPayload(city="Lima")).pending.payload.version == 8
 
 
 def test_replace_active_converges_and_preserves_metadata(tmp_path: Path):
-    """Issue #8: re-provision overwrites active in place, clears pending, resets
-    version to 1, and preserves device-level metadata (channel). A later pending
-    resumes at v2."""
+    """Issue #8: re-provision overwrites active in place, clears pending,
+    carries the version forward (the withdrawn pending was v2) and preserves
+    device-level metadata (channel). A later pending resumes at v3."""
     reg = Registry(str(tmp_path))
     reg.register(
         "abcdef0a",
@@ -128,14 +156,14 @@ def test_replace_active_converges_and_preserves_metadata(tmp_path: Path):
     assert dev.active.payload.broker_url == "http://new"
     assert dev.active.payload.psk_hex == "bb" * 32
     assert dev.active.payload.city == "Sevilla"
-    assert dev.active.payload.version == 1
+    assert dev.active.payload.version == 2
     assert dev.channel == "dev"  # metadata preserved
     assert dev.active.payload.firmware_version == "1.2.3"  # OTA state preserved
     assert dev.active.payload.min_secure_version == 7  # anti-rollback floor kept
 
     dev2 = reg.set_pending("abcdef0a", ConfigPayload(city="Bilbao"))
     assert dev2.pending is not None
-    assert dev2.pending.payload.version == 2
+    assert dev2.pending.payload.version == 3
 
 
 def test_replace_active_requires_existing(tmp_path: Path):
@@ -160,9 +188,9 @@ def test_theme_mode_only_bumps_pending(tmp_path: Path):
     assert dev.pending is not None
     assert dev.pending.payload.version == 2
     assert dev.pending.payload.theme_mode == "night"
-    # No-op: pending equal to active drops pending.
+    # Undo: the pending stays, equal to active, under a new version.
     dev2 = reg.set_pending("abcdef04", ConfigPayload(theme_mode="day"))
-    assert dev2.pending is None
+    assert dev2.pending.payload.version == 3 and dev2.pending.payload.theme_mode == "day"
 
 
 def test_maybe_promote_theme_only_with_active_psk(tmp_path: Path):

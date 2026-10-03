@@ -44,6 +44,35 @@ type deviceSummary struct {
 	PendingVersion   uint32    `json:"pending_version,omitempty"`
 	PendingChanges   []string  `json:"pending_changes,omitempty"`
 	PendingCreatedAt time.Time `json:"pending_created_at,omitempty"`
+	// BrokerURLDropped is a staged broker_url that was removed unsent because
+	// the device runs firmware that resolves the broker by mDNS.
+	BrokerURLDropped string `json:"broker_url_dropped,omitempty"`
+}
+
+// Canonical strings for the legacy broker_url re-point (compat/mcp-errors.md).
+const (
+	// errBrokerURLMDNSFmt takes the device id and its reported firmware.
+	errBrokerURLMDNSFmt = "broker_url cannot be staged for device %s: it reports firmware %s, and firmware 1.0.1 or newer resolves the broker by mDNS and does not take a pushed address. Nothing was staged."
+	errBrokerURLShape   = "broker_url must be an http:// or https:// URL of at most 127 bytes"
+	noteBrokerURLHeld   = "broker_url is staged but held: this device has not reported a firmware version yet. It is sent only if the device's next poll reports firmware older than 1.0.1, and dropped if that poll reports 1.0.1 or newer, or no readable version."
+
+	labelBrokerURLHeld = "broker_url (held: sent only if the device's next poll reports firmware older than 1.0.1)"
+	labelBrokerURLDrop = "broker_url (will be dropped: firmware 1.0.1 or newer resolves the broker by mDNS)"
+)
+
+// brokerURLLabel is the pending_changes entry for a staged broker_url. It
+// says what will actually happen to it, which depends on the firmware the
+// device last reported (active.FirmwareVersion).
+func brokerURLLabel(reportedFw string) string {
+	legacy, known := ota.BrokerURLFw(reportedFw)
+	switch {
+	case !known:
+		return labelBrokerURLHeld
+	case legacy:
+		return "broker_url"
+	default:
+		return labelBrokerURLDrop
+	}
 }
 
 // providerNames flattens a ProviderModeSet into the slice of enabled
@@ -71,7 +100,7 @@ func providerNames(p *registry.ProviderModeSet) []string {
 func pendingChanges(active, pending registry.ConfigPayload) []string {
 	var diffs []string
 	if pending.BrokerURL != "" && pending.BrokerURL != active.BrokerURL {
-		diffs = append(diffs, "broker_url")
+		diffs = append(diffs, brokerURLLabel(active.FirmwareVersion))
 	}
 	if pending.PSKHex != "" && pending.PSKHex != active.PSKHex {
 		diffs = append(diffs, "psk_hex (key rotation)")
@@ -161,6 +190,7 @@ func summarise(dev *registry.Device) deviceSummary {
 		ActiveProviders:  providerNames(dev.Active.ProviderModes),
 		MinSecureVersion: dev.Active.MinSecureVersion,
 		LastSeen:         dev.Active.LastSeen,
+		BrokerURLDropped: dev.BrokerURLDropped,
 	}
 	if dev.Pending != nil {
 		s.HasPending = true
@@ -210,9 +240,6 @@ func handleRegisterDevice(d Deps) server.ToolHandlerFunc {
 		if !registry.ValidDeviceID(deviceID) {
 			return mcp.NewToolResultError("device_id must be 8 lowercase hex chars"), nil
 		}
-		if brokerURL == "" {
-			return mcp.NewToolResultError("broker_url required"), nil
-		}
 		if len(pskHex) != 64 {
 			return mcp.NewToolResultError("psk_hex must be exactly 64 hex chars"), nil
 		}
@@ -232,6 +259,8 @@ func handleRegisterDevice(d Deps) server.ToolHandlerFunc {
 			channel = ch
 		}
 
+		// broker_url is optional: the device resolves its broker by mDNS, so
+		// the registry only keeps one as the last-known address.
 		payload := registry.ConfigPayload{
 			BrokerURL: brokerURL,
 			PSKHex:    pskHex,
@@ -287,13 +316,34 @@ func handleSetDevicePending(d Deps) server.ToolHandlerFunc {
 			}
 		}
 
-		// No broker_url here: the device's broker address is not something the
-		// control plane sets any more. It is discovered by mDNS on the device's
-		// own subnet and adopted only after the response signature proves the
-		// pairing, so a staged address would be overwritten within a poll
-		// cycle — after costing a reboot. The provisioning tools still accept
-		// one as a cache seed for a device that has never resolved.
+		// broker_url is a LEGACY re-point. From firmware 1.0.1 the broker's
+		// address is not something the control plane sets: the device finds it
+		// by mDNS and adopts it on a response signature, so staging one would
+		// queue a field that is never sent. Firmware older than that has no
+		// other way to follow a broker that moved. This gate exists for those
+		// units and must not be removed while any can exist; the /sync side of
+		// it is pendingPayloadJSON. See compat/README.md, "Legacy firmware
+		// compatibility".
 		var update registry.ConfigPayload
+		brokerURLHeld := false
+		if v := strings.TrimSpace(req.GetString("broker_url", "")); v != "" {
+			if !(strings.HasPrefix(v, "http://") || strings.HasPrefix(v, "https://")) || len(v) > 127 {
+				return mcp.NewToolResultError(errBrokerURLShape), nil
+			}
+			cur, err := d.Registry.Load(deviceID)
+			if err != nil {
+				if errors.Is(err, registry.ErrNotFound) {
+					return mcp.NewToolResultError(fmt.Sprintf("device %s not registered — call tokenmonitor_register_device first", deviceID)), nil
+				}
+				return mcp.NewToolResultErrorFromErr("load", err), nil
+			}
+			legacy, known := ota.BrokerURLFw(cur.Active.FirmwareVersion)
+			if known && !legacy {
+				return mcp.NewToolResultError(fmt.Sprintf(errBrokerURLMDNSFmt, deviceID, cur.Active.FirmwareVersion)), nil
+			}
+			brokerURLHeld = !known
+			update.BrokerURL = v
+		}
 		if v := strings.ToLower(strings.TrimSpace(req.GetString("psk_hex", ""))); v != "" {
 			if len(v) != 64 {
 				return mcp.NewToolResultError("psk_hex must be exactly 64 hex chars"), nil
@@ -534,10 +584,15 @@ func handleSetDevicePending(d Deps) server.ToolHandlerFunc {
 			}
 			return mcp.NewToolResultErrorFromErr("set_pending", err), nil
 		}
+		note := ""
+		if brokerURLHeld && dev.Pending != nil && dev.Pending.BrokerURL != dev.Active.BrokerURL {
+			note = noteBrokerURLHeld
+		}
 		return mcp.NewToolResultJSON(struct {
 			OK     bool          `json:"ok"`
 			Device deviceSummary `json:"device"`
-		}{OK: true, Device: summarise(dev)})
+			Note   string        `json:"note,omitempty"`
+		}{OK: true, Device: summarise(dev), Note: note})
 	}
 }
 

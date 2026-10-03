@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema",
   "$comment": "Authoritative MCP tool definitions for tokenmonitor-mcp. Every impl (Go, Python, JS) must register tools with these exact name/description/inputSchema triples. The Python and JS servers load this file at runtime; the Go server hardcodes equivalent mcp.NewTool registrations in internal/mcp/{server,devices,discovery,ota,wifi,usb}.go and must be kept in sync by hand.",
-  "version": 13,
+  "version": 14,
   "tools": [
     {
       "name": "tokenmonitor_status",
@@ -72,7 +72,7 @@
     },
     {
       "name": "tokenmonitor_provision_hint",
-      "description": "Print the address(es) the device should be told to poll in its captive portal `svc_url` field \u2014 i.e. the laptop's non-loopback IPv4 interfaces, paired with the configured broker port.",
+      "description": "Print the address(es) this broker is reachable on — the laptop's non-loopback IPv4 interfaces paired with the configured broker port. This is a diagnostic: the device finds the broker by itself over mDNS and adopts it only once the broker proves the pairing, and the captive portal collects WiFi credentials only, so nothing has to be told this address. Use it to check reachability, or as the optional `broker_url` cache seed the provisioning tools accept.",
       "inputSchema": {
         "type": "object",
         "properties": {},
@@ -90,7 +90,7 @@
     },
     {
       "name": "tokenmonitor_register_device",
-      "description": "Register a device in the local registry so its future polls are recognised. Required for any device that was originally provisioned via the captive portal (which doesn't know about device_ids). Pass the device_id printed on the device (or the first 8 hex chars of its MAC), the broker_url it points to, the PSK hex it derived from its passphrase, and any optional config you want to seed.",
+      "description": "Register a device in the local registry so its future polls are recognised. Use it for a device that already holds a PSK this registry does not know: a legacy unit, one configured by hand, or one whose provisioning call returned psk_hex because the registry could not be written. Pass the device_id printed on the device (or the first 8 hex chars of its MAC), the PSK hex it signs with, and any optional config you want to seed. broker_url is optional and is only recorded as the device's last-known broker address.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -100,7 +100,7 @@
           },
           "broker_url": {
             "type": "string",
-            "description": "HTTP(S) URL of the tokenmonitor-mcp broker the device should poll. Use tokenmonitor_provision_hint to learn the laptop's reachable address; the URL depends on the user's network."
+            "description": "Optional. HTTP(S) URL of the broker, recorded as the device's last-known address and nothing more — the device resolves its broker by mDNS, so this configures nothing. tokenmonitor_provision_hint lists this host's reachable addresses."
           },
           "psk_hex": {
             "type": "string",
@@ -133,7 +133,6 @@
         },
         "required": [
           "device_id",
-          "broker_url",
           "psk_hex"
         ],
         "additionalProperties": false
@@ -141,13 +140,17 @@
     },
     {
       "name": "tokenmonitor_set_device_pending",
-      "description": "Stage a pending config update for a registered device. The next time the device polls /device/<id>/sync, it will receive the encrypted payload and apply it under the candidate/rollback safety net. Only fields you supply are changed; omitted fields keep their active value. Setting psk_hex triggers a key rotation that the broker tracks via two-PSK acceptance until the device confirms.",
+      "description": "Stage a pending config update for a registered device. The next time the device polls /device/<id>/sync, it will receive the encrypted payload and apply it under the candidate/rollback safety net. Only fields you supply are changed; omitted fields keep their active value. Setting psk_hex triggers a key rotation that the broker tracks via two-PSK acceptance until the device confirms. broker_url is accepted only as a legacy re-point for firmware older than 1.0.1 (see that argument).",
       "inputSchema": {
         "type": "object",
         "properties": {
           "device_id": {
             "type": "string",
             "description": "8 lowercase hex chars."
+          },
+          "broker_url": {
+            "type": "string",
+            "description": "LEGACY re-point, for firmware older than 1.0.1 only: the address the device should move to, an http:// or https:// URL of at most 127 bytes (take it from tokenmonitor_provision_hint). From 1.0.1 the device finds the broker by mDNS and adopts it only on a signed response, so the address is not configuration and the call is refused when the device last reported 1.0.1 or newer (a -dev.<ts> build counts by its base version). If the device has not reported a firmware version yet, the address is staged but held: it is sent only if the device's next poll reports firmware older than 1.0.1, and dropped — then reported as broker_url_dropped by tokenmonitor_list_devices — if that poll reports 1.0.1 or newer, or no readable version. The registry's own record of the address is never pushed; only a value staged here is. Legacy firmware probes the new address before switching and reboots onto it, so the broker answering there must be this one (same registry), or the device stays where it is."
           },
           "psk_hex": {
             "type": "string",
@@ -215,7 +218,7 @@
           },
           "log_enabled": {
             "type": "boolean",
-            "description": "Enable (true) or disable (false) over-the-air diagnostic log upload on the device. Dev units default on and factory units default off, so set true to stream a production unit's logs (visible via tokenmonitor_device_logs) or false to silence one. Takes effect after the device promotes and reboots."
+            "description": "Enable (true) or disable (false) over-the-air diagnostic log upload on the device. Dev units default on and factory units default off, so set true to stream a production unit's logs (visible via tokenmonitor_device_logs) or false to silence one. Takes effect when the device promotes the change — no reboot."
           },
           "theme_mode": {
             "type": "string",
@@ -224,7 +227,7 @@
               "night",
               "auto"
             ],
-            "description": "Theme mode applied on the device: 'day' (light palette), 'night' (dark palette) or 'auto' (follows sunrise/sunset). Applied LIVE when the candidate is promoted — no reboot. Fields that DO reboot the device: psk_hex, the WiFi pair, and arming a firmware update."
+            "description": "Theme mode applied on the device: 'day' (light palette), 'night' (dark palette) or 'auto' (follows sunrise/sunset). Applied LIVE when the candidate is promoted — no reboot. Fields that DO reboot the device: psk_hex, the WiFi pair, arming a firmware update, and — on firmware older than 1.0.1 — broker_url."
           },
           "pet_enabled": {
             "type": "boolean",
@@ -415,7 +418,7 @@
     },
     {
       "name": "tokenmonitor_provision",
-      "description": "Send the initial config to a device that is currently in BOOT_NEEDS_CONFIG. Requires the 6-digit pairing code the user reads off the device's screen, plus the broker URL and PSK hex you want the device to start using. On success the device persists the config to NVS and reboots into BOOT_READY. If broker_url + psk_hex are supplied, this tool also registers the device in the local tokenmonitor-mcp registry so subsequent control-plane polls (/device/<id>/sync) are recognised.",
+      "description": "Pair a device that is waiting for its initial config (BOOT_NEEDS_CONFIG, or pairing mode) with this broker. Requires the 6-digit pairing code the user reads off the device's screen. ENROLMENT: a device this registry already knows is re-sent its own PSK. A device it does not know is paired — given a PSK (psk_hex if supplied, else a freshly generated one) and recorded in the local tokenmonitor-mcp registry so its control-plane polls (/device/<id>/sync) are recognised — only when the call says so: enroll=true, psk_hex or broker_url. For a first pairing pass enroll=true. Without one of those the call is refused before anything is sent, because the new PSK would replace whatever the device holds and nothing on the LAN says whether it is paired with another broker. enroll=false changes settings only. Whenever a PSK is pushed and broker_url was omitted, this host's address on the route to the device is sent with it and reported as broker_url_seeded: firmware 1.0.0 or newer finds the broker by mDNS and keeps it as a cache seed, older firmware cannot pair without it. On success the device persists the config to NVS and reboots. The result's `enrolled` says whether the registry now holds the device with the PSK that was pushed; if a PSK was generated but could not be recorded, the result carries psk_hex and a note so the device can be recovered with tokenmonitor_register_device.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -433,11 +436,15 @@
           },
           "broker_url": {
             "type": "string",
-            "description": "HTTP(S) URL of the tokenmonitor-mcp broker the device should poll. Run tokenmonitor_provision_hint to learn the laptop's reachable URL on this LAN; do not assume a specific IP. If omitted, only the optional fields below are pushed."
+            "description": "Optional: HTTP(S) URL of this broker, stored on the device as the first address to try and in the registry as the last-known address. Not needed to pair on firmware 1.0.0 or newer — the device resolves the broker by mDNS and re-resolves whenever the address changes. Required by older firmware, which cannot leave setup without one — so it is auto-seeded when omitted: whenever a PSK is pushed, this host's address on the route to the device is sent and reported as broker_url_seeded. If you pass one, take it from tokenmonitor_provision_hint; do not assume a specific IP. Passing one also counts as asking to pair a device this registry does not know."
           },
           "psk_hex": {
             "type": "string",
-            "description": "64-hex PSK the device should sign requests with."
+            "description": "64-hex PSK the device should sign requests with. Optional: when omitted, the PSK this registry already holds for the device is reused, else a fresh one is generated if the call pairs the device (see enroll)."
+          },
+          "enroll": {
+            "type": "boolean",
+            "description": "Whether to pair the device with this broker: push a PSK and record the device in the local registry. Omit it to let the tool decide from what it knows (see the tool description): a device this registry already knows is re-sent its own PSK, and a device it does not know is paired only when that is clearly meant — otherwise the call is refused before anything is written. true pairs the device here regardless, replacing any PSK it holds: use it for a first pairing, or to move a device over from another broker. false changes settings only, leaving the device's PSK and the registry untouched: use it for a WiFi-only or settings-only change on a device paired with a DIFFERENT broker. false cannot be combined with psk_hex."
           },
           "city": {
             "type": "string",
@@ -517,7 +524,7 @@
     },
     {
       "name": "tokenmonitor_usb_scan",
-      "description": "Enumerate TokenMonitor devices reachable over a USB cable and classify each by identity tier. Returns one entry per serial port with its vid/pid, iSerial, tier (registry-match | probe | shared) and - for enrolled or probed units - device_id/sku/fw/state. A `probe`-tier Espressif port (shared by every ESP32-S3/C3/C6) receives ONE bounded HELLO only during this user-initiated scan; `shared` generic-bridge ports are listed but never written to. Never auto-selects a `probe` or `shared` port. USB is the developer / rescue / reconfiguration path; the consumer path stays SoftAP + LAN (WSL2 without usbipd-win cannot see the device).",
+      "description": "Enumerate TokenMonitor devices reachable over a USB cable and classify each by identity tier. Returns one entry per serial port with its vid/pid, iSerial, tier (registry-match | probe | shared) and - for enrolled or probed units - device_id/sku/fw/state. A probed unit also reports has_psk when its firmware sends it: true means the device already holds a PSK (it is paired with some broker), false that it holds none, and an absent has_psk means unknown, never false. A `probe`-tier Espressif port (shared by every ESP32-S3/C3/C6) receives ONE bounded HELLO only during this user-initiated scan; `shared` generic-bridge ports are listed but never written to. Never auto-selects a `probe` or `shared` port. USB is the developer / rescue / reconfiguration path; the consumer path stays SoftAP + LAN (WSL2 without usbipd-win cannot see the device).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -534,7 +541,7 @@
     },
     {
       "name": "tokenmonitor_usb_provision",
-      "description": "Configure or reconfigure a device over a USB cable, independent of the network. No pairing code is needed: the cable is the physical-presence proof, so pairing_code is optional and the device ignores it on this transport. Runs the SLIP+CRC32 serial session (HELLO -> SESSION_BEGIN -> PROVISION -> BYE) behind a leader-mediated port lease so it never collides with the broker's serial log tailer. Carries the config fields the provisioning core applies (broker_url, psk_hex, city, brightness, volume, theme, pet, providers) plus the optional WiFi pair wifi_ssid + wifi_pass, so partial payloads are allowed: sending only city preserves the broker URL and PSK, and the headline flow sends only wifi_ssid + wifi_pass to point the device at the same WiFi the computer is on (prefill wifi_ssid from the host's current network; ask the user for the password). WiFi credentials go into the device's multi-network remembered-networks store, so a USB-configured device roams like any other. On success the device persists to NVS and reboots. If broker_url + psk_hex are supplied, also registers/updates the device in the local registry. See compat/PROVISION_WIRE.md.",
+      "description": "Configure or reconfigure a device over a USB cable, independent of the network. No pairing code is needed: the cable is the physical-presence proof, so pairing_code is optional and the device ignores it on this transport. Runs the SLIP+CRC32 serial session (HELLO -> SESSION_BEGIN -> PROVISION -> BYE) behind a leader-mediated port lease so it never collides with the broker's serial log tailer. Carries the config fields the provisioning core applies (broker_url, psk_hex, city, brightness, volume, theme, pet, providers) plus the optional WiFi pair wifi_ssid + wifi_pass; every field is optional and an omitted one is left unchanged on the device. The headline flow sends only wifi_ssid + wifi_pass to point the device at the same WiFi the computer is on (prefill wifi_ssid from the host's current network; ask the user for the password). WiFi credentials go into the device's multi-network remembered-networks store, so a USB-configured device roams like any other.\n\nENROLMENT: the device identifies itself in the serial handshake, and what is pushed is decided from that before anything is written. A device this registry already knows is re-sent its own PSK, which changes nothing. A device it does not know is paired with this broker — given a PSK (psk_hex if supplied, else a freshly generated one) and recorded in the local registry — when it reports that it holds no PSK (has_psk=false, so a first pairing needs no extra argument), or when the call says so with enroll=true or psk_hex, or, on firmware too old to report has_psk, with broker_url. Otherwise the call is refused with nothing written: a device holding a PSK this registry has never seen is paired with another broker, and a new key would break that. enroll=false changes settings only — the WiFi-only call for a device paired elsewhere. Firmware older than 1.0.0 cannot find the broker without an address: when a PSK is pushed to it and broker_url was omitted, the one address tokenmonitor_provision_hint lists is sent with it and reported as broker_url_seeded, and the call is refused if the hint has several or none.\n\nOn success the device persists to NVS and reboots. Top-level ok mirrors the device's own answer, and a device-side error writes nothing to the registry. See compat/PROVISION_WIRE.md.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -554,12 +561,16 @@
           },
           "broker_url": {
             "type": "string",
-            "description": "HTTP(S) URL of the tokenmonitor-mcp broker the device should poll. Run tokenmonitor_provision_hint to learn the laptop's reachable URL on this LAN; do not assume a specific IP. If omitted, only the optional fields below are pushed."
+            "description": "Optional: HTTP(S) URL of this broker, stored on the device as the first address to try and in the registry as the last-known address. Not needed to pair on firmware 1.0.0 or newer — the device resolves the broker by mDNS and re-resolves whenever the address changes. Required by older firmware, which cannot leave setup without one — so it is auto-seeded when omitted: when a PSK is pushed to firmware older than 1.0.0, the one address tokenmonitor_provision_hint lists is sent and reported as broker_url_seeded, and the call is refused before anything is written if the hint has several or none. If you pass one, take it from tokenmonitor_provision_hint; do not assume a specific IP. On firmware that does not report has_psk, passing one also counts as asking to pair a device this registry does not know."
           },
           "psk_hex": {
             "type": "string",
             "pattern": "^[0-9a-f]{64}$",
-            "description": "64-hex PSK the device should sign requests with."
+            "description": "64-hex PSK the device should sign requests with. Optional: when omitted, the PSK this registry already holds for the device is reused, else a fresh one is generated if the call pairs the device (see enroll)."
+          },
+          "enroll": {
+            "type": "boolean",
+            "description": "Whether to pair the device with this broker: push a PSK and record the device in the local registry. Omit it to let the tool decide from what it knows (see the tool description): a device this registry already knows is re-sent its own PSK, and a device it does not know is paired only when that is clearly meant — otherwise the call is refused before anything is written. true pairs the device here regardless, replacing any PSK it holds: use it for a first pairing, or to move a device over from another broker. false changes settings only, leaving the device's PSK and the registry untouched: use it for a WiFi-only or settings-only change on a device paired with a DIFFERENT broker. false cannot be combined with psk_hex."
           },
           "city": {
             "type": "string",

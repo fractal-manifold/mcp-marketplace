@@ -149,6 +149,11 @@ class DeviceInfo:
     fw: str = ""
     state: str = ""
     proto_ver: int = 0
+    # Whether the device holds a PSK. Three-valued on purpose: None means the
+    # firmware did not say (it predates the field, or NVS could not answer) and
+    # MUST be treated as "unknown", never as "fresh". It is not `state`, which
+    # is only this session's done latch.
+    has_psk: bool | None = None
 
 
 @dataclass
@@ -159,6 +164,14 @@ class ProvisionOpts:
     # If non-empty, must equal the HELLO_RESP device_id or the session aborts
     # before any PROVISION write. Re-checked after every (re)handshake.
     expect_device_id: str = ""
+    # If set, produces the PROVISION payload once the device has identified
+    # itself — it replaces provision_json. It exists because what may be sent
+    # depends on the HELLO_RESP (device_id, firmware version, has_psk), which
+    # nobody has before the handshake. It runs after every accepted handshake
+    # and always BEFORE any PROVISION write, so an exception from it aborts the
+    # session with nothing written and propagates as-is. A re-handshake calls
+    # it again; it must return the same bytes for the same device.
+    finalize: Callable[[DeviceInfo], bytes] | None = None
     timeouts: Timeouts = field(default_factory=Timeouts)
 
 
@@ -277,7 +290,8 @@ def run_provision(
         for _ in range(MAX_RESET_RECOVERIES + 1):
             dev = _do_handshake(fc, to, seq_ref, cancel)
             _accept_device(dev, opts)
-            result, retry = _run_exchange(fc, dev, opts.provision_json, to, cancel)
+            payload = opts.finalize(dev) if opts.finalize is not None else opts.provision_json
+            result, retry = _run_exchange(fc, dev, payload, to, cancel)
             if retry:
                 # Stalled BEFORE any pairing code was transmitted (no
                 # SESSION_ACK). Safe to re-HELLO and retry.
@@ -471,10 +485,18 @@ def _parse_hello_resp(f: Frame, want_seq: int) -> DeviceInfo | None:
     # waiting within the timeout). Coercing instead — e.g. a numeric/string
     # proto_ver silently becoming 0 — could turn noise into a spurious
     # UnsupportedProto abort. So a wrong-typed field returns None here.
-    sku = d.get("sku", "")
-    fw = d.get("fw", "")
-    state = d.get("state", "")
-    if not all(isinstance(v, str) for v in (sku, fw, state)):
+    # A JSON null is the zero value, as in Go (null into a string field leaves
+    # it "") and JS.
+    sku = "" if d.get("sku") is None else d.get("sku")
+    fw = "" if d.get("fw") is None else d.get("fw")
+    # fw_version is the key shipping firmware actually sends (its HELLO_RESP
+    # mirrors GET /info); fold it into fw.
+    fw_version = "" if d.get("fw_version") is None else d.get("fw_version")
+    state = "" if d.get("state") is None else d.get("state")
+    if not all(isinstance(v, str) for v in (sku, fw, fw_version, state)):
+        return None
+    has_psk = d.get("has_psk")
+    if has_psk is not None and not isinstance(has_psk, bool):
         return None
     proto_ver = d.get("proto_ver", 0)
     if isinstance(proto_ver, bool) or not isinstance(proto_ver, int):
@@ -483,9 +505,10 @@ def _parse_hello_resp(f: Frame, want_seq: int) -> DeviceInfo | None:
         nonce=f.nonce,
         device_id=device_id,
         sku=sku,
-        fw=fw,
+        fw=fw or fw_version,
         state=state,
         proto_ver=proto_ver,
+        has_psk=has_psk,
     )
 
 

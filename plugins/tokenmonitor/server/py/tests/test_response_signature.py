@@ -147,15 +147,35 @@ async def test_a_wrong_psk_does_not_verify(tmp_path: Path):
         assert sig != impostor
 
 
-async def test_pending_payload_never_carries_broker_url(tmp_path: Path):
-    """The broker's address stopped being configuration. Echoing it back used
-    to overwrite an address the device had just discovered — and, since the
-    firmware treats a broker_url change as channel identity, reboot the device
-    onto one that had already stopped working."""
-    _, reg = _make_app(tmp_path)
-    reg.set_pending(DEVICE_ID, ConfigPayload(broker_url="http://192.168.1.28:8765",
-                                             city="Madrid"))
-    dev = reg.load(DEVICE_ID)
-    wire = broker_server._pending_payload_json(dev.pending.payload)
-    assert "broker_url" not in wire
-    assert "Madrid" in wire, "the rest of the payload must still be emitted"
+def test_pending_payload_broker_url_is_a_legacy_repoint(tmp_path: Path):
+    """broker_url travels in a pending under two conditions at once: an
+    operator staged it (it differs from the active record's address — the
+    registry's own value is never echoed), and the device asking reports
+    firmware older than 1.0.1, the release where the address stopped being
+    configuration. Mirror of Go TestPendingPayloadJSON_BrokerURLIsALegacyRepoint."""
+    import json
+
+    staged, recorded = "http://192.168.1.50:8765", "http://192.168.1.28:8765"
+    cases = [
+        ("legacy 0.12.0", staged, recorded, "0.12.0", True),
+        ("legacy 1.0.0", staged, recorded, "1.0.0", True),
+        ("legacy dev build", staged, recorded, "1.0.0-dev.202609011200", True),
+        ("legacy, registry had no address", staged, "", "0.10.3", True),
+        ("1.0.1", staged, recorded, "1.0.1", False),
+        ("1.0.1 dev build", staged, recorded, "1.0.1-dev.202609181200", False),
+        ("2.0.0", staged, recorded, "2.0.0", False),
+        ("no version reported", staged, recorded, "", False),
+        ("unparseable version", staged, recorded, "dev", False),
+        ("legacy, but only the registry's own address", recorded, recorded, "0.12.0", False),
+        ("legacy, nothing staged", "", recorded, "0.12.0", False),
+    ]
+    for name, pending_url, active_url, fw, want in cases:
+        wire = json.loads(
+            broker_server._pending_payload_json(
+                ConfigPayload(version=9, broker_url=pending_url, city="Barcelona"), active_url, fw
+            )
+        )
+        assert ("broker_url" in wire) is want, name
+        if want:
+            assert wire["broker_url"] == staged, name
+        assert wire["city"] == "Barcelona", name
