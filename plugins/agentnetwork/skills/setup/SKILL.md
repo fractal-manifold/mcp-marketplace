@@ -56,7 +56,8 @@ user once: the v0.2 user-scope MCP entry can be removed at their convenience wit
 
 This is the real production-style flow — same path as the hosted server. The server
 emails a 6-digit OTP **and** a single-use magic-link to the address. The user can
-either paste the code back or click the link; either finishes the verification.
+either paste the code back, or open the link and press the confirm button on the
+page it shows; either finishes the verification. Opening the link alone does not.
 
 **2a. Pick the email to verify.** Read `git config user.email` for a suggestion, then
 ALWAYS confirm with the user via `AskUserQuestion`:
@@ -76,7 +77,7 @@ node ${extensionPath}/scripts/setup.js start-verification \
 
 Output: `{ "status": "sent", "verificationId": "<id>", "email": "<EMAIL>", "expiresInSeconds": <N> }`.
 Tell the user: *"Email sent to `<EMAIL>`. You have ~10 minutes. You can paste me the
-6-digit code here, or click the magic link in the email."*
+6-digit code here, or open the link in the email and press the confirm button."*
 
 **2c. Finish verification.** Ask the user (via `AskUserQuestion`) which path:
 
@@ -85,9 +86,9 @@ Tell the user: *"Email sent to `<EMAIL>`. You have ~10 minutes. You can paste me
   node ${extensionPath}/scripts/setup.js complete-verification \
     --base-url <BASE_URL> --verification-id <id> --code <NNNNNN>
   ```
-- **Magic-link path**: user will click the link in their email client. Run with
-  `--wait` so the script polls every 3 s until the link is clicked (or until the
-  10-minute window expires):
+- **Magic-link path**: user will open the link from their email client and press
+  the confirm button on the page. Run with `--wait` so the script polls every 3 s
+  until they have confirmed (or until the 10-minute window expires):
   ```bash
   node ${extensionPath}/scripts/setup.js complete-verification \
     --base-url <BASE_URL> --verification-id <id> --wait
@@ -97,7 +98,7 @@ On success, output is `{ "status": "issued", "email": "...", "user_token_path": 
 and the user-token (`usr_*`) is cached under `~/.config/agentnetwork/user-token`.
 
 Other statuses to handle: `bad_code` (try again, `attemptsLeft` says how many left),
-`expired` (restart from 2b), `already_consumed` (the link was already clicked once —
+`expired` (restart from 2b), `already_consumed` (the link was already confirmed once —
 re-run `check`; if `has_user_token` is still false, start fresh), `unknown`
 (verification-id wrong — restart from 2b), `pending` without `--wait` (re-run with
 `--wait` or pass `--code`).
