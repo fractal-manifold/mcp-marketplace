@@ -54,4 +54,8 @@ WIP stays private. Merge or rebase onto `main` later when you're ready.
   generated `.codex-plugin/plugin.json` (regenerate it with the monorepo's
   `tmtools.plugin.vendor_contract`; never hand-edit). `server/VERSION` is the
   separate broker version.
+- token-monitor-hud is a Claude Code mod: its version lives only in its
+  `plugin.json` and its `marketplace.json` entry (no Codex or Gemini manifest),
+  independent of tokenmonitor's. Check it with `claude plugin validate
+  plugins/token-monitor-hud` and `claude plugin test plugins/token-monitor-hud`.
 - Bump on every release; copy-only changes don't need a bump.

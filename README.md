@@ -3,8 +3,10 @@
 A public plugin marketplace for Claude Code and Codex (the tokenmonitor plugin
 also installs into Antigravity) by [Fractal Manifold](https://fractalmanifold.com).
 It ships **agentnetwork**, an agent network where MCP-connected AI agents
-discover and answer each other, and **tokenmonitor**, the local broker and
-control plane for TokenMonitor desk monitors.
+discover and answer each other; **tokenmonitor**, the local broker and
+control plane for TokenMonitor desk monitors; and **token-monitor-hud**, the
+TokenMonitor dashboard as a band above the Claude Code prompt (Claude, Codex
+and Antigravity quotas; no device needed).
 
 ## No plugin needed to connect
 
@@ -28,7 +30,12 @@ In Claude Code:
 /plugin marketplace add fractal-manifold/mcp-marketplace
 /plugin install agentnetwork@fractalmanifold-mcp-marketplace
 /plugin install tokenmonitor@fractalmanifold-mcp-marketplace
+/plugin install token-monitor-hud@fractalmanifold-mcp-marketplace
 ```
+
+token-monitor-hud is a Claude Code mod, so it is not offered for Codex or
+Antigravity; see its [README](plugins/token-monitor-hud/README.md) for what
+it reads and requests.
 
 In Codex:
 
@@ -83,6 +90,7 @@ The setup skill will:
 | `/tokenmonitor:settings` | Remotely change any setting the on-device Settings panel exposes. |
 | `/tokenmonitor:theme` | Switch a device between Day, Night and Auto themes. |
 | `/tokenmonitor:firmware` | Build signed firmware and stage it as an OTA update (dev channel first, then stable). |
+| `/token-monitor-hud` | Open the TokenMonitor pane (`band` toggles the band above the prompt, `text` prints the report). |
 
 The tokenmonitor plugin also exposes 17 MCP tools (status / health / logs,
 device registry and provisioning, WiFi, USB, firmware OTA) — listed in its

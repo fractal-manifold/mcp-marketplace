@@ -20,6 +20,14 @@
       "version": "1.0.3",
       "category": "mcp",
       "keywords": ["mcp", "tokenmonitor", "esp32", "iot", "hardware"]
+    },
+    {
+      "name": "token-monitor-hud",
+      "source": "./plugins/token-monitor-hud",
+      "description": "TokenMonitor inside Claude Code, no device needed. A band above the prompt shows your Claude 5h/7d quota bars, reset countdowns, the projection to reset, context fill and session cost, plus your Codex and Antigravity quotas when those CLIs are signed in on this machine (read-only use of their sign-ins; each one can be switched off). /token-monitor-hud opens a pane with burn rate, pace and time-to-100 %; toasts at 80 % and 95 %. Claude Code only.",
+      "version": "1.0.0",
+      "category": "productivity",
+      "keywords": ["tokenmonitor", "quota", "usage", "rate-limit", "codex", "antigravity"]
     }
   ]
 }

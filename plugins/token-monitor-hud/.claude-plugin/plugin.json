@@ -1,0 +1,29 @@
+{
+  "name": "token-monitor-hud",
+  "version": "1.0.0",
+  "description": "TokenMonitor inside Claude Code: a band above the prompt with your Claude 5h/7d quota bars, reset countdowns, projection, context fill and session cost — plus your Codex and Antigravity quotas when those CLIs are signed in on this machine. No TokenMonitor device needed.",
+  "author": {
+    "name": "fractal-manifold",
+    "url": "https://github.com/fractal-manifold"
+  },
+  "homepage": "https://github.com/fractal-manifold/mcp-marketplace/tree/main/plugins/token-monitor-hud",
+  "repository": "https://github.com/fractal-manifold/mcp-marketplace",
+  "license": "MIT",
+  "keywords": ["tokenmonitor", "quota", "usage", "rate-limit", "codex", "antigravity"],
+  "icon": "./.claude-plugin/icon.png",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "codex": {
+      "type": "boolean",
+      "title": "Show Codex",
+      "description": "Read ~/.codex/auth.json (or $CODEX_HOME/auth.json) and ask chatgpt.com for your Codex quota every 5 minutes. Off: nothing is read or requested.",
+      "default": true
+    },
+    "antigravity": {
+      "type": "boolean",
+      "title": "Show Antigravity",
+      "description": "Read agy's token from the OS keyring (secret-tool / macOS Keychain) and ask Google for your Antigravity quota every 5 minutes. Off: nothing is read or requested.",
+      "default": true
+    }
+  }
+}
